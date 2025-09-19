@@ -93,3 +93,4 @@ kernel_meta/
 # pipeline
 pipeline/output/
 pipeline/dataset/
+pipeline/venv

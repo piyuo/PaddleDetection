@@ -1,5 +1,3 @@
-# pipeline/PP-YOLOE/py_inference_image.py
-
 #!/usr/bin/env python3
 """
 Run PP-YOLOE Human model inference on the demo image and save results to pipeline/output.
@@ -10,7 +8,7 @@ This is a thin wrapper around tools/infer.py that:
 - Auto-selects GPU if available (falls back to CPU)
 
 Usage:
-  python pipeline/py_inference_image.py
+  python pipeline/run_ppyoloe_human_infer.py
 
 Optional args:
   --img <path>      Override the input image (default: pipeline/dataset/demo/demo.jpg)
