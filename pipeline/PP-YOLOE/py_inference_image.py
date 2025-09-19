@@ -25,8 +25,8 @@ import sys
 
 
 def repo_root() -> str:
-    # This file lives in <repo>/pipeline/, so parent dir is the repo root
-    return os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+    # This file lives in <repo>/pipeline/PP-YOLOE/, so we need to go up two levels to get the repo root
+    return os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
 
 
 def has_gpu() -> bool:
@@ -50,7 +50,7 @@ def main():
 
     root = repo_root()
 
-    config_path = os.path.join(root, 'pipeline', 'PP-YOLOE', 'models', 'ppyoloe_crn_s_36e_pphuman.yml')
+    config_path = os.path.join(root, 'pipeline', 'ppyoloe_crn_s_36e_pphuman.yml')
     weights_path = os.path.join(root, 'pipeline', 'PP-YOLOE', 'models', 'ppyoloe_crn_s_36e_pphuman.pdparams')
     img_path = args.img or os.path.join(root, 'pipeline', 'dataset', 'demo', 'demo.jpg')
     out_dir = args.out or os.path.join(root, 'pipeline', 'output')
@@ -74,7 +74,6 @@ def main():
         sys.executable,
         os.path.join(root, 'tools', 'infer.py'),
         '-c', config_path,
-        '-o', f'weights={weights_path}',
         '-o', device_flag,
         '--infer_img', img_path,
         '--output_dir', out_dir,
