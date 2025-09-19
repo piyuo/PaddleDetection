@@ -90,3 +90,6 @@ kernel_meta/
 # MAC
 *.DS_Store
 
+# pipeline
+pipeline/output/
+pipeline/dataset/
