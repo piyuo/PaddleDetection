@@ -7,30 +7,12 @@ _BASE_: [
 ]
 log_iter: 100
 snapshot_epoch: 4
-weights: output/ppyoloe_crn_s_36e_pphuman/model_final
+weights: pipeline/PP-YOLOE/weights/ppyoloe_crn_s_36e_pphuman
 
-pretrain_weights: https://paddledet.bj.bcebos.com/models/ppyoloe_crn_s_300e_coco.pdparams
 depth_mult: 0.33
 width_mult: 0.50
 
 num_classes: 1
-TrainDataset:
-  !COCODataSet
-    image_dir: ""
-    anno_path: annotations/train.json
-    dataset_dir: dataset/pphuman
-    data_fields: ['image', 'gt_bbox', 'gt_class', 'is_crowd']
-
-EvalDataset:
-  !COCODataSet
-    image_dir: ""
-    anno_path: annotations/val.json
-    dataset_dir: dataset/pphuman
-
-TestDataset:
-  !ImageFolder
-    anno_path: annotations/val.json
-    dataset_dir: dataset/pphuman
 
 TrainReader:
   batch_size: 8

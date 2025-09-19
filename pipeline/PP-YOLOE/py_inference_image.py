@@ -50,8 +50,8 @@ def main():
 
     root = repo_root()
 
-    config_path = os.path.join(root, 'pipeline', 'ppyoloe_crn_s_36e_pphuman.yml')
-    weights_path = os.path.join(root, 'pipeline', 'PP-YOLOE', 'models', 'ppyoloe_crn_s_36e_pphuman.pdparams')
+    config_path = os.path.join(root, 'configs','pphuman', 'ppyoloe_crn_s_36e_pphuman.yml')
+    weights_path = os.path.join(root, 'pipeline', 'PP-YOLOE', 'weights', 'ppyoloe_crn_s_36e_pphuman.pdparams')
     img_path = args.img or os.path.join(root, 'pipeline', 'dataset', 'demo', 'demo.jpg')
     out_dir = args.out or os.path.join(root, 'pipeline', 'output')
 
