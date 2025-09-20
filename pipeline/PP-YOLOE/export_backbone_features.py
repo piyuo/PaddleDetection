@@ -16,7 +16,7 @@ Example:
 	--img pipeline/dataset/demo/demo.jpg \
 	--infer_cfg pipeline/output/inference_model/ppyoloe_crn_s_36e_pphuman/infer_cfg.yml \
 	--node <tensor_name_from_list> \
-	--out pipeline/output/backbone \
+	--out pipeline/PP-YOLOE/models \
 	--roi_from_det --thresh 0.5
 
 First, discover node/tensor names:

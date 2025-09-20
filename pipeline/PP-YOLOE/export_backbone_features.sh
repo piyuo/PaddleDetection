@@ -18,7 +18,7 @@ fi
 cd "${REPO_ROOT}"
 
 ONNX_PATH="pipeline/PP-YOLOE/backbone/ppyoloe_crn_s_36e_pphuman.onnx"
-INFER_CFG="pipeline/output/inference_model/ppyoloe_crn_s_36e_pphuman/infer_cfg.yml"
+INFER_CFG="pipeline/PP-YOLOE/backbone/inference_model/ppyoloe_crn_s_36e_pphuman/infer_cfg.yml"
 IMG_PATH="pipeline/dataset/demo/demo.jpg"
 OUT_DIR="pipeline/PP-YOLOE/models"
 
