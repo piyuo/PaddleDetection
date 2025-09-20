@@ -93,4 +93,6 @@ kernel_meta/
 # pipeline
 pipeline/output/
 pipeline/dataset/
-pipeline/venv
+pipeline/PP-YOLOE/venv
+pipeline/PP-YOLOE/backbone
+pipeline/PP-YOLOE/*.onnx

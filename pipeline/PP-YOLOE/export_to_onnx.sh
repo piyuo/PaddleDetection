@@ -1,4 +1,9 @@
+# pipeline/PP-YOLOE/export_to_onnx.sh
 #!/usr/bin/env bash
+
+# Activate the Python virtual environment
+echo "🔧 Activating Python environment..."
+source pipeline/PP-YOLOE/venv/bin/activate
 
 # Export PP-YOLOE Human model to ONNX for ONNX Runtime use
 # - Exports Paddle inference model (tools/export_model.py)
@@ -20,7 +25,7 @@ DEFAULT_CONFIG="${REPO_ROOT}/configs/pphuman/ppyoloe_crn_s_36e_pphuman.yml"
 DEFAULT_WEIGHTS="${REPO_ROOT}/pipeline/PP-YOLOE/weights/ppyoloe_crn_s_36e_pphuman.pdparams"
 DEFAULT_SHAPE="3,640,640"  # C,H,W
 DEFAULT_OPSET=16
-DEFAULT_OUT_DIR="${REPO_ROOT}/pipeline/output"
+DEFAULT_OUT_DIR="${REPO_ROOT}/pipeline/PP-YOLOE/backbone"
 
 CONFIG="${DEFAULT_CONFIG}"
 WEIGHTS="${DEFAULT_WEIGHTS}"
@@ -43,7 +48,7 @@ Options:
 Notes:
 	- YOLO-family ONNX export requires fixed shape; batch=1 is implied.
 	- Will try to use python3, falling back to python.
-	- If pipeline/venv exists, it will be sourced automatically.
+	- If pipeline/PP-YOLOE/venv exists, it will be sourced automatically.
 EOF
 }
 
@@ -74,14 +79,6 @@ echo "Infer dir : ${MODEL_DIR}"
 echo "ONNX file : ${ONNX_FILE}"
 echo
 
-# Activate venv if present, but don't error if missing
-if [[ -f "${REPO_ROOT}/pipeline/venv/bin/activate" ]]; then
-	echo "🔧 Activating Python environment at pipeline/venv ..."
-	# shellcheck disable=SC1091
-	source "${REPO_ROOT}/pipeline/venv/bin/activate"
-else
-	echo "ℹ️  No venv at pipeline/venv; continuing with system Python"
-fi
 
 # Choose python executable
 PY="${PYTHON:-}"
@@ -140,3 +137,5 @@ else
 	echo "[ERROR] ONNX file not generated: ${ONNX_FILE}" >&2
 	exit 1
 fi
+
+./pipeline/PP-YOLOE/export_backbone_features.sh

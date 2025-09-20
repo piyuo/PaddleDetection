@@ -1,19 +1,31 @@
 # pipeline/PP-YOLOE/onnx_inference_image.sh
-#!/bin/bash
+#!/usr/bin/env bash
 
-# Activate the Python virtual environment
-echo "🔧 Activating Python environment..."
-source pipeline/venv/bin/activate
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+
+# Activate the Python virtual environment if it exists
+if [[ -f "${REPO_ROOT}/pipeline/venv/bin/activate" ]]; then
+    echo "🔧 Activating Python environment..."
+    # shellcheck disable=SC1091
+    source "${REPO_ROOT}/pipeline/venv/bin/activate"
+else
+    echo "ℹ️  No venv at pipeline/venv; using system Python"
+fi
 
 echo "🔧 Running ONNX inference..."
 
-python3 pipeline/PP-YOLOE/onnx_inference_image.py
+# Use correct argument names and paths
+cd "${REPO_ROOT}"
 
-#python3 pipeline/PP-YOLOE/onnx_inference_image.py \
-#  --onnx pipeline/output/ppyoloe_crn_s_36e_pphuman.onnx \
-#  --image pipeline/dataset/demo/demo.jpg \
-#  --output pipeline/output \
-#  --conf 0.5 \
-#  --debug
+# Use the detected Python executable to ensure we have onnxruntime
+/usr/local/bin/python3 pipeline/PP-YOLOE/onnx_inference_image.py \
+    --img pipeline/dataset/demo/demo.jpg \
+    --onnx pipeline/output/ppyoloe_crn_s_36e_pphuman.onnx \
+    --infer_cfg pipeline/output/inference_model/ppyoloe_crn_s_36e_pphuman/infer_cfg.yml \
+    --out pipeline/output \
+    --thresh 0.5
 
-echo "✅ Fixed ONNX inference completed! Check pipeline/output/ for result images."
+echo "✅ ONNX inference completed! Check pipeline/output/onnx_vis/ for visualized result images."

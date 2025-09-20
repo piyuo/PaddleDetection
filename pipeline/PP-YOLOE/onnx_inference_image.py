@@ -7,9 +7,9 @@ Defaults assume you exported via pipeline/PP-YOLOE/export_to_onnx.sh.
 Usage:
   python pipeline/PP-YOLOE/onnx_inference_image.py \
     [--img pipeline/dataset/demo/demo.jpg] \
-    [--onnx pipeline/output/onnx/ppyoloe_crn_s_36e_pphuman.onnx] \
+    [--onnx pipeline/output/ppyoloe_crn_s_36e_pphuman.onnx] \
     [--infer_cfg pipeline/output/inference_model/ppyoloe_crn_s_36e_pphuman/infer_cfg.yml] \
-    [--out pipeline/output/onnx_vis] \
+    [--out pipeline/output_vis] \
     [--thresh 0.5] [--gpu]
 
 Notes:
