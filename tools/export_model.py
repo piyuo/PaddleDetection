@@ -99,7 +99,7 @@ def main():
         paddle.set_device("npu")
     else:
         paddle.set_device("cpu")
-        
+
     FLAGS = parse_args()
     cfg = load_config(FLAGS.config)
     merge_config(FLAGS.opt)
