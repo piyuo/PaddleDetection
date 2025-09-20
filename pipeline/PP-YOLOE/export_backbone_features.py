@@ -1,26 +1,25 @@
 #!/usr/bin/env python3
 """
-Extract backbone feature maps from the PP-YOLOE ONNX model, and optionally
-ROI-pool per-detection features for trackers like BoT-SORT.
+Extract or export backbone feature maps from a PP-YOLOE ONNX model.
 
-Features:
+What this script can do now:
 - List candidate intermediate tensors to extract (rank-4 NCHW)
-- Insert the chosen tensor as an additional model output on-the-fly
-- Run ONNX Runtime with PaddleDetection's preprocess Compose
-- Optionally run ROI pooling on the feature map using detection boxes
-- Save feature map and embeddings as .npy files
+- Auto-pick a good feature map (largest/s8/s16/s32) or choose explicitly
+- Insert the chosen tensor as an additional ONNX model output and SAVE the
+	augmented model to the output directory (recommended for deployment)
+- Optionally run an inference pass to export .npy feature maps and ROI
+	embeddings from detections (kept for convenience)
 
-Example:
-  python pipeline/PP-YOLOE/export_backbone_features.py \
-	--onnx pipeline/backbone/ppyoloe_crn_s_36e_pphuman.onnx \
-	--img pipeline/dataset/demo/demo.jpg \
-	--infer_cfg pipeline/output/inference_model/ppyoloe_crn_s_36e_pphuman/infer_cfg.yml \
-	--node <tensor_name_from_list> \
-	--out pipeline/PP-YOLOE/models \
-	--roi_from_det --thresh 0.5
+Quick start: create a new ONNX with an extra backbone feature output
+	python pipeline/PP-YOLOE/export_backbone_features.py \
+		--onnx pipeline/PP-YOLOE/backbone/ppyoloe_crn_s_36e_pphuman.onnx \
+		--infer_cfg pipeline/PP-YOLOE/backbone/inference_model/ppyoloe_crn_s_36e_pphuman/infer_cfg.yml \
+		--auto_pick s8 \
+		--out pipeline/PP-YOLOE/models \
+		--export_onnx
 
 First, discover node/tensor names:
-  python pipeline/PP-YOLOE/export_backbone_features.py --onnx <model.onnx> --list-nodes
+	python pipeline/PP-YOLOE/export_backbone_features.py --onnx <model.onnx> --list-nodes
 """
 
 import argparse
@@ -185,6 +184,87 @@ def add_output_to_model(model, value_name: str):
 	return model
 
 
+def sanitize_filename_part(s: str) -> str:
+	return ''.join(c if c.isalnum() or c in ('-', '_') else '_' for c in s)
+
+
+def onnx_output_shapes(model) -> Dict[str, Optional[List[int]]]:
+	"""Return a mapping output_name -> static shape list (if available)."""
+	try:
+		import onnx
+		model_inf = onnx.shape_inference.infer_shapes(model)
+	except Exception:
+		model_inf = model
+	shapes: Dict[str, Optional[List[int]]] = {}
+	vi_map: Dict[str, Any] = {vi.name: vi for vi in list(model_inf.graph.value_info) + list(model_inf.graph.output)}
+	for out in model_inf.graph.output:
+		shp: Optional[List[int]] = None
+		vi = vi_map.get(out.name)
+		if vi is not None and vi.type and vi.type.tensor_type and vi.type.tensor_type.shape:
+			dims = vi.type.tensor_type.shape.dim
+			s: List[int] = []
+			ok = True
+			for d in dims:
+				if d.HasField('dim_value'):
+					s.append(int(d.dim_value))
+				else:
+					ok = False
+					break
+			if ok:
+				shp = s
+		shapes[out.name] = shp
+	return shapes
+
+
+def describe_outputs_text(outputs: List[str], shapes: Dict[str, Optional[List[int]]], feat_output_name: Optional[str]) -> str:
+	lines: List[str] = []
+	lines.append('# Model outputs')
+	lines.append('')
+	lines.append(f'Total outputs: {len(outputs)}')
+	lines.append('')
+	for idx, name in enumerate(outputs):
+		shp = shapes.get(name)
+		shp_str = 'x'.join(str(d) for d in shp) if shp else 'dynamic/unknown'
+		purpose = 'Original model output'
+		# Heuristics for PP-YOLOE typical first output
+		if idx == 0:
+			purpose = 'Detections: [class_id, score, x_min, y_min, x_max, y_max] per row'
+		if feat_output_name and name == feat_output_name:
+			purpose = 'Backbone/neck feature map (NCHW) for downstream embedding/association'
+		lines.append(f'- {idx}: {name}  shape: [{shp_str}]  — {purpose}')
+	lines.append('')
+	lines.append('Notes:')
+	lines.append('- Shapes may be dynamic depending on opset and preprocessing; when unknown, infer at runtime.')
+	lines.append('- The feature map is useful for ROI pooling or computing appearance embeddings for tracking (e.g., BoT-SORT).')
+	return '\n'.join(lines)
+
+
+def save_augmented_model(onnx_path: str, node_name: str, out_dir: str) -> Tuple[str, str]:
+	"""
+	Add the given node/tensor as an extra graph output, save to out_dir, and
+	emit a small README describing outputs.
+	Returns: (onnx_out_path, outputs_md_path)
+	"""
+	import onnx
+	os.makedirs(out_dir, exist_ok=True)
+	base = os.path.splitext(os.path.basename(onnx_path))[0]
+	tag = sanitize_filename_part(node_name[-40:])  # keep tail, sanitize
+	out_onnx = os.path.join(out_dir, f'{base}_with_{tag}.onnx')
+
+	model = onnx.load(onnx_path)
+	model = add_output_to_model(model, node_name)
+	onnx.save(model, out_onnx)
+
+	# Describe outputs
+	shapes = onnx_output_shapes(model)
+	outputs = [o.name for o in model.graph.output]
+	md = describe_outputs_text(outputs, shapes, feat_output_name=node_name)
+	out_md = os.path.join(out_dir, f'{base}_outputs.md')
+	with open(out_md, 'w') as f:
+		f.write(md)
+	return out_onnx, out_md
+
+
 def build_session(onnx_path: str, extra_output: Optional[str] = None):
 	onnx, helper, TensorProto, ort = import_onnx_modules()
 	if extra_output:
@@ -242,6 +322,7 @@ def main():
 	ap.add_argument('--thresh', type=float, default=0.5, help='Score threshold for ROI selection when roi_from_det')
 	ap.add_argument('--out', default=d_out, help='Output directory')
 	ap.add_argument('--auto_pick', choices=['largest', 's8', 's16', 's32'], default=None, help='Automatically pick a feature map by size/stride')
+	ap.add_argument('--export_onnx', action='store_true', help='Export a new ONNX with the selected feature map added as an extra output')
 	args = ap.parse_args()
 
 	for p, label in [
@@ -342,7 +423,14 @@ def main():
 		print('[ERROR] --node is required unless --list-nodes or --auto_pick is used. Run with --list-nodes to inspect tensor names.')
 		sys.exit(2)
 
-	# Build session with extra output
+	# If user wants to export an augmented model, do that first
+	if args.export_onnx:
+		onnx_out, md_path = save_augmented_model(args.onnx, args.node, args.out)
+		print('Saved augmented ONNX:', onnx_out)
+		print('Wrote outputs description:', md_path)
+		# You can still continue to run a quick inference to verify shapes below.
+
+	# Build session with extra output (using original or temporary model)
 	sess, tmp_model = build_session(args.onnx, extra_output=args.node)
 
 	# Prepare feed for runtime

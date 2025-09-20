@@ -34,6 +34,7 @@ if [[ -z "${NODE_NAME}" ]]; then
 		--auto_pick "${AUTO_PICK}" \
 		--roi_from_det \
 		--thresh 0.5 \
+		--export_onnx \
 		--out "${OUT_DIR}"
 	echo
 	echo "Tip: To choose explicitly, list candidates:"
@@ -50,6 +51,7 @@ echo "🔧 Extracting features from tensor: ${NODE_NAME}"
 	--node "${NODE_NAME}" \
 	--roi_from_det \
 	--thresh 0.5 \
+	--export_onnx \
 	--out "${OUT_DIR}"
 
 echo "✅ Saved feature map and (optional) embeddings to ${OUT_DIR}"
