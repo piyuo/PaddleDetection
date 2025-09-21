@@ -25,6 +25,36 @@ from typing import Tuple
 import numpy as np
 
 
+def roi_pool_average(feat_map: np.ndarray, boxes_xyxy: np.ndarray, img_hw: Tuple[int, int]) -> np.ndarray:
+    """
+    Simple ROI average pooling on a feature map.
+    - feat_map: (1, C, Hf, Wf)
+    - boxes_xyxy: (N, 4) in original image coordinates
+    - img_hw: (Himg, Wimg)
+    Returns:
+      embeddings: (N, C)
+    """
+    assert feat_map.ndim == 4 and feat_map.shape[0] == 1
+    _, C, Hf, Wf = feat_map.shape
+    Himg, Wimg = img_hw
+    scale_x = Wf / float(Wimg)
+    scale_y = Hf / float(Himg)
+
+    embs = []
+    for x0, y0, x1, y1 in boxes_xyxy:
+        fx0 = int(max(0, np.floor(x0 * scale_x)))
+        fy0 = int(max(0, np.floor(y0 * scale_y)))
+        fx1 = int(min(Wf, np.ceil(x1 * scale_x)))
+        fy1 = int(min(Hf, np.ceil(y1 * scale_y)))
+        if fx1 <= fx0 or fy1 <= fy0:
+            embs.append(np.zeros((C,), dtype=np.float32))
+            continue
+        region = feat_map[0, :, fy0:fy1, fx0:fx1]
+        vec = region.reshape(C, -1).mean(axis=1) if region.size > 0 else np.zeros((C,), dtype=np.float32)
+        embs.append(vec)
+    return np.stack(embs, axis=0) if embs else np.zeros((0, C), dtype=np.float32)
+
+
 def repo_root() -> str:
     # This file is at <repo>/pipeline/PP-YOLOE/onnx_inference_image.py
     return os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
@@ -154,12 +184,78 @@ def main():
 
     # Save visualization
     base = os.path.splitext(os.path.basename(args.img))[0]
-    vis_path = os.path.join(args.out, f'{base}_onnx_vis.jpg')
+    vis_path = os.path.join(args.out, f'{base}.jpg')
     try:
         draw_and_save(args.img, bboxes, draw_threshold, vis_path, label_list)
         print('Saved visualization to:', vis_path)
     except Exception as e:
         print('[WARN] Failed to save visualization:', e)
+
+    # --- Verify exported feature map usability for BoT-SORT embeddings ---
+    # Find a rank-4 feature map output (NCHW) among session outputs
+    out_names = [o.name for o in sess.get_outputs()]
+    name_to_out = {out_names[i]: outputs[i] for i in range(len(out_names))}
+    feat_cands = [(n, a) for n, a in name_to_out.items() if isinstance(a, np.ndarray) and a.ndim == 4 and a.shape[0] in (1,)]
+    if not feat_cands:
+        print('\n[WARN] No 4D feature map output found in the ONNX outputs.\n'
+              'Ensure you exported an augmented model with a backbone feature output\n'
+              'using pipeline/PP-YOLOE/export_backbone_features.sh.')
+        return
+
+    # Choose the highest spatial resolution candidate
+    feat_name, feat_map = max(feat_cands, key=lambda kv: kv[1].shape[2] * kv[1].shape[3])
+    print(f"\n[BoT-SORT] Using feature output: {feat_name} shape={feat_map.shape}")
+
+    # Prepare boxes above threshold
+    keep = [b for b in bboxes if int(b[0]) > -1 and float(b[1]) >= float(draw_threshold)]
+    if not keep:
+        print(f"[BoT-SORT] No detections above threshold {draw_threshold}; skipping embedding check.")
+        return
+
+    boxes_xyxy = np.array([[b[2], b[3], b[4], b[5]] for b in keep], dtype=np.float32)
+    try:
+        import cv2
+        im = cv2.imread(args.img)
+        if im is None:
+            print('[WARN] Could not load image to infer size; skipping embedding verification.')
+            return
+        Himg, Wimg = im.shape[:2]
+    except Exception:
+        print('[WARN] OpenCV not available; skipping embedding verification.')
+        return
+
+    # ROI average pooling to produce appearance embeddings (like BoT-SORT)
+    embs = roi_pool_average(feat_map, boxes_xyxy, (Himg, Wimg))  # (N, C)
+    if embs.size == 0:
+        print('[BoT-SORT] Failed to compute embeddings from feature map.')
+        return
+
+    # L2-normalize embeddings
+    norms = np.linalg.norm(embs, axis=1, keepdims=True) + 1e-8
+    embs_norm = embs / norms
+
+    # Cosine similarity matrix (N x N)
+    sims = embs_norm @ embs_norm.T
+    diag_mean = float(np.diag(sims).mean())
+    off_diag = sims[~np.eye(sims.shape[0], dtype=bool)] if sims.shape[0] > 1 else np.array([])
+    off_min = float(off_diag.min()) if off_diag.size else 1.0
+    off_max = float(off_diag.max()) if off_diag.size else 1.0
+
+    base = os.path.splitext(os.path.basename(args.img))[0]
+    emb_path = os.path.join(args.out, f'{base}_embeddings.npy')
+    os.makedirs(args.out, exist_ok=True)
+    np.save(emb_path, embs_norm.astype(np.float32))
+
+    print('[BoT-SORT] Embeddings computed:')
+    print('  - shape:', embs_norm.shape)
+    print('  - L2 norms (mean±std):', float(norms.mean()), '±', float(norms.std()))
+    print('  - cosine diag mean:', f'{diag_mean:.4f}', ' off-diag min/max:', f'{off_min:.4f}/{off_max:.4f}')
+    if off_diag.size:
+        n_show = min(5, sims.shape[0])
+        print('  - similarity matrix (top-left):')
+        with np.printoptions(precision=2, suppress=True):
+            print(sims[:n_show, :n_show])
+    print('  - saved normalized embeddings to:', emb_path)
 
 
 if __name__ == '__main__':
