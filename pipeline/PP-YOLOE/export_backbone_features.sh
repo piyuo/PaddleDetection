@@ -19,14 +19,12 @@ cd "${REPO_ROOT}"
 
 ONNX_PATH="pipeline/PP-YOLOE/backbone/ppyoloe_crn_s_36e_pphuman.onnx"
 INFER_CFG="pipeline/PP-YOLOE/backbone/inference_model/ppyoloe_crn_s_36e_pphuman/infer_cfg.yml"
-IMG_PATH="pipeline/dataset/demo/demo.jpg"
 OUT_DIR="pipeline/PP-YOLOE/models"
 AUTO_PICK="s8"
 
 echo "🔧 Auto-picking a feature map (${AUTO_PICK})..."
 "${PY}" pipeline/PP-YOLOE/export_backbone_features.py \
 	--onnx "${ONNX_PATH}" \
-	--img "${IMG_PATH}" \
 	--infer_cfg "${INFER_CFG}" \
 	--auto_pick "${AUTO_PICK}" \
 	--roi_from_det \

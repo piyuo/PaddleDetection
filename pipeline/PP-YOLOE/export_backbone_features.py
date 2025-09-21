@@ -7,16 +7,15 @@ What this script can do now:
 - Auto-pick a good feature map (largest/s8/s16/s32) or choose explicitly
 - Insert the chosen tensor as an additional ONNX model output and SAVE the
 	augmented model to the output directory (recommended for deployment)
-- Optionally run an inference pass to export .npy feature maps and ROI
-	embeddings from detections (kept for convenience)
+- Run an inference pass to export .npy feature maps and ROI
+	embeddings from detections
 
 Quick start: create a new ONNX with an extra backbone feature output
 	python pipeline/PP-YOLOE/export_backbone_features.py \
 		--onnx pipeline/PP-YOLOE/backbone/ppyoloe_crn_s_36e_pphuman.onnx \
 		--infer_cfg pipeline/PP-YOLOE/backbone/inference_model/ppyoloe_crn_s_36e_pphuman/infer_cfg.yml \
 		--auto_pick s8 \
-		--out pipeline/PP-YOLOE/models \
-		--export_onnx
+		--out pipeline/PP-YOLOE/models
 
 First, discover node/tensor names:
 	python pipeline/PP-YOLOE/export_backbone_features.py --onnx <model.onnx> --list-nodes
@@ -184,8 +183,6 @@ def add_output_to_model(model, value_name: str):
 	return model
 
 
-def sanitize_filename_part(s: str) -> str:
-	return ''.join(c if c.isalnum() or c in ('-', '_') else '_' for c in s)
 
 
 def onnx_output_shapes(model) -> Dict[str, Optional[List[int]]]:
@@ -239,30 +236,22 @@ def describe_outputs_text(outputs: List[str], shapes: Dict[str, Optional[List[in
 	return '\n'.join(lines)
 
 
-def save_augmented_model(onnx_path: str, node_name: str, out_dir: str) -> Tuple[str, str]:
+def save_augmented_model(onnx_path: str, node_name: str, out_dir: str) -> str:
 	"""
 	Add the given node/tensor as an extra graph output, save to out_dir, and
-	emit a small README describing outputs.
-	Returns: (onnx_out_path, outputs_md_path)
+	return the output path.
+	Returns: onnx_out_path
 	"""
 	import onnx
 	os.makedirs(out_dir, exist_ok=True)
 	base = os.path.splitext(os.path.basename(onnx_path))[0]
-	tag = sanitize_filename_part(node_name[-40:])  # keep tail, sanitize
-	out_onnx = os.path.join(out_dir, f'{base}_with_{tag}.onnx')
+	out_onnx = os.path.join(out_dir, f'{base}.onnx')
 
 	model = onnx.load(onnx_path)
 	model = add_output_to_model(model, node_name)
 	onnx.save(model, out_onnx)
 
-	# Describe outputs
-	shapes = onnx_output_shapes(model)
-	outputs = [o.name for o in model.graph.output]
-	md = describe_outputs_text(outputs, shapes, feat_output_name=node_name)
-	out_md = os.path.join(out_dir, f'{base}_outputs.md')
-	with open(out_md, 'w') as f:
-		f.write(md)
-	return out_onnx, out_md
+	return out_onnx
 
 
 def build_session(onnx_path: str, extra_output: Optional[str] = None):
@@ -314,7 +303,6 @@ def main():
 
 	ap = argparse.ArgumentParser(description='Extract PP-YOLOE backbone features from ONNX model')
 	ap.add_argument('--onnx', default=d_onnx, help='Path to ONNX model')
-	ap.add_argument('--img', default=d_img, help='Path to input image')
 	ap.add_argument('--infer_cfg', default=d_infer_cfg, help='infer_cfg.yml for preprocess')
 	ap.add_argument('--node', default=None, help='Tensor name to extract as feature map (use --list-nodes to discover)')
 	ap.add_argument('--list-nodes', action='store_true', help='List candidate 4D tensors and exit')
@@ -326,7 +314,6 @@ def main():
 
 	for p, label in [
 		(args.onnx, 'ONNX model'),
-		(args.img, 'input image'),
 		(args.infer_cfg, 'infer_cfg.yml'),
 	]:
 		if not os.path.exists(p):
@@ -346,9 +333,9 @@ def main():
 		print('- For trackers, stride-8 (largest Hf/Wf) or stride-16 often works well.')
 		return
 
-	# Preprocess to get input tensor and size
+	# Preprocess to get input tensor and size (using default demo image)
 	transforms, _ = load_preprocess(args.infer_cfg)
-	inputs_map = transforms(args.img)
+	inputs_map = transforms(d_img)
 	# infer input H,W from 'image' or any tensor with shape [C,H,W]
 	in_hw = None
 	for k, v in inputs_map.items():
@@ -423,9 +410,9 @@ def main():
 		sys.exit(2)
 
 	# Export an augmented model with the selected feature map as an additional output
-	onnx_out, md_path = save_augmented_model(args.onnx, args.node, args.out)
+	onnx_out = save_augmented_model(args.onnx, args.node, args.out)
 	print('Saved augmented ONNX:', onnx_out)
-	print('Wrote outputs description:', md_path)
+
 
 	# Build session with extra output (using original or temporary model)
 	sess, tmp_model = build_session(args.onnx, extra_output=args.node)
@@ -455,7 +442,7 @@ def main():
 		print('[WARN] Extracted tensor is not rank-4; shape:', feat_map.shape)
 
 	os.makedirs(args.out, exist_ok=True)
-	base = os.path.splitext(os.path.basename(args.img))[0]
+	base = "demo"  # Use generic filename since no image input
 	np.save(os.path.join(args.out, f'{base}_feature_map.npy'), feat_map)
 	print('Saved feature map:', os.path.join(args.out, f'{base}_feature_map.npy'), 'shape', feat_map.shape)
 
@@ -464,11 +451,11 @@ def main():
 		keep = [b for b in bboxes if int(b[0]) > -1 and float(b[1]) >= args.thresh]
 		if keep:
 			boxes = np.array([[b[2], b[3], b[4], b[5]] for b in keep], dtype=np.float32)
-			# Need original image size for mapping
+			# Need original image size for mapping - use demo image dimensions
 			import cv2
-			im = cv2.imread(args.img)
+			im = cv2.imread(d_img)
 			if im is None:
-				print('[WARN] Could not load image to infer size; skipping ROI features')
+				print('[WARN] Could not load demo image to infer size; skipping ROI features')
 			else:
 				Himg, Wimg = im.shape[:2]
 				embs = roi_pool_average(feat_map, boxes, (Himg, Wimg))
@@ -476,6 +463,14 @@ def main():
 				print('Saved ROI embeddings:', os.path.join(args.out, f'{base}_embeddings.npy'), 'shape', embs.shape)
 		else:
 			print(f'No detections above threshold {args.thresh}; skipping ROI embeddings')
+
+	# Print outputs description to console
+	import onnx
+	model = onnx.load(onnx_out)
+	shapes = onnx_output_shapes(model)
+	outputs = [o.name for o in model.graph.output]
+	outputs_desc = describe_outputs_text(outputs, shapes, feat_output_name=args.node)
+	print('\n' + outputs_desc)
 
 	# Cleanup temp model
 	if tmp_model and os.path.exists(tmp_model):
