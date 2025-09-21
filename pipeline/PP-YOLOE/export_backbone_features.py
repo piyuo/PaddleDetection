@@ -322,7 +322,6 @@ def main():
 	ap.add_argument('--thresh', type=float, default=0.5, help='Score threshold for ROI selection when roi_from_det')
 	ap.add_argument('--out', default=d_out, help='Output directory')
 	ap.add_argument('--auto_pick', choices=['largest', 's8', 's16', 's32'], default=None, help='Automatically pick a feature map by size/stride')
-	ap.add_argument('--export_onnx', action='store_true', help='Export a new ONNX with the selected feature map added as an extra output')
 	args = ap.parse_args()
 
 	for p, label in [
@@ -423,12 +422,10 @@ def main():
 		print('[ERROR] --node is required unless --list-nodes or --auto_pick is used. Run with --list-nodes to inspect tensor names.')
 		sys.exit(2)
 
-	# If user wants to export an augmented model, do that first
-	if args.export_onnx:
-		onnx_out, md_path = save_augmented_model(args.onnx, args.node, args.out)
-		print('Saved augmented ONNX:', onnx_out)
-		print('Wrote outputs description:', md_path)
-		# You can still continue to run a quick inference to verify shapes below.
+	# Export an augmented model with the selected feature map as an additional output
+	onnx_out, md_path = save_augmented_model(args.onnx, args.node, args.out)
+	print('Saved augmented ONNX:', onnx_out)
+	print('Wrote outputs description:', md_path)
 
 	# Build session with extra output (using original or temporary model)
 	sess, tmp_model = build_session(args.onnx, extra_output=args.node)

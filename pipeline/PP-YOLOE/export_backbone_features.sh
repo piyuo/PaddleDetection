@@ -31,7 +31,6 @@ echo "🔧 Auto-picking a feature map (${AUTO_PICK})..."
 	--auto_pick "${AUTO_PICK}" \
 	--roi_from_det \
 	--thresh 0.5 \
-	--export_onnx \
 	--out "${OUT_DIR}"
 
 echo
