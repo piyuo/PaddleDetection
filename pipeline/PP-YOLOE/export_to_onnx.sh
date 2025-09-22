@@ -141,5 +141,4 @@ fi
 #./pipeline/PP-YOLOE/export_backbone_features.sh
 python3 pipeline/PP-YOLOE/insert_embedding_head.py \
     --onnx_in pipeline/PP-YOLOE/backbone/ppyoloe_crn_s_36e_pphuman.onnx \
-    --onnx_out pipeline/PP-YOLOE/models/ppyoloe_crn_s_36e_pphuman_embed.onnx \
-	--roi_from ms
+    --onnx_out pipeline/PP-YOLOE/models/ppyoloe_crn_s_36e_pphuman_embed.onnx

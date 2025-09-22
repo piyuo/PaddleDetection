@@ -95,4 +95,5 @@ pipeline/output/
 pipeline/dataset/
 pipeline/PP-YOLOE/venv
 pipeline/PP-YOLOE/backbone
+pipeline/PP-YOLOE/models
 pipeline/PP-YOLOE/*.onnx
