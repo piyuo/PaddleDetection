@@ -5,15 +5,15 @@ Run inference on a single image using ONNX Runtime with the exported PP-YOLOE Hu
 Usage:
     python pipeline/PP-YOLOE/onnx_inference_image.py \
         [--img pipeline/dataset/demo/demo.jpg] \
-        [--onnx pipeline/PP-YOLOE/models/ppyoloe_crn_s_36e_pphuman_embed_det.onnx] \
+        [--onnx pipeline/PP-YOLOE/models/ppyoloe_crn_s_36e_pphuman_embed.onnx] \
         [--infer_cfg pipeline/PP-YOLOE/backbone/inference_model/ppyoloe_crn_s_36e_pphuman/infer_cfg.yml] \
         [--out pipeline/output/onnx_vis] \
         [--thresh 0.5] [--gpu]
 
 Requirement:
-    - The ONNX model must expose per-detection embeddings named "embeddings_det" with shape (N, D),
+    - The ONNX model must expose per-detection embeddings named "embed" with shape (N, D),
         where N matches the number of rows in the detection output (top-K). This script will error out
-        if "embeddings_det" is not present.
+        if "embed" is not present.
 
 Notes:
     - This script reuses PaddleDetection's ONNX preprocess (deploy/third_engine/onnx/preprocess.py).
@@ -26,7 +26,6 @@ import sys
 from typing import Tuple
 
 import numpy as np
-
 
 def roi_pool_average(feat_map: np.ndarray, boxes_xyxy: np.ndarray, img_hw: Tuple[int, int]) -> np.ndarray:
     """
@@ -238,21 +237,21 @@ def main():
             shape = getattr(arr, 'shape', None)
             print(f'  - {n}: {shape}')
     # Enforce presence of per-detection embeddings
-    if 'embeddings_det' not in name_to_out or not isinstance(name_to_out['embeddings_det'], np.ndarray):
-        print('\n[ERROR] Model does not expose per-detection embeddings "embeddings_det".', file=sys.stderr)
+    if 'embed' not in name_to_out or not isinstance(name_to_out['embed'], np.ndarray):
+        print('\n[ERROR] Model does not expose per-detection embeddings "embed".', file=sys.stderr)
         if not args.list_outputs:
             print('        Tip: run with --list_outputs to see available outputs.', file=sys.stderr)
-        print('        Use pipeline/PP-YOLOE/insert_embedding_head.py to augment your model, or load the *_embed_det.onnx.', file=sys.stderr)
+        print('        Use pipeline/PP-YOLOE/insert_embedding_head.py to augment your model, or load the *_embed.onnx.', file=sys.stderr)
         sys.exit(2)
 
-    det_embs = name_to_out['embeddings_det']
+    det_embs = name_to_out['embed']
     if det_embs.ndim != 2 or det_embs.shape[0] == 0:
-        print('\n[ERROR] "embeddings_det" must be a 2D array shaped (N, D) with N>0. Got:', det_embs.shape, file=sys.stderr)
+        print('\n[ERROR] "embed" must be a 2D array shaped (N, D) with N>0. Got:', det_embs.shape, file=sys.stderr)
         sys.exit(2)
 
     if det_embs.shape[0] != bboxes.shape[0]:
         print('\n[ERROR] Row count mismatch between detections and embeddings:', file=sys.stderr)
-        print('        detections:', bboxes.shape, ' embeddings_det:', det_embs.shape, file=sys.stderr)
+        print('        detections:', bboxes.shape, ' embed:', det_embs.shape, file=sys.stderr)
         print('        Ensure your model outputs align. Regenerate with insert_embedding_head.py if needed.', file=sys.stderr)
         sys.exit(2)
 
@@ -269,8 +268,8 @@ def main():
     os.makedirs(args.out, exist_ok=True)
 
     print('\n[BoT-SORT] Per-detection embeddings ready (console only):')
-    print('  - embeddings_det (all):', det_embs.shape)
-    print('  - embeddings_det_valid:', embs_valid.shape)
+    print('  - embed (all):', det_embs.shape)
+    print('  - embed_valid:', embs_valid.shape)
     print('  - detections_valid:', boxes_valid.shape)
 
     # Optional: Embedding sanity checks to ensure values are informative per detection

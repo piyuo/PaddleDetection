@@ -3,13 +3,13 @@
 Insert per-detection appearance embeddings into a PP-YOLOE ONNX model.
 
 Key outcomes (accurate as of 2025‑09‑21):
-- Produces per-detection, L2-normalized embeddings in a new output named 'embeddings_det' (BoT-SORT-ready).
+- Produces per-detection, L2-normalized embeddings in a new output named 'embed' (BoT-SORT-ready).
 - Auto-picks two rank-4 feature maps near strides s8 and s16; falls back to runtime probing if static shape inference is insufficient.
 - Applies ROIAlign on s8 and s16 with proper spatial_scale and rescales detection boxes by 'scale_factor' if present to match Paddle behavior.
 - Per-ROI processing pipeline (per feature map): optional InstanceNorm (default OFF), signed-sqrt (power-law) normalization, and global pooling by averaging ReduceMean and ReduceMax ((avg+max)/2).
 - Optional part pooling over horizontal/vertical stripes blended via weights; default disabled (pp_w=0.0).
 - Optional color-statistics branch (per-ROI RGB mean and std -> 6D) from the image input, scaled by color_gain (default 1.0; set 0 to disable).
-- Concatenates [s8_mix, s16_mix, (optional color)] -> sanitizes NaNs -> final L2 normalization along channel to produce embeddings_det.
+- Concatenates [s8_mix, s16_mix, (optional color)] -> sanitizes NaNs -> final L2 normalization along channel to produce embed.
 - Opset-16-safe ops/attributes (ReduceMean/Max/Sum with axes/keepdims, etc.) and original model outputs preserved.
     Embedding dim = C_s8 + C_s16 (+6 if color is enabled). Original detection outputs remain unchanged.
 
@@ -249,7 +249,7 @@ def probe_rank4_candidates(onnx, helper, TensorProto, model, max_probe: int = 15
     return probed
 
 
-# (Removed image-level embedding head to simplify the script; we only produce per-detection embeddings_det.)
+# (Removed image-level embedding head to simplify the script; we only produce per-detection embed.)
 
 
 def find_detection_output(onnx, model) -> Optional[str]:
@@ -289,7 +289,7 @@ def find_detection_output(onnx, model) -> Optional[str]:
     return None
 
 
-def add_roi_head(onnx, helper, TensorProto, model, feat_name: str, det_out_name: str, stride: int, out_name: str = 'embeddings_det', pooled_hw: int = 14):
+def add_roi_head(onnx, helper, TensorProto, model, feat_name: str, det_out_name: str, stride: int, out_name: str = 'embed', pooled_hw: int = 14):
     g = model.graph
 
     def make_name(base):
@@ -455,7 +455,7 @@ def add_roi_head_multi_scale(
     det_out_name: str,
     stride8: int = 8,
     stride16: int = 16,
-    out_name: str = 'embeddings_det',
+    out_name: str = 'embed',
     pooled_hw: int = 14,
     gp_w: float = 1.0,
     pp_w: float = 0.0,
@@ -903,9 +903,9 @@ def add_roi_head_multi_scale(
 def main():
     onnx, helper, TensorProto = import_onnx_modules()
 
-    ap = argparse.ArgumentParser(description='Add per-detection ROI embeddings (multi-scale s8+s16) -> embeddings_det')
+    ap = argparse.ArgumentParser(description='Add per-detection ROI embeddings (multi-scale s8+s16) -> embed')
     ap.add_argument('--onnx_in', required=True, help='Input ONNX model path')
-    ap.add_argument('--onnx_out', default=None, help='Output ONNX model path (default: *_embed_det.onnx)')
+    ap.add_argument('--onnx_out', default=None, help='Output ONNX model path (default: *_embed.onnx)')
     ap.add_argument('--s8_node', default=None, help='Override tensor name for s8 feature')
     ap.add_argument('--s16_node', default=None, help='Override tensor name for s16 feature')
     ap.add_argument('--det_out', default=None, help='Detection output (Nx6) tensor name (auto if omitted)')
@@ -969,7 +969,7 @@ def main():
         det_out,
         stride8=8,
         stride16=16,
-        out_name='embeddings_det',
+        out_name='embed',
         pooled_hw=14,
         gp_w=args.gp_w,
         pp_w=args.pp_w,
@@ -985,7 +985,7 @@ def main():
     out_path = args.onnx_out
     if not out_path:
         base = os.path.splitext(args.onnx_in)[0]
-        out_path = base + '_embed_det.onnx'
+        out_path = base + '_embed.onnx'
     onnx.save(model, out_path)
     print('Saved ONNX with embedding head:', out_path)
     # Print final output names to confirm presence
