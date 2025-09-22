@@ -26,7 +26,6 @@ python3 pipeline/PP-YOLOE/onnx_inference_image.py \
     --onnx pipeline/PP-YOLOE/models/ppyoloe_crn_s_36e_pphuman_embed.onnx \
     --infer_cfg pipeline/PP-YOLOE/backbone/inference_model/ppyoloe_crn_s_36e_pphuman/infer_cfg.yml \
     --out pipeline/output \
-    --check_embed \
     --thresh 0.5
 
 echo "✅ ONNX inference completed! Check pipeline/output/ for visualized result images."

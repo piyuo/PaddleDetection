@@ -177,8 +177,6 @@ def main():
     parser.add_argument('--out', default=d_out, help='Directory to save visualization')
     parser.add_argument('--thresh', type=float, default=None, help='Score threshold for printing/drawing (default from infer_cfg)')
     parser.add_argument('--gpu', action='store_true', help='Use GPU if onnxruntime-gpu is available')
-    parser.add_argument('--check_embed', action='store_true',
-                        help='Run embedding sanity checks (cosine similarity stats, top similar pairs) and save a brief report')
     args = parser.parse_args()
 
     # Validate inputs
@@ -197,15 +195,6 @@ def main():
         draw_threshold = args.thresh
     sess = get_session(args.onnx, args.gpu)
 
-    # Print concise model output summary to help debugging
-    out_names = [o.name for o in sess.get_outputs()]
-    print('Model outputs:', out_names)
-    print(" - expected outputs[0]: detections (N,6) [class, score, x0, y0, x1, y1]")
-    if 'embed' in out_names:
-        print(" - 'embed': per-detection embeddings (N, D)")
-    else:
-        print(" - 'embed' not present: run insert_embedding_head.py to add embeddings or use *_embed.onnx")
-
     # Prepare inputs using Compose. It will return a dict keyed by model input names.
     inputs_map = transforms(args.img)
     input_names = [i.name for i in sess.get_inputs()]
@@ -213,6 +202,20 @@ def main():
 
     # Run
     outputs = sess.run(None, feed)
+    out_names = [o.name for o in sess.get_outputs()]
+
+    # Combined model outputs summary (names + shapes) and expectations
+    print('Model outputs:', out_names)
+    print(" - expected outputs[0]: detections (N,6) [class, score, x0, y0, x1, y1]")
+    if 'embed' in out_names:
+        print(" - 'embed': per-detection embeddings (N, D)")
+    else:
+        print(" - 'embed' not present: run insert_embedding_head.py to add embeddings or use *_embed.onnx")
+    print('\n[Debug] Model outputs (names and shapes):')
+    for i, n in enumerate(out_names):
+        arr = outputs[i]
+        shape = getattr(arr, 'shape', None)
+        print(f'  - {n}: {shape}')
 
     # Post-process for PP-YOLOE: first output is [N,6] -> [class_id, score, x0, y0, x1, y1]
     bboxes = np.array(outputs[0])
@@ -226,23 +229,11 @@ def main():
     if kept == 0:
         print(f'No boxes above threshold {draw_threshold}. Try lowering --thresh.')
 
-    # Save visualization
     base = os.path.splitext(os.path.basename(args.img))[0]
     vis_path = os.path.join(args.out, f'{base}.jpg')
-    try:
-        draw_and_save(args.img, bboxes, draw_threshold, vis_path, label_list)
-        print('Saved visualization to:', vis_path)
-    except Exception as e:
-        print('[WARN] Failed to save visualization:', e)
 
     # --- Require per-detection embeddings for BoT-SORT ---
     name_to_out = {out_names[i]: outputs[i] for i in range(len(out_names))}
-    # Always print outputs with shapes for debugging
-    print('\n[Debug] Model outputs (names and shapes):')
-    for i, n in enumerate(out_names):
-        arr = outputs[i]
-        shape = getattr(arr, 'shape', None)
-        print(f'  - {n}: {shape}')
     # Enforce presence of per-detection embeddings
     if 'embed' not in name_to_out or not isinstance(name_to_out['embed'], np.ndarray):
         print('\n[ERROR] Model does not expose per-detection embeddings "embed".', file=sys.stderr)
@@ -272,24 +263,31 @@ def main():
     base = os.path.splitext(os.path.basename(args.img))[0]
     os.makedirs(args.out, exist_ok=True)
 
+    # Save a single visualization with valid detection ids
+    try:
+        ids_valid = np.arange(boxes_valid.shape[0])
+        draw_and_save_with_ids(args.img, boxes_valid, ids_valid, float(draw_threshold), vis_path, label_list)
+        print('Saved visualization to:', vis_path)
+    except Exception as e:
+        print('[WARN] Failed to save visualization:', e)
+
     print('\n[BoT-SORT] Per-detection embeddings ready (console only):')
     print('  - embed (all):', det_embs.shape)
     print('  - embed_valid:', embs_valid.shape)
     print('  - detections_valid:', boxes_valid.shape)
 
-    # Optional: Embedding sanity checks to ensure values are informative per detection
-    if args.check_embed:
-        print('\n[Embeddings check] Basic stats:')
-        D = det_embs.shape[1]
-        print(f'  - embedding dim: {D}, total N: {det_embs.shape[0]}, valid N: {embs_valid.shape[0]}')
-        norms = np.linalg.norm(det_embs, axis=1)
-        print(f'  - L2 norms (all, after normalization): min={norms.min():.4f} mean={norms.mean():.4f} max={norms.max():.4f}')
-        norms_v = np.linalg.norm(embs_valid, axis=1) if embs_valid.size else np.array([])
-        if norms_v.size:
-            print(f'  - L2 norms (valid): min={norms_v.min():.4f} mean={norms_v.mean():.4f} max={norms_v.max():.4f}')
-            # Zero-vector rate (after normalization, zero means original vector was zero)
-            zero_rate = float((norms_v < 1e-8).sum()) / float(norms_v.size)
-            print(f'  - zero-vector rate (valid): {zero_rate*100:.1f}%')
+    # Embedding sanity checks to ensure values are informative per detection (always on)
+    print('\n[Embeddings check] Basic stats:')
+    D = det_embs.shape[1]
+    print(f'  - embedding dim: {D}, total N: {det_embs.shape[0]}, valid N: {embs_valid.shape[0]}')
+    norms = np.linalg.norm(det_embs, axis=1)
+    print(f'  - L2 norms (all, after normalization): min={norms.min():.4f} mean={norms.mean():.4f} max={norms.max():.4f}')
+    norms_v = np.linalg.norm(embs_valid, axis=1) if embs_valid.size else np.array([])
+    if norms_v.size:
+        print(f'  - L2 norms (valid): min={norms_v.min():.4f} mean={norms_v.mean():.4f} max={norms_v.max():.4f}')
+        # Zero-vector rate (after normalization, zero means original vector was zero)
+        zero_rate = float((norms_v < 1e-8).sum()) / float(norms_v.size)
+        print(f'  - zero-vector rate (valid): {zero_rate*100:.1f}%')
 
         def iou_xyxy(a: np.ndarray, b: np.ndarray) -> float:
             # a,b: (6,) [cls,score,x0,y0,x1,y1]
@@ -366,14 +364,6 @@ def main():
                 print(f'     id={i:2d} cls={int(cls_id)} score={score:.3f} box=[{x0:.0f},{y0:.0f},{x1:.0f},{y1:.0f}]{is_zero}')
                 print(f'        emb[:{dims_preview}]=[{pv_str}]  NN-> id={j:2d} cos={nn_cos[i]:.3f} IoU={iou_xyxy(boxes_valid[i], boxes_valid[j]):.3f}')
 
-            # Save an additional visualization with valid detection ids
-            ids_valid = np.arange(nv)
-            vis_idx = os.path.join(args.out, f'{base}_idx.jpg')
-            try:
-                draw_and_save_with_ids(args.img, boxes_valid, ids_valid, float(draw_threshold), vis_idx, label_list)
-                print('  - saved:', vis_idx)
-            except Exception as e:
-                print('[WARN] Failed to save id visualization:', e)
         else:
             print('  - Not enough valid detections for pairwise comparison.')
     return
