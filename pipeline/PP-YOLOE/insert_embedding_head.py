@@ -1,28 +1,29 @@
 #!/usr/bin/env python3
 """
-Insert a simple multi-scale embedding head into a PP-YOLOE ONNX model.
+Insert per-detection appearance embeddings into a PP-YOLOE ONNX model.
 
-What it does:
+What it does by default:
 - Auto-pick two backbone/neck feature maps around strides s8 and s16
-- Apply GlobalAveragePool + Flatten on both
-- Concat the pooled vectors and L2-normalize -> 'embedding' output
+- Add a multi-scale (s8+s16) ROIAlign + mean + L2 head that outputs per-detection embeddings -> 'embeddings_det'
+
+Optional (opt-in):
+- Add a global multi-scale image-level embedding ('embedding') via GlobalAveragePool on s8 and s16, concat, L2
 
 Notes:
-- No projection layer is added (no learned weights). This is a strong
-  baseline to verify BoT-SORT-style appearance features are available
-  directly from the model. You can later add a learned projection if needed.
-- The original model outputs are preserved.
+- No projection layer is added (no learned weights). This is a solid baseline for BoT-SORT-style appearance features.
+- The original model outputs are preserved, and you can strip the optional image-level embedding unless explicitly requested.
 
 Usage:
-  python pipeline/PP-YOLOE/insert_embedding_head.py \
-    --onnx_in pipeline/PP-YOLOE/backbone/ppyoloe_crn_s_36e_pphuman.onnx \
-    --onnx_out pipeline/PP-YOLOE/models/ppyoloe_crn_s_36e_pphuman_embed.onnx
+    python pipeline/PP-YOLOE/insert_embedding_head.py \
+        --onnx_in pipeline/PP-YOLOE/backbone/ppyoloe_crn_s_36e_pphuman.onnx
 
 Optional:
-    --s8_node <tensor_name>  --s16_node <tensor_name>  (to override auto-pick)
-    --pool avg|max  (default: avg)
-    --roi_from {s8,s16,ms}   Add a per-detection ROI head using the selected feature map, or 'ms' for s8+s16 concat
-    --det_out <tensor_name>  Detection output (Nx6) to source boxes from (auto-pick if omitted)
+        --s8_node <tensor_name>  --s16_node <tensor_name>   (override auto-pick)
+        --pool avg|max            (default: avg)
+        --roi_from {s8,s16,ms}    Per-detection ROI head source or multi-scale (default: ms)
+        --no_roi                  Disable the per-detection ROI head
+        --image_embedding         Also add a global image-level 'embedding' output (off by default)
+        --det_out <tensor_name>   Detection output (Nx6) to source boxes from (auto-pick if omitted)
 
 """
 
@@ -460,13 +461,15 @@ def add_roi_head_multi_scale(onnx, helper, TensorProto, model, feat8: str, feat1
 def main():
     onnx, helper, TensorProto = import_onnx_modules()
 
-    ap = argparse.ArgumentParser(description='Insert multi-scale (s8+s16) pooling+concat+L2 head into ONNX')
+    ap = argparse.ArgumentParser(description='Add per-detection ROI embeddings (default: multi-scale s8+s16); optional global image embedding')
     ap.add_argument('--onnx_in', required=True, help='Input ONNX model path')
     ap.add_argument('--onnx_out', default=None, help='Output ONNX model path (default: *_embed.onnx)')
     ap.add_argument('--s8_node', default=None, help='Override tensor name for s8 feature')
     ap.add_argument('--s16_node', default=None, help='Override tensor name for s16 feature')
     ap.add_argument('--pool', choices=['avg', 'max'], default='avg', help='Pooling type (default: avg)')
-    ap.add_argument('--roi_from', choices=['s8', 's16', 'ms'], default=None, help='Add per-detection ROI head from this feature map or multi-scale (ms)')
+    ap.add_argument('--roi_from', choices=['s8', 's16', 'ms'], default='ms', help='Per-detection ROI head from this feature map or multi-scale (ms). Default: ms. Use --no_roi to disable.')
+    ap.add_argument('--no_roi', action='store_true', help='Disable adding the per-detection ROI head (default adds multi-scale ROI head)')
+    ap.add_argument('--image_embedding', action='store_true', help="Also add a global multi-scale image embedding output named 'embedding' (off by default)")
     ap.add_argument('--det_out', default=None, help='Detection output (Nx6) tensor name (auto if omitted)')
     args = ap.parse_args()
 
@@ -495,28 +498,49 @@ def main():
     print(' - s8 :', s8_name)
     print(' - s16:', s16_name)
 
-    model = add_multi_scale_head(onnx, helper, TensorProto, model, s8_name, s16_name, pool=args.pool, embed_out_name='embedding')
+    # Optional: image-level multi-scale head (disabled by default)
+    if args.image_embedding:
+        model = add_multi_scale_head(onnx, helper, TensorProto, model, s8_name, s16_name, pool=args.pool, embed_out_name='embedding')
 
-    # Optional: add per-detection ROIAlign head
-    if args.roi_from is not None:
+    # Optional: add per-detection ROIAlign head (default: multi-scale, can be disabled via --no_roi)
+    effective_roi = None if args.no_roi else args.roi_from
+    if effective_roi is not None:
         det_out = args.det_out or find_detection_output(onnx, model)
         if not det_out:
             print('[ERROR] Could not auto-detect detection output (Nx6). Provide --det_out.', file=sys.stderr)
             sys.exit(3)
-        if args.roi_from == 'ms':
+        if effective_roi == 'ms':
             print(f'Adding multi-scale ROI head from s8 ({s8_name}) and s16 ({s16_name}), det_out={det_out}')
             model = add_roi_head_multi_scale(onnx, helper, TensorProto, model, s8_name, s16_name, det_out, stride8=8, stride16=16, out_name='embeddings_det', pooled_hw=7)
         else:
-            feat = s8_name if args.roi_from == 's8' else s16_name
-            stride = 8 if args.roi_from == 's8' else 16
-            print(f'Adding ROI head from {args.roi_from} ({feat}), det_out={det_out}, stride={stride}')
+            feat = s8_name if effective_roi == 's8' else s16_name
+            stride = 8 if effective_roi == 's8' else 16
+            print(f'Adding ROI head from {effective_roi} ({feat}), det_out={det_out}, stride={stride}')
             model = add_roi_head(onnx, helper, TensorProto, model, feat, det_out, stride=stride, out_name='embeddings_det', pooled_hw=7)
+
+    # Optionally strip image-level embedding output if not requested (handles re-running on prior *_embed.onnx)
+    if not args.image_embedding:
+        try:
+            g = model.graph
+            keep = [o for o in g.output if o.name != 'embedding']
+            if len(keep) != len(g.output):
+                # Replace outputs with filtered list
+                del g.output[:]
+                g.output.extend(keep)
+        except Exception:
+            pass
 
     out_path = args.onnx_out
     if not out_path:
         base = os.path.splitext(args.onnx_in)[0]
-        # If ROI head is added, default to *_embed_det.onnx for clarity
-        out_path = base + ('_embed_det.onnx' if args.roi_from is not None else '_embed.onnx')
+        added_roi = (effective_roi is not None)
+        added_img = bool(args.image_embedding)
+        if added_roi:
+            out_path = base + '_embed_det.onnx'
+        elif added_img:
+            out_path = base + '_embed.onnx'
+        else:
+            out_path = base + '_mod.onnx'
     onnx.save(model, out_path)
     print('Saved ONNX with embedding head:', out_path)
     # Print final output names to confirm presence
