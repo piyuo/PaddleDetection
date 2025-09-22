@@ -177,7 +177,6 @@ def main():
     parser.add_argument('--out', default=d_out, help='Directory to save visualization')
     parser.add_argument('--thresh', type=float, default=None, help='Score threshold for printing/drawing (default from infer_cfg)')
     parser.add_argument('--gpu', action='store_true', help='Use GPU if onnxruntime-gpu is available')
-    parser.add_argument('--list_outputs', action='store_true', help='Print ONNX output names and shapes')
     parser.add_argument('--check_embed', action='store_true',
                         help='Run embedding sanity checks (cosine similarity stats, top similar pairs) and save a brief report')
     args = parser.parse_args()
@@ -197,6 +196,15 @@ def main():
     if args.thresh is not None:
         draw_threshold = args.thresh
     sess = get_session(args.onnx, args.gpu)
+
+    # Print concise model output summary to help debugging
+    out_names = [o.name for o in sess.get_outputs()]
+    print('Model outputs:', out_names)
+    print(" - expected outputs[0]: detections (N,6) [class, score, x0, y0, x1, y1]")
+    if 'embed' in out_names:
+        print(" - 'embed': per-detection embeddings (N, D)")
+    else:
+        print(" - 'embed' not present: run insert_embedding_head.py to add embeddings or use *_embed.onnx")
 
     # Prepare inputs using Compose. It will return a dict keyed by model input names.
     inputs_map = transforms(args.img)
@@ -228,19 +236,16 @@ def main():
         print('[WARN] Failed to save visualization:', e)
 
     # --- Require per-detection embeddings for BoT-SORT ---
-    out_names = [o.name for o in sess.get_outputs()]
     name_to_out = {out_names[i]: outputs[i] for i in range(len(out_names))}
-    if args.list_outputs:
-        print('\n[Debug] Model outputs:')
-        for i, n in enumerate(out_names):
-            arr = outputs[i]
-            shape = getattr(arr, 'shape', None)
-            print(f'  - {n}: {shape}')
+    # Always print outputs with shapes for debugging
+    print('\n[Debug] Model outputs (names and shapes):')
+    for i, n in enumerate(out_names):
+        arr = outputs[i]
+        shape = getattr(arr, 'shape', None)
+        print(f'  - {n}: {shape}')
     # Enforce presence of per-detection embeddings
     if 'embed' not in name_to_out or not isinstance(name_to_out['embed'], np.ndarray):
         print('\n[ERROR] Model does not expose per-detection embeddings "embed".', file=sys.stderr)
-        if not args.list_outputs:
-            print('        Tip: run with --list_outputs to see available outputs.', file=sys.stderr)
         print('        Use pipeline/PP-YOLOE/insert_embedding_head.py to augment your model, or load the *_embed.onnx.', file=sys.stderr)
         sys.exit(2)
 

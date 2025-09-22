@@ -1,30 +1,56 @@
 #!/usr/bin/env python3
 """
-Insert per-detection appearance embeddings into a PP-YOLOE ONNX model.
+Insert per-detection appearance embeddings into a PP‑YOLOE ONNX model.
 
-Key outcomes (accurate as of 2025‑09‑21):
-- Produces per-detection, L2-normalized embeddings in a new output named 'embed' (BoT-SORT-ready).
-- Auto-picks two rank-4 feature maps near strides s8 and s16; falls back to runtime probing if static shape inference is insufficient.
-- Applies ROIAlign on s8 and s16 with proper spatial_scale and rescales detection boxes by 'scale_factor' if present to match Paddle behavior.
-- Per-ROI processing pipeline (per feature map): optional InstanceNorm (default OFF), signed-sqrt (power-law) normalization, and global pooling by averaging ReduceMean and ReduceMax ((avg+max)/2).
-- Optional part pooling over horizontal/vertical stripes blended via weights; default disabled (pp_w=0.0).
-- Optional color-statistics branch (per-ROI RGB mean and std -> 6D) from the image input, scaled by color_gain (default 1.0; set 0 to disable).
-- Concatenates [s8_mix, s16_mix, (optional color)] -> sanitizes NaNs -> final L2 normalization along channel to produce embed.
-- Opset-16-safe ops/attributes (ReduceMean/Max/Sum with axes/keepdims, etc.) and original model outputs preserved.
-    Embedding dim = C_s8 + C_s16 (+6 if color is enabled). Original detection outputs remain unchanged.
+What this does
+- Adds a BoT‑SORT–ready output named 'embed' with shape (N, D). Each row is an L2‑normalized per‑detection embedding.
+- Auto‑picks two rank‑4 features around strides s8 and s16 (multi‑scale ROIAlign). If static shapes are not enough, it can do a small
+    runtime probe to confirm shapes.
+- Per‑ROI pipeline (per scale): optional InstanceNorm → signed power‑law normalization → global pooling (avg/max mix) and part pooling
+    (horizontal/vertical stripes) → weighted blend → concat s8/s16 (and optional color) → NaN sanitize → final L2.
+- Keeps the original model outputs intact; only adds 'embed'. Embedding dim ≈ C_s8 + C_s16 (+6 if color branch enabled).
 
-Locked defaults used by the CLI path:
-- Global pooling weight gp_w=1.0; Part pooling weight pp_w=0.0 (disabled by default).
-- color_gain=1.0 (enables 6D color stats); pass 0.0 to disable and reduce embedding dim by 6.
-- InstanceNorm: OFF by default; can be explicitly enabled with --use_inst_norm.
+Recommended strong settings for tracking (good separation in our tests)
+- Use these flags when inserting the head for robust cosine spread:
+        --use_inst_norm \
+        --gp_w 0.2 --pp_w 0.8 \
+        --avg_w 1.0 --max_w 0.0 \
+        --pp_k 9 --pp_stripe_h 2 --pp_vertical_k 2 --pp_vertical_stripe_w 2 \
+        --pooled_hw 16 --sampling_ratio 2 \
+        --pl_alpha 0.35 --pre_norm_scales \
+        --color_gain 0.0
 
-Usage:
-    python pipeline/PP-YOLOE/insert_embedding_head.py \
-    --onnx_in pipeline/PP-YOLOE/backbone/ppyoloe_crn_s_36e_pphuman.onnx
+Expected embedding health (rule‑of‑thumb)
+- After normalization, pairwise cosine on valid detections typically shows: median ~0.05–0.10, p95 < ~0.35.
+- The highest cosines (>0.6) usually happen for duplicate/overlapping boxes of the same person (high IoU). Non‑overlapping pairs should
+    rarely exceed ~0.45–0.50.
 
-Optional:
-    --s8_node <tensor_name>  --s16_node <tensor_name>   (override auto-pick)
-    --det_out <tensor_name>  Detection output (Nx6) to source boxes from (auto-pick if omitted)
+BoT‑SORT wiring tips
+- The output name is 'embed' (float32, N×D). Make sure the tracker reads this tensor row‑aligned with detections.
+- Thresholding guidance:
+    * If your code uses cosine distance d = 1 − cos, set max_dist ≈ 0.40–0.45 (i.e., cos ≥ 0.55–0.60 is considered similar).
+    * If it uses cosine similarity directly, use a match threshold ≈ 0.55–0.60.
+- Keep IoU gating on (e.g., ≥ 0.2–0.3) to favor motion/overlap for short‑term matches and use appearance as a tiebreaker.
+- Use a reasonable feature history (e.g., nn_budget 50–100) and EMA/smoothing if available for track features.
+
+Troubleshooting / quality of life
+- If auto‑picking features is slow, cap the runtime probe count: --max_probe 20 (default is 60), or specify nodes explicitly with
+    --s8_node and --s16_node.
+- To disable the color branch and reduce D by 6, set --color_gain 0.0 (recommended for stability across lighting changes).
+- For small/skinny boxes, keep --sampling_ratio 2 and consider --pooled_hw 16–20.
+
+Quick usage
+        # Minimal (auto‑pick features and detection output)
+        python pipeline/PP-YOLOE/insert_embedding_head.py \
+                --onnx_in pipeline/PP-YOLOE/backbone/ppyoloe_crn_s_36e_pphuman.onnx \
+                --onnx_out pipeline/PP-YOLOE/models/ppyoloe_crn_s_36e_pphuman_embed.onnx \
+                --use_inst_norm --gp_w 0.2 --pp_w 0.8 --avg_w 1.0 --max_w 0.0 \
+                --pp_k 9 --pp_stripe_h 2 --pp_vertical_k 2 --pp_vertical_stripe_w 2 \
+                --pooled_hw 16 --sampling_ratio 2 --pl_alpha 0.35 --pre_norm_scales \
+                --color_gain 0.0 --max_probe 20
+
+        # If you know the feature node names, you can bypass probing entirely
+        ... --s8_node <tensor_name> --s16_node <tensor_name>
 
 """
 
@@ -974,22 +1000,24 @@ def main():
     ap.add_argument('--s8_node', default=None, help='Override tensor name for s8 feature')
     ap.add_argument('--s16_node', default=None, help='Override tensor name for s16 feature')
     ap.add_argument('--det_out', default=None, help='Detection output (Nx6) tensor name (auto if omitted)')
-    ap.add_argument('--max_probe', type=int, default=60, help='Max runtime outputs to probe when auto-picking feature tensors (default: 60)')
+    ap.add_argument('--max_probe', type=int, default=20, help='Max runtime outputs to probe when auto-picking feature tensors (default: 20)')
     # Tuning knobs for part/global pooling and color features
-    ap.add_argument('--gp_w', type=float, default=0.4, help='Weight for global pooled features (default: 0.4)')
-    ap.add_argument('--pp_w', type=float, default=0.6, help='Weight for part-pooled features (default: 0.6)')
-    ap.add_argument('--color_gain', type=float, default=0.3, help='Gain multiplier for color-statistics features (default: 0.3; set 0 to disable)')
-    ap.add_argument('--avg_w', type=float, default=0.8, help='Weight for average pooling within ROI (default: 0.8)')
-    ap.add_argument('--max_w', type=float, default=0.2, help='Weight for max pooling within ROI (default: 0.2)')
-    ap.add_argument('--pp_k', type=int, default=7, help='Number of horizontal stripes (default: 7 for pooled_hw=14)')
-    ap.add_argument('--pp_stripe_h', type=int, default=2, help='Height of each horizontal stripe (default: 2 for pooled_hw=14)')
-    ap.add_argument('--pp_vertical_k', type=int, default=7, help='Number of vertical stripes (default: 7 for pooled_hw=14; set 0 to disable)')
-    ap.add_argument('--pp_vertical_stripe_w', type=int, default=2, help='Width of each vertical stripe (default: 2 for pooled_hw=14)')
-    ap.add_argument('--pooled_hw', type=int, default=14, help='ROIAlign pooled size H=W (default: 14)')
-    ap.add_argument('--pl_alpha', type=float, default=0.5, help='Signed power-law exponent alpha (default: 0.5 for signed-sqrt)')
-    ap.add_argument('--pre_norm_scales', action='store_true', help='L2-normalize s8/s16 vectors before concatenation')
-    ap.add_argument('--sampling_ratio', type=int, default=0, help='RoiAlign sampling_ratio (0 for adaptive, >0 for fixed samples per bin)')
-    # InstanceNorm control: default OFF unless explicitly enabled
+    ap.add_argument('--gp_w', type=float, default=0.2, help='Weight for global pooled features (default: 0.2)')
+    ap.add_argument('--pp_w', type=float, default=0.8, help='Weight for part-pooled features (default: 0.8)')
+    ap.add_argument('--color_gain', type=float, default=0.0, help='Gain multiplier for color-statistics features (default: 0.0; set >0 to enable)')
+    ap.add_argument('--avg_w', type=float, default=1.0, help='Weight for average pooling within ROI (default: 1.0)')
+    ap.add_argument('--max_w', type=float, default=0.0, help='Weight for max pooling within ROI (default: 0.0)')
+    ap.add_argument('--pp_k', type=int, default=9, help='Number of horizontal stripes (default: 9 for pooled_hw=16)')
+    ap.add_argument('--pp_stripe_h', type=int, default=2, help='Height of each horizontal stripe (default: 2 for pooled_hw=16)')
+    ap.add_argument('--pp_vertical_k', type=int, default=2, help='Number of vertical stripes (default: 2 for pooled_hw=16; set 0 to disable)')
+    ap.add_argument('--pp_vertical_stripe_w', type=int, default=2, help='Width of each vertical stripe (default: 2 for pooled_hw=16)')
+    ap.add_argument('--pooled_hw', type=int, default=16, help='ROIAlign pooled size H=W (default: 16)')
+    ap.add_argument('--pl_alpha', type=float, default=0.35, help='Signed power-law exponent alpha (default: 0.35)')
+    # Pre-normalization control: default ON, allow disabling with --no_pre_norm_scales
+    ap.add_argument('--pre_norm_scales', dest='pre_norm_scales', action='store_true', default=True, help='L2-normalize s8/s16 vectors before concatenation (default: enabled)')
+    ap.add_argument('--no_pre_norm_scales', dest='pre_norm_scales', action='store_false', help='Disable L2 pre-normalization of s8/s16 vectors before concatenation')
+    ap.add_argument('--sampling_ratio', type=int, default=2, help='RoiAlign sampling_ratio (0 for adaptive, >0 for fixed samples per bin; default: 2)')
+    # InstanceNorm control: default ON unless explicitly disabled
     ap.add_argument('--no_inst_norm', action='store_true', help='Disable per-ROI instance normalization')
     ap.add_argument('--use_inst_norm', action='store_true', help='Enable per-ROI instance normalization (overrides --no_inst_norm)')
     ap.add_argument('--no_center_ch', action='store_true', help='Disable per-vector channel centering before L2 normalization')
@@ -1028,8 +1056,8 @@ def main():
         print('[ERROR] Could not auto-detect detection output (Nx6). Provide --det_out.', file=sys.stderr)
         sys.exit(3)
     print(f'Adding multi-scale ROI head from s8 ({s8_name}) and s16 ({s16_name}), det_out={det_out}')
-    # Resolve InstanceNorm usage: default OFF unless --use_inst_norm set
-    use_inst = True if getattr(args, 'use_inst_norm', False) else (False if getattr(args, 'no_inst_norm', False) else False)
+    # Resolve InstanceNorm usage: default ON unless --no_inst_norm set
+    use_inst = False if getattr(args, 'no_inst_norm', False) else (True if getattr(args, 'use_inst_norm', False) else True)
 
     model = add_roi_head_multi_scale(
         onnx,
@@ -1055,7 +1083,7 @@ def main():
         use_inst_norm=use_inst,
         center_ch=(False if getattr(args, 'no_center_ch', False) else True),
         pl_alpha=args.pl_alpha,
-        pre_norm_scales=bool(getattr(args, 'pre_norm_scales', False)),
+    pre_norm_scales=bool(getattr(args, 'pre_norm_scales', True)),
         sampling_ratio=int(getattr(args, 'sampling_ratio', 0)),
     )
 
