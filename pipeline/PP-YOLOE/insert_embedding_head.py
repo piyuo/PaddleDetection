@@ -2,13 +2,21 @@
 """
 Insert per-detection appearance embeddings into a PP-YOLOE ONNX model.
 
-What it does:
-- Auto-pick two backbone/neck feature maps around strides s8 and s16
-- Add a multi-scale (s8+s16) ROIAlign + mean + L2 head that outputs per-detection embeddings -> 'embeddings_det'
+Key outcomes (accurate as of 2025‑09‑21):
+- Produces per-detection, L2-normalized embeddings in a new output named 'embeddings_det' (BoT-SORT-ready).
+- Auto-picks two rank-4 feature maps near strides s8 and s16; falls back to runtime probing if static shape inference is insufficient.
+- Applies ROIAlign on s8 and s16 with proper spatial_scale and rescales detection boxes by 'scale_factor' if present to match Paddle behavior.
+- Per-ROI processing pipeline (per feature map): optional InstanceNorm (default OFF), signed-sqrt (power-law) normalization, and global pooling by averaging ReduceMean and ReduceMax ((avg+max)/2).
+- Optional part pooling over horizontal/vertical stripes blended via weights; default disabled (pp_w=0.0).
+- Optional color-statistics branch (per-ROI RGB mean and std -> 6D) from the image input, scaled by color_gain (default 1.0; set 0 to disable).
+- Concatenates [s8_mix, s16_mix, (optional color)] -> sanitizes NaNs -> final L2 normalization along channel to produce embeddings_det.
+- Opset-16-safe ops/attributes (ReduceMean/Max/Sum with axes/keepdims, etc.) and original model outputs preserved.
+    Embedding dim = C_s8 + C_s16 (+6 if color is enabled). Original detection outputs remain unchanged.
 
-Notes:
-- No projection layer is added (no learned weights). This is a solid baseline for BoT-SORT-style appearance features.
-- The original model outputs are preserved.
+Locked defaults used by the CLI path:
+- Global pooling weight gp_w=1.0; Part pooling weight pp_w=0.0 (disabled by default).
+- color_gain=1.0 (enables 6D color stats); pass 0.0 to disable and reduce embedding dim by 6.
+- InstanceNorm: OFF by default; can be explicitly enabled with --use_inst_norm.
 
 Usage:
     python pipeline/PP-YOLOE/insert_embedding_head.py \
@@ -364,6 +372,7 @@ def add_roi_head(onnx, helper, TensorProto, model, feat_name: str, det_out_name:
     ])
 
     # Instance normalization per ROI (per-channel, across HxW) to increase contrast without learned params
+    # Note: this single-scale helper always applies InstanceNorm. It is not used by the default multi-scale path.
     mean_hw = roi_out + '_meanhw'
     g.node.extend([
         helper.make_node('ReduceMean', inputs=[roi_out], outputs=[mean_hw], name=make_name('ReduceMean'), keepdims=1, axes=[2, 3])
@@ -396,7 +405,7 @@ def add_roi_head(onnx, helper, TensorProto, model, feat_name: str, det_out_name:
         helper.make_node('Div', inputs=[x_center, std_hw], outputs=[x_norm], name=make_name('Div'))
     ])
 
-    # Reduce over H and W of normalized features -> use avg+max then average them elementwise
+    # Reduce over H and W of normalized features -> use avg+max then average them elementwise (global pooling)
     # Use unique suffixes to avoid clashes with part-based pooling
     avg = roi_out + '_gavg'
     mx = roi_out + '_gmax'
@@ -448,14 +457,14 @@ def add_roi_head_multi_scale(
     stride16: int = 16,
     out_name: str = 'embeddings_det',
     pooled_hw: int = 14,
-    gp_w: float = 0.3,
-    pp_w: float = 0.7,
-    color_gain_val: float = 4.0,
+    gp_w: float = 1.0,
+    pp_w: float = 0.0,
+    color_gain_val: float = 1.0,
     pp_k: int = 7,
     pp_stripe_h: int = 2,
     pp_vertical_k: int = 7,
     pp_vertical_stripe_w: int = 2,
-    use_inst_norm: bool = True,
+    use_inst_norm: bool = False,
 ):
     g = model.graph
 
@@ -691,9 +700,8 @@ def add_roi_head_multi_scale(
     g.node.extend([helper.make_node('Add', inputs=[avg8, max8], outputs=[pooled8_add], name=make_name('Add'))])
     g.node.extend([helper.make_node('Mul', inputs=[pooled8_add, half], outputs=[pooled8], name=make_name('Mul'))])
 
-    # Part-based pooling over H stripes (keeps (N, C)) and blend with global pooled
-    # Increase contribution of part-based pooling to improve discriminativeness
-    # If pp_w <= 0, skip building part-pooling graph and use zeros to avoid NaN*0 propagation
+    # Part-based pooling over H stripes (keeps (N, C)) and optionally blend with global pooled.
+    # If pp_w <= 0 (default), skip building part-pooling graph and use zeros to avoid NaN*0 propagation.
     if pp_w is not None and float(pp_w) <= 0.0:
         # Create a zeros-like tensor by subtracting the tensor from itself
         pb8 = roi8 + '_pp_zero'
@@ -702,7 +710,7 @@ def add_roi_head_multi_scale(
         ])
     else:
         pb8_h = add_part_pool(pl8, roi8, K=pp_k, stripe_h=pp_stripe_h)
-        # optional vertical pooling
+    # Optional vertical pooling
         pb8_v: Optional[str] = None
         if pp_vertical_k and pp_vertical_k > 0:
             pb8_v = add_part_pool_vertical(pl8, roi8, K=pp_vertical_k, stripe_w=pp_vertical_stripe_w)
