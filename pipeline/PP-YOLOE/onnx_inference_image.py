@@ -211,11 +211,50 @@ def main():
         print(" - 'embed': per-detection embeddings (N, D)")
     else:
         print(" - 'embed' not present: run insert_embedding_head.py to add embeddings or use *_embed.onnx")
-    print('\n[Debug] Model outputs (names and shapes):')
+    print('\n[Debug] Model outputs (names, shapes, and quick notes):')
     for i, n in enumerate(out_names):
         arr = outputs[i]
         shape = getattr(arr, 'shape', None)
         print(f'  - {n}: {shape}')
+        try:
+            # Heuristic descriptions and small samples
+            if i == 0 and isinstance(arr, np.ndarray) and arr.ndim == 2 and arr.shape[1] == 6:
+                # Detection head
+                dets = arr
+                num = dets.shape[0]
+                num_valid = int(((dets[:, 0] > -1) & (dets[:, 1] >= float(draw_threshold))).sum()) if num else 0
+                print('      • detections (N,6) = [class, score, x0, y0, x1, y1]')
+                print(f'      • N={num}, valid(≥{float(draw_threshold):.2f})={num_valid}')
+                if num:
+                    k = min(3, num)
+                    print('      • samples:')
+                    for r in range(k):
+                        cls, sc, x0, y0, x1, y1 = dets[r]
+                        print(f'         {int(cls)} {sc:.4f} {x0:.1f} {y0:.1f} {x1:.1f} {y1:.1f}')
+            elif n == 'embed' and isinstance(arr, np.ndarray) and arr.ndim == 2:
+                N, D = arr.shape
+                print('      • embeddings (N,D), L2-normalized expected downstream')
+                print(f'      • N={N}, D={D}')
+                if N > 0:
+                    pv = arr[0, :min(8, D)]
+                    pv_str = ' '.join(f'{v:.2f}' for v in pv.tolist())
+                    print(f'      • first emb[:{min(8,D)}]=[{pv_str}]')
+            elif isinstance(arr, np.ndarray) and arr.ndim == 1 and arr.size <= 4:
+                # Likely auxiliary scalar/vector (often count or image meta); safe to ignore for tracking
+                vals = ' '.join(f'{float(v):.3f}' for v in arr.tolist())
+                hint = ' (often count/image meta; usually safe to ignore)'
+                print(f'      • auxiliary vector: [{vals}]' + hint)
+            else:
+                # Generic small sample
+                flat = arr.ravel() if isinstance(arr, np.ndarray) else []
+                if isinstance(flat, np.ndarray) and flat.size:
+                    k = min(8, flat.size)
+                    vals = ' '.join(f'{float(v):.3f}' for v in flat[:k].tolist())
+                    more = ' …' if flat.size > k else ''
+                    print(f'      • sample: [{vals}]{more}')
+        except Exception:
+            # best-effort only
+            pass
 
     # Post-process for PP-YOLOE: first output is [N,6] -> [class_id, score, x0, y0, x1, y1]
     bboxes = np.array(outputs[0])
