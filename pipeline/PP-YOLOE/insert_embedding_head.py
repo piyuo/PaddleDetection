@@ -460,13 +460,23 @@ def add_roi_head_multi_scale(
     gp_w: float = 1.0,
     pp_w: float = 0.0,
     color_gain_val: float = 1.0,
+    avg_w: float = 0.5,
+    max_w: float = 0.5,
     pp_k: int = 7,
     pp_stripe_h: int = 2,
     pp_vertical_k: int = 7,
     pp_vertical_stripe_w: int = 2,
     use_inst_norm: bool = False,
+    center_ch: bool = True,
+    pl_alpha: float = 0.5,
+    pre_norm_scales: bool = False,
+    sampling_ratio: int = 0,
 ):
     g = model.graph
+
+    # Common 0.5 constant used for averaging two tensors
+    if not any(init.name == 'const_half' for init in g.initializer):
+        g.initializer.extend([helper.make_tensor(name='const_half', data_type=TensorProto.FLOAT, dims=[1], vals=[0.5])])
 
     def make_name(base):
         idx = 0
@@ -644,9 +654,9 @@ def add_roi_head_multi_scale(
 
     # ROIAlign on s8 and s16 (ensure unique value names even if features coincide)
     roi8 = feat8 + '_roi_ms8'
-    g.node.extend([helper.make_node('RoiAlign', inputs=[feat8, boxes, batch_idx], outputs=[roi8], name=make_name('RoiAlign'), mode='avg', output_height=pooled_hw, output_width=pooled_hw, sampling_ratio=0, spatial_scale=1.0/float(stride8))])
+    g.node.extend([helper.make_node('RoiAlign', inputs=[feat8, boxes, batch_idx], outputs=[roi8], name=make_name('RoiAlign'), mode='avg', output_height=pooled_hw, output_width=pooled_hw, sampling_ratio=int(sampling_ratio), spatial_scale=1.0/float(stride8))])
     roi16 = feat16 + '_roi_ms16'
-    g.node.extend([helper.make_node('RoiAlign', inputs=[feat16, boxes, batch_idx], outputs=[roi16], name=make_name('RoiAlign'), mode='avg', output_height=pooled_hw, output_width=pooled_hw, sampling_ratio=0, spatial_scale=1.0/float(stride16))])
+    g.node.extend([helper.make_node('RoiAlign', inputs=[feat16, boxes, batch_idx], outputs=[roi16], name=make_name('RoiAlign'), mode='avg', output_height=pooled_hw, output_width=pooled_hw, sampling_ratio=int(sampling_ratio), spatial_scale=1.0/float(stride16))])
 
     # Instance normalization per ROI for s8 (optional)
     if use_inst_norm:
@@ -671,20 +681,23 @@ def add_roi_head_multi_scale(
     else:
         src8 = roi8
 
-    # Power-law (signed sqrt) normalization to reduce burstiness: y = sign(x)*sqrt(|x| + eps)
+    # Power-law (signed) normalization to reduce burstiness: y = sign(x) * (|x| + eps)^alpha
     eps_pl = 'eps_powerlaw'
     if not any(init.name == eps_pl for init in g.initializer):
         g.initializer.extend([helper.make_tensor(name=eps_pl, data_type=TensorProto.FLOAT, dims=[1], vals=[1e-6])])
+    const_pl_alpha = 'const_pl_alpha'
+    if not any(init.name == const_pl_alpha for init in g.initializer):
+        g.initializer.extend([helper.make_tensor(name=const_pl_alpha, data_type=TensorProto.FLOAT, dims=[1], vals=[float(pl_alpha)])])
     abs8 = src8 + '_abs'
     g.node.extend([helper.make_node('Abs', inputs=[src8], outputs=[abs8], name=make_name('Abs'))])
     abseps8 = src8 + '_abseps'
     g.node.extend([helper.make_node('Add', inputs=[abs8, eps_pl], outputs=[abseps8], name=make_name('Add'))])
-    sqrt8 = src8 + '_sqrtabs'
-    g.node.extend([helper.make_node('Sqrt', inputs=[abseps8], outputs=[sqrt8], name=make_name('Sqrt'))])
+    pow8 = src8 + '_powabs'
+    g.node.extend([helper.make_node('Pow', inputs=[abseps8, const_pl_alpha], outputs=[pow8], name=make_name('Pow'))])
     sign8 = src8 + '_sign'
     g.node.extend([helper.make_node('Sign', inputs=[src8], outputs=[sign8], name=make_name('Sign'))])
     pl8 = src8 + '_powerlaw'
-    g.node.extend([helper.make_node('Mul', inputs=[sign8, sqrt8], outputs=[pl8], name=make_name('Mul'))])
+    g.node.extend([helper.make_node('Mul', inputs=[sign8, pow8], outputs=[pl8], name=make_name('Mul'))])
 
     # Reduce over H and W: avg+max then average to keep dim unchanged (global pooling)
     # Use unique name suffixes to avoid colliding with part-pooling outputs
@@ -692,13 +705,21 @@ def add_roi_head_multi_scale(
     max8 = roi8 + '_gmax'
     g.node.extend([helper.make_node('ReduceMean', inputs=[pl8], outputs=[avg8], name=make_name('ReduceMean'), keepdims=0, axes=[2, 3])])
     g.node.extend([helper.make_node('ReduceMax', inputs=[pl8], outputs=[max8], name=make_name('ReduceMax'), keepdims=0, axes=[2, 3])])
-    pooled8_add = roi8 + '_avgmax_add'
-    pooled8 = roi8 + '_avgmax'
-    half = 'const_half'
-    if not any(init.name == half for init in g.initializer):
-        g.initializer.extend([helper.make_tensor(name=half, data_type=TensorProto.FLOAT, dims=[1], vals=[0.5])])
-    g.node.extend([helper.make_node('Add', inputs=[avg8, max8], outputs=[pooled8_add], name=make_name('Add'))])
-    g.node.extend([helper.make_node('Mul', inputs=[pooled8_add, half], outputs=[pooled8], name=make_name('Mul'))])
+    # Weighted combine: pooled8 = avg8*avg_w + max8*max_w (defaults favor avg)
+    const_avg_w = 'const_avg_w'
+    const_max_w = 'const_max_w'
+    init_names_local = {init.name for init in g.initializer}
+    if const_avg_w not in init_names_local:
+        g.initializer.extend([helper.make_tensor(name=const_avg_w, data_type=TensorProto.FLOAT, dims=[1], vals=[float(avg_w)])])
+    if const_max_w not in init_names_local:
+        g.initializer.extend([helper.make_tensor(name=const_max_w, data_type=TensorProto.FLOAT, dims=[1], vals=[float(max_w)])])
+    avg8_w = roi8 + '_gavg_w'
+    max8_w = roi8 + '_gmax_w'
+    pooled8 = roi8 + '_gpool'
+    # Important: append nodes one-by-one so make_name() sees the updated graph
+    g.node.extend([helper.make_node('Mul', inputs=[avg8, const_avg_w], outputs=[avg8_w], name=make_name('Mul'))])
+    g.node.extend([helper.make_node('Mul', inputs=[max8, const_max_w], outputs=[max8_w], name=make_name('Mul'))])
+    g.node.extend([helper.make_node('Add', inputs=[avg8_w, max8_w], outputs=[pooled8], name=make_name('Add'))])
 
     # Part-based pooling over H stripes (keeps (N, C)) and optionally blend with global pooled.
     # If pp_w <= 0 (default), skip building part-pooling graph and use zeros to avoid NaN*0 propagation.
@@ -765,22 +786,26 @@ def add_roi_head_multi_scale(
     g.node.extend([helper.make_node('Abs', inputs=[src16], outputs=[abs16], name=make_name('Abs'))])
     abseps16 = src16 + '_abseps'
     g.node.extend([helper.make_node('Add', inputs=[abs16, eps_pl], outputs=[abseps16], name=make_name('Add'))])
-    sqrt16 = src16 + '_sqrtabs'
-    g.node.extend([helper.make_node('Sqrt', inputs=[abseps16], outputs=[sqrt16], name=make_name('Sqrt'))])
+    pow16 = src16 + '_powabs'
+    g.node.extend([helper.make_node('Pow', inputs=[abseps16, const_pl_alpha], outputs=[pow16], name=make_name('Pow'))])
     sign16 = src16 + '_sign'
     g.node.extend([helper.make_node('Sign', inputs=[src16], outputs=[sign16], name=make_name('Sign'))])
     pl16 = src16 + '_powerlaw'
-    g.node.extend([helper.make_node('Mul', inputs=[sign16, sqrt16], outputs=[pl16], name=make_name('Mul'))])
+    g.node.extend([helper.make_node('Mul', inputs=[sign16, pow16], outputs=[pl16], name=make_name('Mul'))])
 
     # Use unique name suffixes for s16 as well
     avg16 = roi16 + '_gavg'
     max16 = roi16 + '_gmax'
     g.node.extend([helper.make_node('ReduceMean', inputs=[pl16], outputs=[avg16], name=make_name('ReduceMean'), keepdims=0, axes=[2, 3])])
     g.node.extend([helper.make_node('ReduceMax', inputs=[pl16], outputs=[max16], name=make_name('ReduceMax'), keepdims=0, axes=[2, 3])])
-    pooled16_add = roi16 + '_avgmax_add'
-    pooled16 = roi16 + '_avgmax'
-    g.node.extend([helper.make_node('Add', inputs=[avg16, max16], outputs=[pooled16_add], name=make_name('Add'))])
-    g.node.extend([helper.make_node('Mul', inputs=[pooled16_add, half], outputs=[pooled16], name=make_name('Mul'))])
+    # Reuse weights
+    avg16_w = roi16 + '_gavg_w'
+    max16_w = roi16 + '_gmax_w'
+    pooled16 = roi16 + '_gpool'
+    # Important: append nodes one-by-one so make_name() sees the updated graph
+    g.node.extend([helper.make_node('Mul', inputs=[avg16, 'const_avg_w'], outputs=[avg16_w], name=make_name('Mul'))])
+    g.node.extend([helper.make_node('Mul', inputs=[max16, 'const_max_w'], outputs=[max16_w], name=make_name('Mul'))])
+    g.node.extend([helper.make_node('Add', inputs=[avg16_w, max16_w], outputs=[pooled16], name=make_name('Add'))])
 
     # Part-based pooling for s16 and blend (same weights as s8)
     if pp_w is not None and float(pp_w) <= 0.0:
@@ -828,7 +853,7 @@ def add_roi_head_multi_scale(
                 img_in = g.input[0].name
             if img_in is not None:
                 roi_img = img_in + '_roi_ms_input'
-                g.node.extend([helper.make_node('RoiAlign', inputs=[img_in, boxes, batch_idx], outputs=[roi_img], name=make_name('RoiAlign'), mode='avg', output_height=pooled_hw, output_width=pooled_hw, sampling_ratio=0, spatial_scale=1.0)])
+                g.node.extend([helper.make_node('RoiAlign', inputs=[img_in, boxes, batch_idx], outputs=[roi_img], name=make_name('RoiAlign'), mode='avg', output_height=pooled_hw, output_width=pooled_hw, sampling_ratio=int(sampling_ratio), spatial_scale=1.0)])
                 # Mean over H,W per channel -> (N, C)
                 img_mean = roi_img + '_gmean'
                 g.node.extend([helper.make_node('ReduceMean', inputs=[roi_img], outputs=[img_mean], name=make_name('ReduceMean'), keepdims=0, axes=[2, 3])])
@@ -860,9 +885,35 @@ def add_roi_head_multi_scale(
         except Exception:
             color_feat_scaled = None
 
+    # Optionally pre-normalize each scale vector to unit L2 before concatenation (equalize contribution)
+    def l2_normalize_vec(inp: str, base: str) -> str:
+        sq = base + '_sq'
+        rs = base + '_rs'
+        add = base + '_den'
+        norm = base + '_norm'
+        g.node.extend([helper.make_node('Mul', inputs=[inp, inp], outputs=[sq], name=make_name('Square'))])
+        axes_ch = 'roi_axes_ch_ms_prenorm'
+        if not any(init.name == axes_ch for init in g.initializer):
+            g.initializer.extend([helper.make_tensor(name=axes_ch, data_type=TensorProto.INT64, dims=[1], vals=[1])])
+        g.node.extend([helper.make_node('ReduceSum', inputs=[sq, axes_ch], outputs=[rs], name=make_name('ReduceSum'), keepdims=1)])
+        eps = 'eps_roi_head_ms_prenorm'
+        if not any(init.name == eps for init in g.initializer):
+            g.initializer.extend([helper.make_tensor(name=eps, data_type=TensorProto.FLOAT, dims=[1], vals=[1e-6])])
+        g.node.extend([helper.make_node('Add', inputs=[rs, eps], outputs=[add], name=make_name('Add'))])
+        g.node.extend([helper.make_node('Sqrt', inputs=[add], outputs=[norm], name=make_name('Sqrt'))])
+        out = base + '_unit'
+        g.node.extend([helper.make_node('Div', inputs=[inp, norm], outputs=[out], name=make_name('Div'))])
+        return out
+
+    pooled8_for_concat = pooled8_mix
+    pooled16_for_concat = pooled16_mix
+    if pre_norm_scales:
+        pooled8_for_concat = l2_normalize_vec(pooled8_mix, roi8 + '_prenorm')
+        pooled16_for_concat = l2_normalize_vec(pooled16_mix, roi16 + '_prenorm')
+
     # Concat channel-wise (s8, s16, optional color stats)
     concat = 'emb_ms_concat'
-    concat_inputs = [pooled8_mix, pooled16_mix]
+    concat_inputs = [pooled8_for_concat, pooled16_for_concat]
     if color_feat_scaled is not None:
         concat_inputs.append(color_feat_scaled)
     g.node.extend([helper.make_node('Concat', inputs=concat_inputs, outputs=[concat], name=make_name('Concat'), axis=1)])
@@ -878,10 +929,24 @@ def add_roi_head_multi_scale(
         helper.make_node('Where', inputs=[concat_mask, concat_zeros, concat], outputs=[concat_clean], name=make_name('Where')),
     ])
 
+    # Optional channel centering (remove per-vector mean across channels) to improve angular spread
+    emb_input = concat_clean
+    if center_ch:
+        ch_axes = 'center_ch_axes'
+        if not any(init.name == ch_axes for init in g.initializer):
+            g.initializer.extend([helper.make_tensor(name=ch_axes, data_type=TensorProto.INT64, dims=[1], vals=[1])])
+        ch_mean = concat + '_chmean'
+        emb_centered = concat + '_centered'
+        g.node.extend([
+            helper.make_node('ReduceMean', inputs=[concat_clean], outputs=[ch_mean], name=make_name('ReduceMean'), keepdims=1, axes=[1]),
+            helper.make_node('Sub', inputs=[concat_clean, ch_mean], outputs=[emb_centered], name=make_name('Sub')),
+        ])
+        emb_input = emb_centered
+
     # L2 normalize across channel (dim=1)
-    sq = concat + '_sq'
-    g.node.extend([helper.make_node('Mul', inputs=[concat_clean, concat_clean], outputs=[sq], name=make_name('Square'))])
-    rs = concat + '_rs'
+    sq = (emb_input if center_ch else concat_clean) + '_sq'
+    g.node.extend([helper.make_node('Mul', inputs=[emb_input, emb_input], outputs=[sq], name=make_name('Square'))])
+    rs = (emb_input if center_ch else concat_clean) + '_rs'
     axes_ch = 'roi_axes_ch_ms'
     if not any(init.name == axes_ch for init in g.initializer):
         g.initializer.extend([helper.make_tensor(name=axes_ch, data_type=TensorProto.INT64, dims=[1], vals=[1])])
@@ -889,12 +954,12 @@ def add_roi_head_multi_scale(
     eps = 'eps_roi_head_ms'
     if not any(init.name == eps for init in g.initializer):
         g.initializer.extend([helper.make_tensor(name=eps, data_type=TensorProto.FLOAT, dims=[1], vals=[1e-6])])
-    add = concat + '_den'
+    add = (emb_input if center_ch else concat_clean) + '_den'
     g.node.extend([helper.make_node('Add', inputs=[rs, eps], outputs=[add], name=make_name('Add'))])
-    sqrt = concat + '_norm'
+    sqrt = (emb_input if center_ch else concat_clean) + '_norm'
     g.node.extend([helper.make_node('Sqrt', inputs=[add], outputs=[sqrt], name=make_name('Sqrt'))])
     emb = out_name
-    g.node.extend([helper.make_node('Div', inputs=[concat_clean, sqrt], outputs=[emb], name=make_name('Div'))])
+    g.node.extend([helper.make_node('Div', inputs=[emb_input, sqrt], outputs=[emb], name=make_name('Div'))])
 
     g.output.extend([helper.make_tensor_value_info(emb, TensorProto.FLOAT, None)])
     return model
@@ -911,16 +976,23 @@ def main():
     ap.add_argument('--det_out', default=None, help='Detection output (Nx6) tensor name (auto if omitted)')
     ap.add_argument('--max_probe', type=int, default=60, help='Max runtime outputs to probe when auto-picking feature tensors (default: 60)')
     # Tuning knobs for part/global pooling and color features
-    ap.add_argument('--gp_w', type=float, default=1.0, help='Weight for global pooled features (default: 1.0)')
-    ap.add_argument('--pp_w', type=float, default=0.0, help='Weight for part-pooled features (default: 0.0)')
-    ap.add_argument('--color_gain', type=float, default=1.0, help='Gain multiplier for color-statistics features (default: 1.0; set 0 to disable)')
+    ap.add_argument('--gp_w', type=float, default=0.4, help='Weight for global pooled features (default: 0.4)')
+    ap.add_argument('--pp_w', type=float, default=0.6, help='Weight for part-pooled features (default: 0.6)')
+    ap.add_argument('--color_gain', type=float, default=0.3, help='Gain multiplier for color-statistics features (default: 0.3; set 0 to disable)')
+    ap.add_argument('--avg_w', type=float, default=0.8, help='Weight for average pooling within ROI (default: 0.8)')
+    ap.add_argument('--max_w', type=float, default=0.2, help='Weight for max pooling within ROI (default: 0.2)')
     ap.add_argument('--pp_k', type=int, default=7, help='Number of horizontal stripes (default: 7 for pooled_hw=14)')
     ap.add_argument('--pp_stripe_h', type=int, default=2, help='Height of each horizontal stripe (default: 2 for pooled_hw=14)')
     ap.add_argument('--pp_vertical_k', type=int, default=7, help='Number of vertical stripes (default: 7 for pooled_hw=14; set 0 to disable)')
     ap.add_argument('--pp_vertical_stripe_w', type=int, default=2, help='Width of each vertical stripe (default: 2 for pooled_hw=14)')
+    ap.add_argument('--pooled_hw', type=int, default=14, help='ROIAlign pooled size H=W (default: 14)')
+    ap.add_argument('--pl_alpha', type=float, default=0.5, help='Signed power-law exponent alpha (default: 0.5 for signed-sqrt)')
+    ap.add_argument('--pre_norm_scales', action='store_true', help='L2-normalize s8/s16 vectors before concatenation')
+    ap.add_argument('--sampling_ratio', type=int, default=0, help='RoiAlign sampling_ratio (0 for adaptive, >0 for fixed samples per bin)')
     # InstanceNorm control: default OFF unless explicitly enabled
     ap.add_argument('--no_inst_norm', action='store_true', help='Disable per-ROI instance normalization')
     ap.add_argument('--use_inst_norm', action='store_true', help='Enable per-ROI instance normalization (overrides --no_inst_norm)')
+    ap.add_argument('--no_center_ch', action='store_true', help='Disable per-vector channel centering before L2 normalization')
     args = ap.parse_args()
 
     if not os.path.exists(args.onnx_in):
@@ -970,15 +1042,21 @@ def main():
         stride8=8,
         stride16=16,
         out_name='embed',
-        pooled_hw=14,
+        pooled_hw=args.pooled_hw,
         gp_w=args.gp_w,
         pp_w=args.pp_w,
         color_gain_val=args.color_gain,
+        avg_w=args.avg_w,
+        max_w=args.max_w,
         pp_k=args.pp_k,
         pp_stripe_h=args.pp_stripe_h,
         pp_vertical_k=args.pp_vertical_k,
         pp_vertical_stripe_w=args.pp_vertical_stripe_w,
         use_inst_norm=use_inst,
+        center_ch=(False if getattr(args, 'no_center_ch', False) else True),
+        pl_alpha=args.pl_alpha,
+        pre_norm_scales=bool(getattr(args, 'pre_norm_scales', False)),
+        sampling_ratio=int(getattr(args, 'sampling_ratio', 0)),
     )
 
     # Save

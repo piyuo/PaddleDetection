@@ -141,4 +141,19 @@ fi
 #./pipeline/PP-YOLOE/export_backbone_features.sh
 python3 pipeline/PP-YOLOE/insert_embedding_head.py \
     --onnx_in pipeline/PP-YOLOE/backbone/ppyoloe_crn_s_36e_pphuman.onnx \
-    --onnx_out pipeline/PP-YOLOE/models/ppyoloe_crn_s_36e_pphuman_embed.onnx
+	--onnx_out pipeline/PP-YOLOE/models/ppyoloe_crn_s_36e_pphuman_embed.onnx \
+	--use_inst_norm \
+	--gp_w 0.2 \
+	--pp_w 0.8 \
+	--color_gain 0.0 \
+	--avg_w 1.0 \
+	--max_w 0.0 \
+	--pp_k 9 \
+	--pp_stripe_h 2 \
+	--pp_vertical_k 2 \
+	--pp_vertical_stripe_w 2 \
+	--pooled_hw 16 \
+	--pl_alpha 0.35 \
+	--pre_norm_scales \
+	--sampling_ratio 2 \
+	--max_probe 20
