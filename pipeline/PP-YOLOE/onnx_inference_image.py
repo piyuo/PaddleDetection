@@ -267,20 +267,11 @@ def main():
 
     base = os.path.splitext(os.path.basename(args.img))[0]
     os.makedirs(args.out, exist_ok=True)
-    path_det_all = os.path.join(args.out, f'{base}_embeddings_det.npy')
-    path_det_valid = os.path.join(args.out, f'{base}_embeddings_det_valid.npy')
-    path_boxes_valid = os.path.join(args.out, f'{base}_detections_valid.npy')
-    path_npz = os.path.join(args.out, f'{base}_botsort_inputs.npz')
-    np.save(path_det_all, det_embs)
-    np.save(path_det_valid, embs_valid)
-    np.save(path_boxes_valid, boxes_valid)
-    np.savez(path_npz, boxes=boxes_valid, embeddings=embs_valid)
 
-    print('\n[BoT-SORT] Per-detection embeddings ready:')
-    print('  - embeddings_det (all):', det_embs.shape, ' →', path_det_all)
-    print('  - embeddings_det_valid:', embs_valid.shape, ' →', path_det_valid)
-    print('  - detections_valid:', boxes_valid.shape, ' →', path_boxes_valid)
-    print('  - combined (npz):', path_npz, ' (keys: boxes, embeddings)')
+    print('\n[BoT-SORT] Per-detection embeddings ready (console only):')
+    print('  - embeddings_det (all):', det_embs.shape)
+    print('  - embeddings_det_valid:', embs_valid.shape)
+    print('  - detections_valid:', boxes_valid.shape)
 
     # Optional: Embedding sanity checks to ensure values are informative per detection
     if args.check_embed:
@@ -292,6 +283,9 @@ def main():
         norms_v = np.linalg.norm(embs_valid, axis=1) if embs_valid.size else np.array([])
         if norms_v.size:
             print(f'  - L2 norms (valid): min={norms_v.min():.4f} mean={norms_v.mean():.4f} max={norms_v.max():.4f}')
+            # Zero-vector rate (after normalization, zero means original vector was zero)
+            zero_rate = float((norms_v < 1e-8).sum()) / float(norms_v.size)
+            print(f'  - zero-vector rate (valid): {zero_rate*100:.1f}%')
 
         def iou_xyxy(a: np.ndarray, b: np.ndarray) -> float:
             # a,b: (6,) [cls,score,x0,y0,x1,y1]
@@ -310,17 +304,17 @@ def main():
         if embs_valid.shape[0] >= 2:
             # embeddings are L2-normalized; cosine = dot product
             cos = embs_valid @ embs_valid.T
-            # exclude self-similarity
             nv = cos.shape[0]
-            cos_nodiag = cos.copy()
-            np.fill_diagonal(cos_nodiag, np.nan)
-            # pairwise stats
-            flat = cos_nodiag[~np.isnan(cos_nodiag)].ravel()
+            # build an off-diagonal view for stats and NN (avoid self=1.0)
+            cos_off = cos.copy()
+            np.fill_diagonal(cos_off, -np.inf)
+            # pairwise stats (ignore -inf placeholders)
+            flat = cos_off[np.isfinite(cos_off)].ravel()
             if flat.size:
                 p5 = np.percentile(flat, 5)
                 p50 = np.percentile(flat, 50)
                 p95 = np.percentile(flat, 95)
-                print(f'  - pairwise cosine (valid): min={np.nanmin(cos_nodiag):.3f} p5={p5:.3f} median={p50:.3f} p95={p95:.3f} max={np.nanmax(cos_nodiag):.3f}')
+                print(f'  - pairwise cosine (valid): min={flat.min():.3f} p5={p5:.3f} median={p50:.3f} p95={p95:.3f} max={flat.max():.3f}')
 
             # Top-K most similar pairs (to spot potential duplicates)
             K = min(5, nv * (nv - 1) // 2)
@@ -334,28 +328,19 @@ def main():
                 iou = iou_xyxy(boxes_valid[i], boxes_valid[j])
                 print(f'     ({i:2d}, {j:2d})  cos={c:.3f}  IoU={iou:.3f}')
 
-            # Save a brief report
-            report_txt = os.path.join(args.out, f'{base}_embed_check.txt')
-            with open(report_txt, 'w') as f:
-                f.write('Embedding Sanity Report\n')
-                f.write(f'image: {args.img}\n')
-                f.write(f'valid detections: {nv}\n')
-                f.write(f'embedding dim: {D}\n')
-                f.write(f'norms (min/mean/max): {norms.min():.6f}/{norms.mean():.6f}/{norms.max():.6f}\n')
-                if flat.size:
-                    f.write(f'pairwise cosine (min/median/max): {np.nanmin(cos_nodiag):.6f}/{p50:.6f}/{np.nanmax(cos_nodiag):.6f}\n')
-                f.write('top similar pairs (i,j,cos,IoU):\n')
-                for r in order:
-                    i, j = iu[0][r], iu[1][r]
-                    c = float(cos[i, j])
-                    iou = iou_xyxy(boxes_valid[i], boxes_valid[j])
-                    f.write(f'{i},{j},{c:.6f},{iou:.6f}\n')
-            np.save(os.path.join(args.out, f'{base}_cosine_valid.npy'), cos)
-            print('  - saved:', report_txt)
+            # Health summary: fraction of high-cos pairs that don't overlap (potential ID confusion)
+            high = cos_pairs > 0.9
+            if high.any():
+                i_idx, j_idx = iu[0][high], iu[1][high]
+                ious = np.array([iou_xyxy(boxes_valid[i], boxes_valid[j]) for i, j in zip(i_idx, j_idx)], dtype=np.float32)
+                non_overlap = (ious < 0.1).mean() if ious.size else 0.0
+                print(f'  - high-cos (>0.90) non-overlapping pair rate: {non_overlap*100:.1f}%')
+
+            # Console-only mode: do not save report or arrays
 
             # Per-detection nearest neighbor summary (valid only)
-            nn_idx = np.argmax(cos_nodiag, axis=1)
-            nn_cos = cos[np.arange(nv), nn_idx]
+            nn_idx = np.argmax(cos_off, axis=1)
+            nn_cos = cos_off[np.arange(nv), nn_idx]
             # Print a compact table (top few with highest nn cosine)
             order_nn = np.argsort(-nn_cos)
             print('  - per-detection nearest neighbor (sorted by cosine):')
@@ -365,28 +350,20 @@ def main():
                 iou = iou_xyxy(boxes_valid[i], boxes_valid[j])
                 print(f'     i={i:2d} -> j={j:2d}  cos={nn_cos[i]:.3f}  IoU={iou:.3f}  score={boxes_valid[i,1]:.3f}')
 
-            # Save CSVs for easier inspection
-            ids_valid = np.arange(nv)
-            nn_csv = os.path.join(args.out, f'{base}_embed_nn.csv')
-            with open(nn_csv, 'w') as f:
-                f.write('vidx,class,score,x0,y0,x1,y1,nn_vidx,nn_cos,nn_iou\n')
-                for i in range(nv):
-                    j = int(nn_idx[i])
-                    iou = iou_xyxy(boxes_valid[i], boxes_valid[j])
-                    cls_id, score, x0, y0, x1, y1 = boxes_valid[i]
-                    f.write(f'{i},{int(cls_id)},{score:.6f},{x0:.3f},{y0:.3f},{x1:.3f},{y1:.3f},{j},{nn_cos[i]:.6f},{iou:.6f}\n')
-
-            emb_csv = os.path.join(args.out, f'{base}_embeddings_valid.csv')
-            with open(emb_csv, 'w') as f:
-                header = ','.join(['vidx'] + [f'e{k}' for k in range(D)])
-                f.write(header + '\n')
-                for i in range(nv):
-                    row = ','.join([str(i)] + [f'{v:.6f}' for v in embs_valid[i].tolist()])
-                    f.write(row + '\n')
-            print('  - saved:', nn_csv)
-            print('  - saved:', emb_csv)
+            # Also print a short embedding preview per valid detection (first 8 dims)
+            dims_preview = min(8, D)
+            print('  - embedding previews (first', dims_preview, 'dims):')
+            for i in range(nv):
+                cls_id, score, x0, y0, x1, y1 = boxes_valid[i]
+                j = int(nn_idx[i])
+                pv = embs_valid[i, :dims_preview]
+                pv_str = ' '.join([f'{v:.2f}' for v in pv.tolist()])
+                is_zero = ' ZERO' if np.linalg.norm(embs_valid[i]) < 1e-8 else ''
+                print(f'     id={i:2d} cls={int(cls_id)} score={score:.3f} box=[{x0:.0f},{y0:.0f},{x1:.0f},{y1:.0f}]{is_zero}')
+                print(f'        emb[:{dims_preview}]=[{pv_str}]  NN-> id={j:2d} cos={nn_cos[i]:.3f} IoU={iou_xyxy(boxes_valid[i], boxes_valid[j]):.3f}')
 
             # Save an additional visualization with valid detection ids
+            ids_valid = np.arange(nv)
             vis_idx = os.path.join(args.out, f'{base}_idx.jpg')
             try:
                 draw_and_save_with_ids(args.img, boxes_valid, ids_valid, float(draw_threshold), vis_idx, label_list)
