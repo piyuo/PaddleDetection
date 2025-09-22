@@ -20,10 +20,10 @@ echo "🔧 Running ONNX inference..."
 # Use correct argument names and paths
 cd "${REPO_ROOT}"
 
-# Use the detected Python executable to ensure we have onnxruntime
-/usr/local/bin/python3 pipeline/PP-YOLOE/onnx_inference_image.py \
+# Use python from the (possibly) activated venv
+python3 pipeline/PP-YOLOE/onnx_inference_image.py \
     --img pipeline/dataset/demo/demo.jpg \
-    --onnx pipeline/PP-YOLOE/models/ppyoloe_crn_s_36e_pphuman.onnx \
+    --onnx pipeline/PP-YOLOE/models/ppyoloe_crn_s_36e_pphuman_embed.onnx \
     --infer_cfg pipeline/PP-YOLOE/backbone/inference_model/ppyoloe_crn_s_36e_pphuman/infer_cfg.yml \
     --out pipeline/output \
     --thresh 0.5

@@ -2,19 +2,22 @@
 """
 Run inference on a single image using ONNX Runtime with the exported PP-YOLOE Human model.
 
-Defaults assume you exported via pipeline/PP-YOLOE/export_to_onnx.sh.
-
 Usage:
-  python pipeline/PP-YOLOE/onnx_inference_image.py \
-    [--img pipeline/dataset/demo/demo.jpg] \
-    [--onnx pipeline/output/ppyoloe_crn_s_36e_pphuman.onnx] \
-    [--infer_cfg pipeline/output/inference_model/ppyoloe_crn_s_36e_pphuman/infer_cfg.yml] \
-    [--out pipeline/output_vis] \
-    [--thresh 0.5] [--gpu]
+    python pipeline/PP-YOLOE/onnx_inference_image.py \
+        [--img pipeline/dataset/demo/demo.jpg] \
+        [--onnx pipeline/PP-YOLOE/models/ppyoloe_crn_s_36e_pphuman_embed_det.onnx] \
+        [--infer_cfg pipeline/PP-YOLOE/backbone/inference_model/ppyoloe_crn_s_36e_pphuman/infer_cfg.yml] \
+        [--out pipeline/output/onnx_vis] \
+        [--thresh 0.5] [--gpu]
+
+Requirement:
+    - The ONNX model must expose per-detection embeddings named "embeddings_det" with shape (N, D),
+        where N matches the number of rows in the detection output (top-K). This script will error out
+        if "embeddings_det" is not present.
 
 Notes:
-  - This script reuses PaddleDetection's ONNX preprocess (deploy/third_engine/onnx/preprocess.py)
-  - Outputs printed to stdout and an optional visualization image in --out
+    - This script reuses PaddleDetection's ONNX preprocess (deploy/third_engine/onnx/preprocess.py).
+    - Outputs are printed to stdout, with optional visualization and .npy files in --out.
 """
 
 import argparse
@@ -63,13 +66,22 @@ def repo_root() -> str:
 def default_paths() -> Tuple[str, str, str, str, str]:
     root = repo_root()
     model_name = 'ppyoloe_crn_s_36e_pphuman'
-    onnx_a = os.path.join(root, 'pipeline', 'output', 'onnx', f'{model_name}.onnx')
-    onnx_b = os.path.join(root, 'pipeline', 'output', f'{model_name}.onnx')
-    onnx_path = onnx_a if os.path.exists(onnx_a) else onnx_b
+    # Try likely ONNX locations in priority order
+    onnx_candidates = [
+        os.path.join(root, 'pipeline', 'PP-YOLOE', 'models', f'{model_name}_embed_det.onnx'),
+        os.path.join(root, 'pipeline', 'PP-YOLOE', 'models', f'{model_name}_embed.onnx'),
+        os.path.join(root, 'pipeline', 'PP-YOLOE', 'models', f'{model_name}.onnx'),
+        os.path.join(root, 'pipeline', 'output', 'onnx', f'{model_name}.onnx'),
+        os.path.join(root, 'pipeline', 'output', f'{model_name}.onnx'),
+    ]
+    onnx_path = next((p for p in onnx_candidates if os.path.exists(p)), onnx_candidates[0])
 
-    infer_cfg = os.path.join(
-        root, 'pipeline', 'output', 'inference_model', model_name, 'infer_cfg.yml'
-    )
+    # Try likely infer_cfg locations in priority order
+    infer_cfg_candidates = [
+        os.path.join(root, 'pipeline', 'PP-YOLOE', 'backbone', 'inference_model', model_name, 'infer_cfg.yml'),
+        os.path.join(root, 'pipeline', 'output', 'inference_model', model_name, 'infer_cfg.yml'),
+    ]
+    infer_cfg = next((p for p in infer_cfg_candidates if os.path.exists(p)), infer_cfg_candidates[0])
     img_path = os.path.join(root, 'pipeline', 'dataset', 'demo', 'demo.jpg')
     out_dir = os.path.join(root, 'pipeline', 'output', 'onnx_vis')
     pd_onnx_preprocess_dir = os.path.join(root, 'deploy', 'third_engine', 'onnx')
@@ -144,6 +156,7 @@ def main():
     parser.add_argument('--out', default=d_out, help='Directory to save visualization')
     parser.add_argument('--thresh', type=float, default=None, help='Score threshold for printing/drawing (default from infer_cfg)')
     parser.add_argument('--gpu', action='store_true', help='Use GPU if onnxruntime-gpu is available')
+    parser.add_argument('--list_outputs', action='store_true', help='Print ONNX output names and shapes')
     args = parser.parse_args()
 
     # Validate inputs
@@ -191,71 +204,60 @@ def main():
     except Exception as e:
         print('[WARN] Failed to save visualization:', e)
 
-    # --- Verify exported feature map usability for BoT-SORT embeddings ---
-    # Find a rank-4 feature map output (NCHW) among session outputs
+    # --- Require per-detection embeddings for BoT-SORT ---
     out_names = [o.name for o in sess.get_outputs()]
     name_to_out = {out_names[i]: outputs[i] for i in range(len(out_names))}
-    feat_cands = [(n, a) for n, a in name_to_out.items() if isinstance(a, np.ndarray) and a.ndim == 4 and a.shape[0] in (1,)]
-    if not feat_cands:
-        print('\n[WARN] No 4D feature map output found in the ONNX outputs.\n'
-              'Ensure you exported an augmented model with a backbone feature output\n'
-              'using pipeline/PP-YOLOE/export_backbone_features.sh.')
-        return
+    if args.list_outputs:
+        print('\n[Debug] Model outputs:')
+        for i, n in enumerate(out_names):
+            arr = outputs[i]
+            shape = getattr(arr, 'shape', None)
+            print(f'  - {n}: {shape}')
+    # Enforce presence of per-detection embeddings
+    if 'embeddings_det' not in name_to_out or not isinstance(name_to_out['embeddings_det'], np.ndarray):
+        print('\n[ERROR] Model does not expose per-detection embeddings "embeddings_det".', file=sys.stderr)
+        if not args.list_outputs:
+            print('        Tip: run with --list_outputs to see available outputs.', file=sys.stderr)
+        print('        Use pipeline/PP-YOLOE/insert_embedding_head.py to augment your model, or load the *_embed_det.onnx.', file=sys.stderr)
+        sys.exit(2)
 
-    # Choose the highest spatial resolution candidate
-    feat_name, feat_map = max(feat_cands, key=lambda kv: kv[1].shape[2] * kv[1].shape[3])
-    print(f"\n[BoT-SORT] Using feature output: {feat_name} shape={feat_map.shape}")
+    det_embs = name_to_out['embeddings_det']
+    if det_embs.ndim != 2 or det_embs.shape[0] == 0:
+        print('\n[ERROR] "embeddings_det" must be a 2D array shaped (N, D) with N>0. Got:', det_embs.shape, file=sys.stderr)
+        sys.exit(2)
 
-    # Prepare boxes above threshold
-    keep = [b for b in bboxes if int(b[0]) > -1 and float(b[1]) >= float(draw_threshold)]
-    if not keep:
-        print(f"[BoT-SORT] No detections above threshold {draw_threshold}; skipping embedding check.")
-        return
+    if det_embs.shape[0] != bboxes.shape[0]:
+        print('\n[ERROR] Row count mismatch between detections and embeddings:', file=sys.stderr)
+        print('        detections:', bboxes.shape, ' embeddings_det:', det_embs.shape, file=sys.stderr)
+        print('        Ensure your model outputs align. Regenerate with insert_embedding_head.py if needed.', file=sys.stderr)
+        sys.exit(2)
 
-    boxes_xyxy = np.array([[b[2], b[3], b[4], b[5]] for b in keep], dtype=np.float32)
-    try:
-        import cv2
-        im = cv2.imread(args.img)
-        if im is None:
-            print('[WARN] Could not load image to infer size; skipping embedding verification.')
-            return
-        Himg, Wimg = im.shape[:2]
-    except Exception:
-        print('[WARN] OpenCV not available; skipping embedding verification.')
-        return
+    # Normalize per-detection embeddings
+    det_embs = det_embs.astype(np.float32)
+    det_embs = det_embs / (np.linalg.norm(det_embs, axis=1, keepdims=True) + 1e-8)
 
-    # ROI average pooling to produce appearance embeddings (like BoT-SORT)
-    embs = roi_pool_average(feat_map, boxes_xyxy, (Himg, Wimg))  # (N, C)
-    if embs.size == 0:
-        print('[BoT-SORT] Failed to compute embeddings from feature map.')
-        return
-
-    # L2-normalize embeddings
-    norms = np.linalg.norm(embs, axis=1, keepdims=True) + 1e-8
-    embs_norm = embs / norms
-
-    # Cosine similarity matrix (N x N)
-    sims = embs_norm @ embs_norm.T
-    diag_mean = float(np.diag(sims).mean())
-    off_diag = sims[~np.eye(sims.shape[0], dtype=bool)] if sims.shape[0] > 1 else np.array([])
-    off_min = float(off_diag.min()) if off_diag.size else 1.0
-    off_max = float(off_diag.max()) if off_diag.size else 1.0
+    # Filter by threshold to match drawn/kept detections
+    valid_mask = (bboxes[:, 0] > -1) & (bboxes[:, 1] >= float(draw_threshold))
+    boxes_valid = bboxes[valid_mask]
+    embs_valid = det_embs[valid_mask]
 
     base = os.path.splitext(os.path.basename(args.img))[0]
-    emb_path = os.path.join(args.out, f'{base}_embeddings.npy')
     os.makedirs(args.out, exist_ok=True)
-    np.save(emb_path, embs_norm.astype(np.float32))
+    path_det_all = os.path.join(args.out, f'{base}_embeddings_det.npy')
+    path_det_valid = os.path.join(args.out, f'{base}_embeddings_det_valid.npy')
+    path_boxes_valid = os.path.join(args.out, f'{base}_detections_valid.npy')
+    path_npz = os.path.join(args.out, f'{base}_botsort_inputs.npz')
+    np.save(path_det_all, det_embs)
+    np.save(path_det_valid, embs_valid)
+    np.save(path_boxes_valid, boxes_valid)
+    np.savez(path_npz, boxes=boxes_valid, embeddings=embs_valid)
 
-    print('[BoT-SORT] Embeddings computed:')
-    print('  - shape:', embs_norm.shape)
-    print('  - L2 norms (mean±std):', float(norms.mean()), '±', float(norms.std()))
-    print('  - cosine diag mean:', f'{diag_mean:.4f}', ' off-diag min/max:', f'{off_min:.4f}/{off_max:.4f}')
-    if off_diag.size:
-        n_show = min(5, sims.shape[0])
-        print('  - similarity matrix (top-left):')
-        with np.printoptions(precision=2, suppress=True):
-            print(sims[:n_show, :n_show])
-    print('  - saved normalized embeddings to:', emb_path)
+    print('\n[BoT-SORT] Per-detection embeddings ready:')
+    print('  - embeddings_det (all):', det_embs.shape, ' →', path_det_all)
+    print('  - embeddings_det_valid:', embs_valid.shape, ' →', path_det_valid)
+    print('  - detections_valid:', boxes_valid.shape, ' →', path_boxes_valid)
+    print('  - combined (npz):', path_npz, ' (keys: boxes, embeddings)')
+    return
 
 
 if __name__ == '__main__':
