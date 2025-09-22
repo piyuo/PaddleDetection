@@ -146,6 +146,28 @@ def draw_and_save(img_path: str, boxes: np.ndarray, thresh: float, out_path: str
     cv2.imwrite(out_path, im)
 
 
+def draw_and_save_with_ids(img_path: str, boxes: np.ndarray, ids: np.ndarray, thresh: float, out_path: str, labels):
+    """Draw boxes with an integer id prefix (e.g., id0, id1) for easier matching with printed tables."""
+    import cv2
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    im = cv2.imread(img_path)
+    if im is None:
+        print('[WARN] Could not load image to draw:', img_path)
+        return
+    for k, b in enumerate(boxes):
+        cls_id, score, x0, y0, x1, y1 = b
+        if cls_id < 0 or score < thresh:
+            continue
+        p1 = (int(x0), int(y0))
+        p2 = (int(x1), int(y1))
+        color = (0, 200, 255)  # orange-ish for id view
+        cv2.rectangle(im, p1, p2, color, 2)
+        label = labels[int(cls_id)] if isinstance(labels, (list, tuple)) and int(cls_id) < len(labels) else f'cls{int(cls_id)}'
+        text = f'id{int(ids[k])}:{label}:{score:.2f}'
+        cv2.putText(im, text, (p1[0], max(0, p1[1] - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
+    cv2.imwrite(out_path, im)
+
+
 def main():
     d_onnx, d_infer_cfg, d_img, d_out, d_preproc_dir = default_paths()
 
@@ -157,6 +179,8 @@ def main():
     parser.add_argument('--thresh', type=float, default=None, help='Score threshold for printing/drawing (default from infer_cfg)')
     parser.add_argument('--gpu', action='store_true', help='Use GPU if onnxruntime-gpu is available')
     parser.add_argument('--list_outputs', action='store_true', help='Print ONNX output names and shapes')
+    parser.add_argument('--check_embed', action='store_true',
+                        help='Run embedding sanity checks (cosine similarity stats, top similar pairs) and save a brief report')
     args = parser.parse_args()
 
     # Validate inputs
@@ -257,6 +281,120 @@ def main():
     print('  - embeddings_det_valid:', embs_valid.shape, ' →', path_det_valid)
     print('  - detections_valid:', boxes_valid.shape, ' →', path_boxes_valid)
     print('  - combined (npz):', path_npz, ' (keys: boxes, embeddings)')
+
+    # Optional: Embedding sanity checks to ensure values are informative per detection
+    if args.check_embed:
+        print('\n[Embeddings check] Basic stats:')
+        D = det_embs.shape[1]
+        print(f'  - embedding dim: {D}, total N: {det_embs.shape[0]}, valid N: {embs_valid.shape[0]}')
+        norms = np.linalg.norm(det_embs, axis=1)
+        print(f'  - L2 norms (all, after normalization): min={norms.min():.4f} mean={norms.mean():.4f} max={norms.max():.4f}')
+        norms_v = np.linalg.norm(embs_valid, axis=1) if embs_valid.size else np.array([])
+        if norms_v.size:
+            print(f'  - L2 norms (valid): min={norms_v.min():.4f} mean={norms_v.mean():.4f} max={norms_v.max():.4f}')
+
+        def iou_xyxy(a: np.ndarray, b: np.ndarray) -> float:
+            # a,b: (6,) [cls,score,x0,y0,x1,y1]
+            ax0, ay0, ax1, ay1 = a[2], a[3], a[4], a[5]
+            bx0, by0, bx1, by1 = b[2], b[3], b[4], b[5]
+            ix0, iy0 = max(ax0, bx0), max(ay0, by0)
+            ix1, iy1 = min(ax1, bx1), min(ay1, by1)
+            iw, ih = max(0.0, ix1 - ix0), max(0.0, iy1 - iy0)
+            inter = iw * ih
+            area_a = max(0.0, ax1 - ax0) * max(0.0, ay1 - ay0)
+            area_b = max(0.0, bx1 - bx0) * max(0.0, by1 - by0)
+            union = area_a + area_b - inter + 1e-6
+            return float(inter / union)
+
+        # Report cosine similarities on valid detections
+        if embs_valid.shape[0] >= 2:
+            # embeddings are L2-normalized; cosine = dot product
+            cos = embs_valid @ embs_valid.T
+            # exclude self-similarity
+            nv = cos.shape[0]
+            cos_nodiag = cos.copy()
+            np.fill_diagonal(cos_nodiag, np.nan)
+            # pairwise stats
+            flat = cos_nodiag[~np.isnan(cos_nodiag)].ravel()
+            if flat.size:
+                p5 = np.percentile(flat, 5)
+                p50 = np.percentile(flat, 50)
+                p95 = np.percentile(flat, 95)
+                print(f'  - pairwise cosine (valid): min={np.nanmin(cos_nodiag):.3f} p5={p5:.3f} median={p50:.3f} p95={p95:.3f} max={np.nanmax(cos_nodiag):.3f}')
+
+            # Top-K most similar pairs (to spot potential duplicates)
+            K = min(5, nv * (nv - 1) // 2)
+            iu = np.triu_indices(nv, k=1)
+            cos_pairs = cos[iu]
+            order = np.argsort(-cos_pairs)[:K]
+            print('  - top similar pairs (idx_i, idx_j, cosine, IoU):')
+            for r in order:
+                i, j = iu[0][r], iu[1][r]
+                c = float(cos[i, j])
+                iou = iou_xyxy(boxes_valid[i], boxes_valid[j])
+                print(f'     ({i:2d}, {j:2d})  cos={c:.3f}  IoU={iou:.3f}')
+
+            # Save a brief report
+            report_txt = os.path.join(args.out, f'{base}_embed_check.txt')
+            with open(report_txt, 'w') as f:
+                f.write('Embedding Sanity Report\n')
+                f.write(f'image: {args.img}\n')
+                f.write(f'valid detections: {nv}\n')
+                f.write(f'embedding dim: {D}\n')
+                f.write(f'norms (min/mean/max): {norms.min():.6f}/{norms.mean():.6f}/{norms.max():.6f}\n')
+                if flat.size:
+                    f.write(f'pairwise cosine (min/median/max): {np.nanmin(cos_nodiag):.6f}/{p50:.6f}/{np.nanmax(cos_nodiag):.6f}\n')
+                f.write('top similar pairs (i,j,cos,IoU):\n')
+                for r in order:
+                    i, j = iu[0][r], iu[1][r]
+                    c = float(cos[i, j])
+                    iou = iou_xyxy(boxes_valid[i], boxes_valid[j])
+                    f.write(f'{i},{j},{c:.6f},{iou:.6f}\n')
+            np.save(os.path.join(args.out, f'{base}_cosine_valid.npy'), cos)
+            print('  - saved:', report_txt)
+
+            # Per-detection nearest neighbor summary (valid only)
+            nn_idx = np.argmax(cos_nodiag, axis=1)
+            nn_cos = cos[np.arange(nv), nn_idx]
+            # Print a compact table (top few with highest nn cosine)
+            order_nn = np.argsort(-nn_cos)
+            print('  - per-detection nearest neighbor (sorted by cosine):')
+            for t in order_nn[:min(10, nv)]:
+                i = int(t)
+                j = int(nn_idx[i])
+                iou = iou_xyxy(boxes_valid[i], boxes_valid[j])
+                print(f'     i={i:2d} -> j={j:2d}  cos={nn_cos[i]:.3f}  IoU={iou:.3f}  score={boxes_valid[i,1]:.3f}')
+
+            # Save CSVs for easier inspection
+            ids_valid = np.arange(nv)
+            nn_csv = os.path.join(args.out, f'{base}_embed_nn.csv')
+            with open(nn_csv, 'w') as f:
+                f.write('vidx,class,score,x0,y0,x1,y1,nn_vidx,nn_cos,nn_iou\n')
+                for i in range(nv):
+                    j = int(nn_idx[i])
+                    iou = iou_xyxy(boxes_valid[i], boxes_valid[j])
+                    cls_id, score, x0, y0, x1, y1 = boxes_valid[i]
+                    f.write(f'{i},{int(cls_id)},{score:.6f},{x0:.3f},{y0:.3f},{x1:.3f},{y1:.3f},{j},{nn_cos[i]:.6f},{iou:.6f}\n')
+
+            emb_csv = os.path.join(args.out, f'{base}_embeddings_valid.csv')
+            with open(emb_csv, 'w') as f:
+                header = ','.join(['vidx'] + [f'e{k}' for k in range(D)])
+                f.write(header + '\n')
+                for i in range(nv):
+                    row = ','.join([str(i)] + [f'{v:.6f}' for v in embs_valid[i].tolist()])
+                    f.write(row + '\n')
+            print('  - saved:', nn_csv)
+            print('  - saved:', emb_csv)
+
+            # Save an additional visualization with valid detection ids
+            vis_idx = os.path.join(args.out, f'{base}_idx.jpg')
+            try:
+                draw_and_save_with_ids(args.img, boxes_valid, ids_valid, float(draw_threshold), vis_idx, label_list)
+                print('  - saved:', vis_idx)
+            except Exception as e:
+                print('[WARN] Failed to save id visualization:', e)
+        else:
+            print('  - Not enough valid detections for pairwise comparison.')
     return
 
 
