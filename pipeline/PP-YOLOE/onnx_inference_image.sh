@@ -18,5 +18,3 @@ python3 pipeline/PP-YOLOE/onnx_inference_image.py \
     --onnx pipeline/PP-YOLOE/models/ppyoloe_crn_s_36e_pphuman_embed.onnx \
     --out pipeline/output \
     --thresh 0.5
-
-echo "✅ ONNX inference completed! Check pipeline/output/ for visualized result images."

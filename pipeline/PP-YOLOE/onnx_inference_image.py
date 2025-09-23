@@ -423,6 +423,9 @@ def main():
 
         else:
             print('  - Not enough valid detections for pairwise comparison.')
+
+    # Final success message with specific file path
+    print(f'\n✅ ONNX inference completed! Generated visualization: {vis_path}')
     return
 
 
