@@ -222,8 +222,20 @@ def main():
     outputs = sess.run(None, feed)
     out_names = [o.name for o in sess.get_outputs()]
 
+    # C++ Porting Guide: Critical preprocessing and model info
+    print('[C++ Porting Info] Model and preprocessing details:')
+    print(f'  • Input image size: {args.img} -> resized to 640x640 (keep_ratio=False)')
+    print('  • Normalization: RGB values /255.0, then (x - mean) / std')
+    print('    - mean = [0.485, 0.456, 0.406]')
+    print('    - std = [0.229, 0.224, 0.225]')
+    print('  • Channel order: RGB (not BGR)')
+    print('  • Input tensor shape: (1, 3, 640, 640) - NCHW format')
+    print(f'  • Input tensor name: {input_names[0] if input_names else "unknown"}')
+    print(f'  • Score threshold for filtering: {draw_threshold}')
+    print('  • Post-processing: L2-normalize embeddings, filter detections by score')
+
     # Combined model outputs summary (names + shapes) and expectations
-    print('Model outputs:', out_names)
+    print('\nModel outputs:', out_names)
     print(" - expected outputs[0]: detections (N,6) [class, score, x0, y0, x1, y1]")
     if 'embed' in out_names:
         print(" - 'embed': per-detection embeddings (N, D)")
