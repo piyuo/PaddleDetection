@@ -225,20 +225,21 @@ def main():
     # C++ Porting Guide: Critical preprocessing and model info
     print('[C++ Porting Info] Model and preprocessing details:')
     print(f'  • Input image size: {args.img} -> resized to 640x640 (keep_ratio=False)')
+    print('    ↳ Why keep_ratio=False? Model was trained this way, handles distortion well for humans')
     print('  • Normalization: RGB values /255.0, then (x - mean) / std')
     print('    - mean = [0.485, 0.456, 0.406]')
     print('    - std = [0.229, 0.224, 0.225]')
     print('  • Channel order: RGB (not BGR)')
-    print('  • Input tensor shape: (1, 3, 640, 640) - NCHW format')
-    print(f'  • Input tensor name: {input_names[0] if input_names else "unknown"}')
-    print(f'  • Score threshold for filtering: {draw_threshold}')
+    print('  • Input tensor: (1, 3, 640, 640) NCHW format, float32')
+    print(f'  • Input tensor name: "{input_names[0] if input_names else "unknown"}"')
+    print(f'  • Score threshold: {draw_threshold} (filter detections below this)')
     print('  • Post-processing: L2-normalize embeddings, filter detections by score')
 
     # Combined model outputs summary (names + shapes) and expectations
     print('\nModel outputs:', out_names)
-    print(" - expected outputs[0]: detections (N,6) [class, score, x0, y0, x1, y1]")
+    print(" - outputs[0]: detections (N,6) [class_id, score, x0, y0, x1, y1] - float32")
     if 'embed' in out_names:
-        print(" - 'embed': per-detection embeddings (N, D)")
+        print(" - 'embed': per-detection embeddings (N, D) - float32, requires L2-normalization")
     else:
         print(" - 'embed' not present: run insert_embedding_head.py to add embeddings or use *_embed.onnx")
     print('\n[Debug] Model outputs (names, shapes, and quick notes):')
