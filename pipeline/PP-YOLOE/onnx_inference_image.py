@@ -6,7 +6,6 @@ Usage:
     python pipeline/PP-YOLOE/onnx_inference_image.py \
         [--img pipeline/dataset/demo/demo.jpg] \
         [--onnx pipeline/PP-YOLOE/models/ppyoloe_crn_s_36e_pphuman_embed.onnx] \
-        [--infer_cfg pipeline/PP-YOLOE/backbone/inference_model/ppyoloe_crn_s_36e_pphuman/infer_cfg.yml] \
         [--out pipeline/output/onnx_vis] \
         [--thresh 0.5] [--gpu]
 
@@ -62,7 +61,7 @@ def repo_root() -> str:
     return os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
 
 
-def default_paths() -> Tuple[str, str, str, str, str]:
+def default_paths() -> Tuple[str, str, str, str]:
     root = repo_root()
     model_name = 'ppyoloe_crn_s_36e_pphuman'
     # Try likely ONNX locations in priority order
@@ -75,16 +74,10 @@ def default_paths() -> Tuple[str, str, str, str, str]:
     ]
     onnx_path = next((p for p in onnx_candidates if os.path.exists(p)), onnx_candidates[0])
 
-    # Try likely infer_cfg locations in priority order
-    infer_cfg_candidates = [
-        os.path.join(root, 'pipeline', 'PP-YOLOE', 'backbone', 'inference_model', model_name, 'infer_cfg.yml'),
-        os.path.join(root, 'pipeline', 'output', 'inference_model', model_name, 'infer_cfg.yml'),
-    ]
-    infer_cfg = next((p for p in infer_cfg_candidates if os.path.exists(p)), infer_cfg_candidates[0])
     img_path = os.path.join(root, 'pipeline', 'dataset', 'demo', 'demo.jpg')
     out_dir = os.path.join(root, 'pipeline', 'output', 'onnx_vis')
     pd_onnx_preprocess_dir = os.path.join(root, 'deploy', 'third_engine', 'onnx')
-    return onnx_path, infer_cfg, img_path, out_dir, pd_onnx_preprocess_dir
+    return onnx_path, img_path, out_dir, pd_onnx_preprocess_dir
 
 
 def get_session(onnx_path: str, use_gpu: bool):
@@ -105,20 +98,47 @@ def get_session(onnx_path: str, use_gpu: bool):
     return sess
 
 
-def load_preprocess(infer_cfg_path: str, preprocess_dir: str):
+def get_hardcoded_preprocess(preprocess_dir: str):
     # Make PaddleDetection ONNX preprocess importable
     if preprocess_dir not in sys.path:
         sys.path.insert(0, preprocess_dir)
-    # The preprocess module expects YAML loading done in their infer.py PredictConfig
-    import yaml
     from preprocess import Compose  # type: ignore
 
-    with open(infer_cfg_path, 'r') as f:
-        yml_conf = yaml.safe_load(f)
-    preprocess_infos = yml_conf['Preprocess']
-    draw_threshold = float(yml_conf.get('draw_threshold', 0.5))
-    arch = yml_conf.get('arch', '')
-    label_list = yml_conf.get('label_list', [])
+    # Hardcoded preprocessing config from infer_cfg.yml
+    preprocess_infos = [
+        {
+            'type': 'Resize',
+            'interp': 2,
+            'keep_ratio': False,
+            'target_size': [640, 640]
+        },
+        {
+            'type': 'NormalizeImage',
+            'is_scale': True,
+            'mean': [0.485, 0.456, 0.406],
+            'std': [0.229, 0.224, 0.225]
+        },
+        {
+            'type': 'Permute'
+        }
+    ]
+
+    draw_threshold = 0.5
+    arch = 'YOLO'
+
+    # COCO label list (80 classes)
+    label_list = [
+        'person', 'bicycle', 'car', 'motorcycle', 'airplane', 'bus', 'train', 'truck', 'boat', 'traffic light',
+        'fire hydrant', 'stop sign', 'parking meter', 'bench', 'bird', 'cat', 'dog', 'horse', 'sheep', 'cow',
+        'elephant', 'bear', 'zebra', 'giraffe', 'backpack', 'umbrella', 'handbag', 'tie', 'suitcase', 'frisbee',
+        'skis', 'snowboard', 'sports ball', 'kite', 'baseball bat', 'baseball glove', 'skateboard', 'surfboard',
+        'tennis racket', 'bottle', 'wine glass', 'cup', 'fork', 'knife', 'spoon', 'bowl', 'banana', 'apple',
+        'sandwich', 'orange', 'broccoli', 'carrot', 'hot dog', 'pizza', 'donut', 'cake', 'chair', 'couch',
+        'potted plant', 'bed', 'dining table', 'toilet', 'tv', 'laptop', 'mouse', 'remote', 'keyboard',
+        'cell phone', 'microwave', 'oven', 'toaster', 'sink', 'refrigerator', 'book', 'clock', 'vase',
+        'scissors', 'teddy bear', 'hair drier', 'toothbrush'
+    ]
+
     transforms = Compose(preprocess_infos)
     return transforms, draw_threshold, arch, label_list
 
@@ -168,14 +188,13 @@ def draw_and_save_with_ids(img_path: str, boxes: np.ndarray, ids: np.ndarray, th
 
 
 def main():
-    d_onnx, d_infer_cfg, d_img, d_out, d_preproc_dir = default_paths()
+    d_onnx, d_img, d_out, d_preproc_dir = default_paths()
 
     parser = argparse.ArgumentParser(description='ONNX Runtime inference for PP-YOLOE Human on one image')
     parser.add_argument('--img', default=d_img, help='Path to input image')
     parser.add_argument('--onnx', default=d_onnx, help='Path to ONNX model file')
-    parser.add_argument('--infer_cfg', default=d_infer_cfg, help='Path to infer_cfg.yml from exported Paddle model')
     parser.add_argument('--out', default=d_out, help='Directory to save visualization')
-    parser.add_argument('--thresh', type=float, default=None, help='Score threshold for printing/drawing (default from infer_cfg)')
+    parser.add_argument('--thresh', type=float, default=None, help='Score threshold for printing/drawing (default: 0.5)')
     parser.add_argument('--gpu', action='store_true', help='Use GPU if onnxruntime-gpu is available')
     args = parser.parse_args()
 
@@ -183,14 +202,13 @@ def main():
     for p, label in [
         (args.img, 'Input image'),
         (args.onnx, 'ONNX model'),
-        (args.infer_cfg, 'infer_cfg.yml'),
     ]:
         if not os.path.exists(p):
             print(f'[ERROR] {label} not found: {p}', file=sys.stderr)
             sys.exit(1)
 
     # Load preprocess and session
-    transforms, draw_threshold, arch, label_list = load_preprocess(args.infer_cfg, d_preproc_dir)
+    transforms, draw_threshold, arch, label_list = get_hardcoded_preprocess(d_preproc_dir)
     if args.thresh is not None:
         draw_threshold = args.thresh
     sess = get_session(args.onnx, args.gpu)
