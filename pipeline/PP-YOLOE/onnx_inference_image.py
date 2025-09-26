@@ -23,6 +23,9 @@ Notes:
 import argparse
 import os
 import sys
+import time
+import plistlib
+import platform
 from typing import Tuple
 
 import numpy as np
@@ -129,6 +132,46 @@ def preprocess_image(img_path: str, target_size: Tuple[int, int] = (640, 640),
 def repo_root() -> str:
     # This file is at <repo>/pipeline/PP-YOLOE/onnx_inference_image.py
     return os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
+
+
+def get_coreml_version_info() -> dict:
+    """Best-effort CoreML environment info for debugging on macOS.
+    Returns dict with keys: coremltools (str|None), framework (dict|None), macOS (str)
+    framework dict contains CFBundleShortVersionString, CFBundleVersion, path when available.
+    """
+    info = {}
+    # Python package (conversion toolkit), may be absent
+    try:
+        import coremltools as ct  # type: ignore
+        info['coremltools'] = getattr(ct, '__version__', 'unknown')
+    except Exception:
+        info['coremltools'] = None
+
+    # System CoreML framework Info.plist (runtime)
+    plist_candidates = [
+        '/System/Library/Frameworks/CoreML.framework/Resources/Info.plist',
+        '/System/Library/Frameworks/CoreML.framework/Versions/Current/Resources/Info.plist',
+    ]
+    framework = None
+    for p in plist_candidates:
+        if os.path.exists(p):
+            try:
+                with open(p, 'rb') as f:
+                    pl = plistlib.load(f)
+                framework = {
+                    'CFBundleShortVersionString': pl.get('CFBundleShortVersionString'),
+                    'CFBundleVersion': pl.get('CFBundleVersion'),
+                    'path': p,
+                }
+                break
+            except Exception:
+                continue
+    info['framework'] = framework
+    try:
+        info['macOS'] = platform.mac_ver()[0]
+    except Exception:
+        info['macOS'] = None
+    return info
 
 
 def default_paths() -> Tuple[str, str, str]:
@@ -320,6 +363,35 @@ def main():
         draw_threshold = args.thresh
     sess = get_session(args.onnx)
 
+    # Environment and provider info
+    try:
+        import onnxruntime as ort  # local import for version
+        ort_ver = getattr(ort, '__version__', 'unknown')
+        avail = ort.get_available_providers()
+    except Exception:
+        ort_ver = 'unknown'
+        avail = []
+    print('\n[Env] onnxruntime:', ort_ver)
+    if avail:
+        print('      available providers:', avail)
+    try:
+        print('      session providers:', sess.get_providers())
+    except Exception:
+        pass
+    cm = get_coreml_version_info()
+    print('[Env] CoreML:', end=' ')
+    cmtools = cm.get('coremltools')
+    print(f"coremltools={cmtools if cmtools else 'not installed'}", end='; ')
+    fw = cm.get('framework')
+    if fw:
+        sv = fw.get('CFBundleShortVersionString') or 'unknown'
+        bv = fw.get('CFBundleVersion') or 'unknown'
+        print(f'framework={sv} (bundle {bv})')
+    else:
+        print('framework version: unknown')
+    if cm.get('macOS'):
+        print(f"[Env] macOS: {cm['macOS']}")
+
     # Preprocess image using our standalone function
     inputs_map = preprocess_image(args.img, target_size=(640, 640), keep_ratio=False)
     input_names = [i.name for i in sess.get_inputs()]
@@ -335,7 +407,10 @@ def main():
             print(f'[WARN] Model input "{name}" not found in preprocessed data', file=sys.stderr)
 
     # Run
+    t0 = time.perf_counter()
     outputs = sess.run(None, feed)
+    t1 = time.perf_counter()
+    print(f'[Timing] onnxruntime sess.run: {(t1 - t0)*1000.0:.2f} ms')
     out_names = [o.name for o in sess.get_outputs()]
 
     # C++ Porting Guide: Critical preprocessing and model info
