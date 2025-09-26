@@ -7,7 +7,7 @@ Usage:
         [--img pipeline/dataset/demo/demo.jpg] \
         [--onnx pipeline/PP-YOLOE/models/ppyoloe_crn_s_36e_pphuman_embed.onnx] \
         [--out pipeline/output/onnx_vis] \
-        [--thresh 0.5] [--gpu]
+        [--thresh 0.5]
 
 Requirement:
     - The ONNX model must expose per-detection embeddings named "embed" with shape (N, D),
@@ -15,7 +15,8 @@ Requirement:
         if "embed" is not present.
 
 Notes:
-    - This script reuses PaddleDetection's ONNX preprocess (deploy/third_engine/onnx/preprocess.py).
+    - This script implements standalone preprocessing (no PaddleDetection dependency required).
+    - Preprocessing matches the original PaddleDetection ONNX pipeline: resize to 640x640, normalize, permute.
     - Outputs are printed to stdout, with optional visualization and .npy files in --out.
 """
 
@@ -25,8 +26,77 @@ import sys
 from typing import Tuple
 
 import numpy as np
+import cv2
 
-def roi_pool_average(feat_map: np.ndarray, boxes_xyxy: np.ndarray, img_hw: Tuple[int, int]) -> np.ndarray:
+def preprocess_image(img_path: str, target_size: Tuple[int, int] = (640, 640),
+                     keep_ratio: bool = False,
+                     mean: Tuple[float, float, float] = (0.485, 0.456, 0.406),
+                     std: Tuple[float, float, float] = (0.229, 0.224, 0.225),
+                     is_scale: bool = True) -> dict:
+    """
+    Standalone image preprocessing for PP-YOLOE ONNX inference.
+
+    Args:
+        img_path: Path to input image
+        target_size: Target size (height, width) for resizing
+        keep_ratio: Whether to keep aspect ratio during resize
+        mean: RGB mean values for normalization
+        std: RGB standard deviation values for normalization
+        is_scale: Whether to scale pixel values by 1/255.0
+
+    Returns:
+        Dictionary with preprocessed image tensor and metadata
+    """
+    # Load image in RGB format
+    with open(img_path, 'rb') as f:
+        im_read = f.read()
+    data = np.frombuffer(im_read, dtype='uint8')
+    im = cv2.imdecode(data, 1)  # BGR mode
+    im = cv2.cvtColor(im, cv2.COLOR_BGR2RGB)  # Convert to RGB
+
+    original_shape = im.shape[:2]  # (H, W)
+
+    # Resize
+    if keep_ratio:
+        # Keep aspect ratio resize
+        im_size_min = min(original_shape)
+        im_size_max = max(original_shape)
+        target_size_min = min(target_size)
+        target_size_max = max(target_size)
+        im_scale = float(target_size_min) / float(im_size_min)
+        if round(im_scale * im_size_max) > target_size_max:
+            im_scale = float(target_size_max) / float(im_size_max)
+        im_scale_y = im_scale
+        im_scale_x = im_scale
+    else:
+        # Direct resize without keeping ratio
+        resize_h, resize_w = target_size
+        im_scale_y = resize_h / float(original_shape[0])
+        im_scale_x = resize_w / float(original_shape[1])
+
+    im = cv2.resize(im, None, None, fx=im_scale_x, fy=im_scale_y,
+                    interpolation=cv2.INTER_LINEAR)
+
+    # Normalize
+    im = im.astype(np.float32, copy=False)
+    if is_scale:
+        im *= (1.0 / 255.0)
+
+    # Apply mean and std normalization
+    mean_arr = np.array(mean)[np.newaxis, np.newaxis, :]
+    std_arr = np.array(std)[np.newaxis, np.newaxis, :]
+    im -= mean_arr
+    im /= std_arr
+
+    # Permute from HWC to CHW
+    im = im.transpose((2, 0, 1))
+
+    # Return in the format expected by ONNX model
+    return {
+        'image': im,
+        'im_shape': np.array(im.shape[1:], dtype=np.float32),  # (H, W)
+        'scale_factor': np.array([im_scale_y, im_scale_x], dtype=np.float32)
+    }
     """
     Simple ROI average pooling on a feature map.
     - feat_map: (1, C, Hf, Wf)
@@ -61,7 +131,7 @@ def repo_root() -> str:
     return os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
 
 
-def default_paths() -> Tuple[str, str, str, str]:
+def default_paths() -> Tuple[str, str, str]:
     root = repo_root()
     model_name = 'ppyoloe_crn_s_36e_pphuman'
     # Try likely ONNX locations in priority order
@@ -76,53 +146,92 @@ def default_paths() -> Tuple[str, str, str, str]:
 
     img_path = os.path.join(root, 'pipeline', 'dataset', 'demo', 'demo.jpg')
     out_dir = os.path.join(root, 'pipeline', 'output', 'onnx_vis')
-    pd_onnx_preprocess_dir = os.path.join(root, 'deploy', 'third_engine', 'onnx')
-    return onnx_path, img_path, out_dir, pd_onnx_preprocess_dir
+    return onnx_path, img_path, out_dir
 
 
-def get_session(onnx_path: str, use_gpu: bool):
+def get_session(onnx_path: str):
     try:
         import onnxruntime as ort
     except Exception as e:
         print('[ERROR] onnxruntime not installed. Install with: pip install onnxruntime', file=sys.stderr)
         raise
 
+    available = ort.get_available_providers()
+    # Always attempt CoreML first (macOS). Fallback to CPU (default) if unavailable.
     providers = None
-    if use_gpu:
-        # Use CUDA if available
-        if 'CUDAExecutionProvider' in ort.get_available_providers():
-            providers = ['CUDAExecutionProvider', 'CPUExecutionProvider']
+    provider_options = None
+    if 'CoreMLExecutionProvider' in available:
+        coreml_opts = {
+            #'mlprogram': '1',
+            #'enable_on_subgraph': '1',
+            #'only_allow_static_input_shapes': '1',
+        }
+        providers = ['CoreMLExecutionProvider', 'CPUExecutionProvider']
+        provider_options = [coreml_opts, {}]
+        print('[INFO] Using CoreMLExecutionProvider (Apple Core ML) with options:', coreml_opts)
+    else:
+        print(f'[WARN] CoreMLExecutionProvider not available. Using default providers: {available}')
+
+    # Create session with provider options when supported; gracefully fallback otherwise
+    def try_build(providers, provider_options):
+        return ort.InferenceSession(
+            onnx_path,
+            providers=providers,
+            provider_options=provider_options,
+        )
+
+    try:
+        if providers is None:
+            # CPU/default path
+            sess = ort.InferenceSession(onnx_path, providers=providers)
         else:
-            print('[WARN] CUDAExecutionProvider not available; falling back to CPU.')
-    sess = ort.InferenceSession(onnx_path, providers=providers)
+            # Try progressively less strict CoreML options to match the installed ORT version
+            option_variants = []
+            if provider_options is not None:
+                full = provider_options[0].copy()
+                option_variants.append(full)
+                v2 = full.copy(); v2.pop('only_allow_static_input_shapes', None); option_variants.append(v2)
+                v1 = {'mlprogram': full.get('mlprogram', '1')}
+                # keep enable_on_subgraph if present; otherwise just mlprogram
+                if 'enable_on_subgraph' in full:
+                    v1['enable_on_subgraph'] = full['enable_on_subgraph']
+                option_variants.append(v1)
+                option_variants.append({})  # default CoreML options
+            else:
+                option_variants.append({})
+
+            last_error = None
+            for opts in option_variants:
+                try:
+                    po = [opts, {}]
+                    sess = try_build(providers, po)
+                    print('[INFO] CoreML provider initialized with options:', opts if opts else '(default)')
+                    break
+                except Exception as e:
+                    last_error = e
+                    msg = str(e)
+                    if 'Unknown option' in msg or 'EP Error' in msg:
+                        # Try next variant
+                        continue
+                    # Non-option error; break and fallback to CPU
+                    break
+            else:
+                # Exhausted variants
+                raise last_error
+    except TypeError:
+        # Older onnxruntime may not support provider_options parameter
+        sess = ort.InferenceSession(onnx_path, providers=providers)
+    except Exception as e:
+        print('[WARN] CoreML session creation failed:', e)
+        print("[WARN] Falling back to CPUExecutionProvider.")
+        sess = ort.InferenceSession(onnx_path, providers=['CPUExecutionProvider'])
     return sess
 
 
-def get_hardcoded_preprocess(preprocess_dir: str):
-    # Make PaddleDetection ONNX preprocess importable
-    if preprocess_dir not in sys.path:
-        sys.path.insert(0, preprocess_dir)
-    from preprocess import Compose  # type: ignore
-
-    # Hardcoded preprocessing config from infer_cfg.yml
-    preprocess_infos = [
-        {
-            'type': 'Resize',
-            'interp': 2,
-            'keep_ratio': False,
-            'target_size': [640, 640]
-        },
-        {
-            'type': 'NormalizeImage',
-            'is_scale': True,
-            'mean': [0.485, 0.456, 0.406],
-            'std': [0.229, 0.224, 0.225]
-        },
-        {
-            'type': 'Permute'
-        }
-    ]
-
+def get_hardcoded_preprocess() -> Tuple[float, str, list]:
+    """
+    Return hardcoded preprocessing parameters without PaddleDetection dependency.
+    """
     draw_threshold = 0.5
     arch = 'YOLO'
 
@@ -139,8 +248,7 @@ def get_hardcoded_preprocess(preprocess_dir: str):
         'scissors', 'teddy bear', 'hair drier', 'toothbrush'
     ]
 
-    transforms = Compose(preprocess_infos)
-    return transforms, draw_threshold, arch, label_list
+    return draw_threshold, arch, label_list
 
 
 def draw_and_save(img_path: str, boxes: np.ndarray, thresh: float, out_path: str, labels):
@@ -188,14 +296,13 @@ def draw_and_save_with_ids(img_path: str, boxes: np.ndarray, ids: np.ndarray, th
 
 
 def main():
-    d_onnx, d_img, d_out, d_preproc_dir = default_paths()
+    d_onnx, d_img, d_out = default_paths()
 
     parser = argparse.ArgumentParser(description='ONNX Runtime inference for PP-YOLOE Human on one image')
     parser.add_argument('--img', default=d_img, help='Path to input image')
     parser.add_argument('--onnx', default=d_onnx, help='Path to ONNX model file')
     parser.add_argument('--out', default=d_out, help='Directory to save visualization')
     parser.add_argument('--thresh', type=float, default=None, help='Score threshold for printing/drawing (default: 0.5)')
-    parser.add_argument('--gpu', action='store_true', help='Use GPU if onnxruntime-gpu is available')
     args = parser.parse_args()
 
     # Validate inputs
@@ -207,16 +314,25 @@ def main():
             print(f'[ERROR] {label} not found: {p}', file=sys.stderr)
             sys.exit(1)
 
-    # Load preprocess and session
-    transforms, draw_threshold, arch, label_list = get_hardcoded_preprocess(d_preproc_dir)
+    # Load preprocess parameters and session
+    draw_threshold, arch, label_list = get_hardcoded_preprocess()
     if args.thresh is not None:
         draw_threshold = args.thresh
-    sess = get_session(args.onnx, args.gpu)
+    sess = get_session(args.onnx)
 
-    # Prepare inputs using Compose. It will return a dict keyed by model input names.
-    inputs_map = transforms(args.img)
+    # Preprocess image using our standalone function
+    inputs_map = preprocess_image(args.img, target_size=(640, 640), keep_ratio=False)
     input_names = [i.name for i in sess.get_inputs()]
-    feed = {name: inputs_map[name][None, ] for name in input_names}
+
+    # Prepare feed dictionary - the ONNX model expects 'image' input
+    feed = {}
+    for name in input_names:
+        if name == 'image':
+            feed[name] = inputs_map['image'][None, :]  # Add batch dimension
+        elif name in inputs_map:
+            feed[name] = inputs_map[name][None, :]  # Add batch dimension for other inputs
+        else:
+            print(f'[WARN] Model input "{name}" not found in preprocessed data', file=sys.stderr)
 
     # Run
     outputs = sess.run(None, feed)
@@ -234,6 +350,7 @@ def main():
     print(f'  • Input tensor name: "{input_names[0] if input_names else "unknown"}"')
     print(f'  • Score threshold: {draw_threshold} (filter detections below this)')
     print('  • Post-processing: L2-normalize embeddings, filter detections by score')
+    print('  • No dependency on PaddleDetection - standalone preprocessing implementation')
 
     # Combined model outputs summary (names + shapes) and expectations
     print('\nModel outputs:', out_names)
