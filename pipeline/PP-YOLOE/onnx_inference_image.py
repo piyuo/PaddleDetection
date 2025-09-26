@@ -200,74 +200,31 @@ def get_session(onnx_path: str):
         raise
 
     available = ort.get_available_providers()
-    # Always attempt CoreML first (macOS). Fallback to CPU (default) if unavailable.
     providers = None
-    provider_options = None
     if 'CoreMLExecutionProvider' in available:
         coreml_opts = {
-            #'mlprogram': '1',
-            #'enable_on_subgraph': '1',
-            #'only_allow_static_input_shapes': '1',
-        }
-        providers = ['CoreMLExecutionProvider', 'CPUExecutionProvider']
-        provider_options = [coreml_opts, {}]
+            "ModelFormat": "MLProgram",
+            "EnableOnSubgraphs": "1",
+            "MLComputeUnits": "ALL",
+            "RequireStaticInputShapes": "1",
+       }
+        providers = [
+            ('CoreMLExecutionProvider', coreml_opts),
+            'CPUExecutionProvider'
+            ]
         print('[INFO] Using CoreMLExecutionProvider (Apple Core ML) with options:', coreml_opts)
+        try:
+            sess = ort.InferenceSession(
+                onnx_path,
+                providers=providers,
+            )
+        except Exception as e:
+            # Fail fast as requested (no complex retry of options)
+            print('[ERROR] Failed to initialize CoreMLExecutionProvider session:', e, file=sys.stderr)
+            raise
     else:
         print(f'[WARN] CoreMLExecutionProvider not available. Using default providers: {available}')
-
-    # Create session with provider options when supported; gracefully fallback otherwise
-    def try_build(providers, provider_options):
-        return ort.InferenceSession(
-            onnx_path,
-            providers=providers,
-            provider_options=provider_options,
-        )
-
-    try:
-        if providers is None:
-            # CPU/default path
-            sess = ort.InferenceSession(onnx_path, providers=providers)
-        else:
-            # Try progressively less strict CoreML options to match the installed ORT version
-            option_variants = []
-            if provider_options is not None:
-                full = provider_options[0].copy()
-                option_variants.append(full)
-                v2 = full.copy(); v2.pop('only_allow_static_input_shapes', None); option_variants.append(v2)
-                v1 = {'mlprogram': full.get('mlprogram', '1')}
-                # keep enable_on_subgraph if present; otherwise just mlprogram
-                if 'enable_on_subgraph' in full:
-                    v1['enable_on_subgraph'] = full['enable_on_subgraph']
-                option_variants.append(v1)
-                option_variants.append({})  # default CoreML options
-            else:
-                option_variants.append({})
-
-            last_error = None
-            for opts in option_variants:
-                try:
-                    po = [opts, {}]
-                    sess = try_build(providers, po)
-                    print('[INFO] CoreML provider initialized with options:', opts if opts else '(default)')
-                    break
-                except Exception as e:
-                    last_error = e
-                    msg = str(e)
-                    if 'Unknown option' in msg or 'EP Error' in msg:
-                        # Try next variant
-                        continue
-                    # Non-option error; break and fallback to CPU
-                    break
-            else:
-                # Exhausted variants
-                raise last_error
-    except TypeError:
-        # Older onnxruntime may not support provider_options parameter
         sess = ort.InferenceSession(onnx_path, providers=providers)
-    except Exception as e:
-        print('[WARN] CoreML session creation failed:', e)
-        print("[WARN] Falling back to CPUExecutionProvider.")
-        sess = ort.InferenceSession(onnx_path, providers=['CPUExecutionProvider'])
     return sess
 
 
