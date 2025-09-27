@@ -11,7 +11,7 @@ source pipeline/PP-YOLOE/venv/bin/activate
 olive  run --config pipeline/PP-YOLOE/onnx_quantize.json
 
 # Rename the output model to a more descriptive name
-#mv -f output/olive/model.onnx output/rtdetrv3_r18vd_6x.onnx
+mv -f pipeline/PP-YOLOE/models/olive/model.onnx pipeline/PP-YOLOE/models/ppyoloe_crn_s_36e_pphuman_embed_olive.onnx
 
 # run inference on demo.jpg
-#python3 tools/onnx_inference.py --debug
+pipeline/PP-YOLOE/onnx_inference_image.sh
