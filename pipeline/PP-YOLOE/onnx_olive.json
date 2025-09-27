@@ -42,6 +42,10 @@
     "peephole_optimizer": {
       "type": "OnnxPeepholeOptimizer"
     },
+    "onnx_float_to_float16": {
+      "type": "OnnxFloatToFloat16",
+      "keep_io_types": true
+    },
     "extract_adapters": {
       "type": "ExtractAdapters"
     }
