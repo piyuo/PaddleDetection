@@ -42,17 +42,6 @@
     "peephole_optimizer": {
       "type": "OnnxPeepholeOptimizer"
     },
-    "onnx_static_quantization": {
-      "type": "OnnxStaticQuantization",
-      "disabled": true,
-      "data_config": "coco_val_data",
-      "quant_format": "QOperator",
-      "activation_type": "uint8",
-      "weight_type": "int8",
-      "per_channel": true,
-      "op_types_to_quantize": ["Conv"],
-      "calibrate_method": "MinMax"
-    },
     "extract_adapters": {
       "type": "ExtractAdapters",
       "disabled": true
