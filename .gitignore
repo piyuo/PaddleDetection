@@ -91,9 +91,10 @@ kernel_meta/
 *.DS_Store
 
 # pipeline
+.olive-cache/
 pipeline/output/
 pipeline/dataset/
+pipeline/models/
 pipeline/PP-YOLOE/venv
-pipeline/PP-YOLOE/backbone
 pipeline/PP-YOLOE/models
 pipeline/PP-YOLOE/*.onnx

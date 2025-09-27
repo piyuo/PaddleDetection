@@ -15,6 +15,6 @@ cd "${REPO_ROOT}"
 # Use python from the (possibly) activated venv
 python3 pipeline/PP-YOLOE/onnx_inference_image.py \
     --img pipeline/dataset/demo/demo.jpg \
-    --onnx pipeline/PP-YOLOE/models/ppyoloe_crn_s_36e_pphuman_embed.onnx \
+    --onnx pipeline/PP-YOLOE/models/ppyoloe_crn_s_36e_pphuman_embed_olive.onnx \
     --out pipeline/output \
     --thresh 0.5
