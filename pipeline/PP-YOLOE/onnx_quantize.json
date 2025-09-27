@@ -1,0 +1,70 @@
+{
+  "input_model": {
+    "type": "ONNXModel",
+    "model_path": "pipeline/PP-YOLOE/models/ppyoloe_crn_s_36e_pphuman_embed.onnx"
+  },
+  "systems": {
+    "local_system": {
+      "type": "LocalSystem",
+      "accelerators": [
+        {
+          "device": "cpu",
+          "execution_providers": ["CPUExecutionProvider"]
+        }
+      ]
+    },
+    "coreml_system": {
+      "type": "LocalSystem",
+      "accelerators": [
+        {
+          "device": "gpu",
+          "execution_providers": ["CoreMLExecutionProvider"],
+          "apple_gpu_only": false,
+          "apple_ane_only": true
+        }
+      ]
+    }
+  },
+
+  "data_configs": [
+    {
+      "name": "coco_val_data",
+      "user_script": "tools/ppyoloe_human.py",
+      "load_dataset_config": {
+        "type": "dataset_load",
+        "data_dir": "dataset/coco/val2017",
+        "annotation_file": "dataset/coco/annotations/simple_instances_val2017.json"
+      },
+      "post_process_data_config": { "type": "dataset_post_process" }
+    }
+  ],
+  "passes": {
+    "peephole_optimizer": {
+      "type": "OnnxPeepholeOptimizer"
+    },
+    "onnx_static_quantization": {
+      "type": "OnnxStaticQuantization",
+      "data_config": "coco_val_data",
+      "quant_format": "QDQ",
+      "activation_type": "uint8",
+      "weight_type": "int8",
+      "per_channel": true,
+      "op_types_to_quantize": ["Conv", "MatMul"],
+      "calibrate_method": "Percentile",
+      "calibrate_method_args": { "calibrate_percentile": 99.9 },
+      "extra_options": {
+        "ActivationSymmetric": false,
+        "WeightSymmetric": true,
+        "AddQDQPairToWeight": true
+      }
+    },
+    "extract_adapters": {
+      "type": "ExtractAdapters"
+    }
+  },
+  "host": "local_system",
+  "target": "coreml_system",
+  "no_artifacts": true,
+  "output_dir": "pipeline/PP-YOLOE/models/olive",
+  "log_severity_level": 1
+}

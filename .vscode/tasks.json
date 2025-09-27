@@ -1,0 +1,14 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "Run PP-YOLOE Human inference",
+			"type": "shell",
+			"command": "python3 pipeline/run_ppyoloe_human_infer.py",
+			"args": [],
+			"isBackground": false,
+			"problemMatcher": [],
+			"group": "build"
+		}
+	]
+}
