@@ -328,6 +328,322 @@ def split_large_concats(model_path: str, out_path: str, max_inputs: int = 8) -> 
     return out_path
 
 
+def fold_static_shape_chains(model_path: str, out_path: str) -> str:
+    """Constant-fold common shape computation chains once input shapes are static.
+
+    Handles a small subset of ops typically seen around shape building:
+      - Shape(x) -> Constant (int64 dims)
+      - Gather(const, axis=0) -> Constant
+      - Unsqueeze(const, axes) -> Constant
+      - Concat(consts, axis) -> Constant
+      - Cast(const) -> Constant
+    """
+    m = onnx.load(model_path)
+    g = m.graph
+
+    # Collect static shapes per value (from value_info & inputs after shape inference)
+    value_shapes = {}
+    def record_shape(vi):
+        try:
+            shp = []
+            tt = vi.type.tensor_type
+            for d in tt.shape.dim:
+                if d.dim_value:
+                    shp.append(int(d.dim_value))
+                else:
+                    shp.append(None)
+            value_shapes[vi.name] = shp
+        except Exception:
+            pass
+    for vi in list(g.input) + list(g.value_info) + list(g.output):
+        record_shape(vi)
+
+    # Prepare constant map: name -> np.ndarray
+    const_vals = {}
+    for init in g.initializer:
+        const_vals[init.name] = numpy_helper.to_array(init)
+
+    def get_const(name: str):
+        return const_vals.get(name)
+
+    def set_const(target_name: str, arr: np.ndarray):
+        # Add/replace initializer; keep the same tensor name
+        # Remove any existing initializer with same name first
+        for i, init in enumerate(list(g.initializer)):
+            if init.name == target_name:
+                del g.initializer[i]
+                break
+        g.initializer.extend([numpy_helper.from_array(arr, name=target_name)])
+        const_vals[target_name] = arr
+
+    nodes_to_remove: List[onnx.NodeProto] = []
+
+    def try_fold(node: onnx.NodeProto) -> bool:
+        op = node.op_type
+        # Helper to fetch attribute
+        def get_attr(name, default=None):
+            for a in node.attribute:
+                if a.name == name:
+                    if a.type == onnx.AttributeProto.INT:
+                        return a.i
+                    if a.type == onnx.AttributeProto.INTS:
+                        return list(a.ints)
+                    if a.type == onnx.AttributeProto.FLOAT:
+                        return a.f
+                    if a.type == onnx.AttributeProto.FLOATS:
+                        return list(a.floats)
+                    if a.type == onnx.AttributeProto.STRING:
+                        return a.s
+            return default
+
+        # Shape: output dims of input tensor
+        if op == "Shape" and len(node.input) == 1:
+            x = node.input[0]
+            out = node.output[0]
+            shp = value_shapes.get(x)
+            if shp and all(d is not None for d in shp):
+                arr = np.asarray(shp, dtype=np.int64)
+                set_const(out, arr)
+                nodes_to_remove.append(node)
+                return True
+            return False
+
+        # Gather(const, indices) along axis (default 0)
+        if op == "Gather" and len(node.input) >= 2:
+            data = get_const(node.input[0])
+            indices = get_const(node.input[1])
+            if data is None or indices is None:
+                return False
+            axis = get_attr("axis", 0)
+            try:
+                out_arr = np.take(data, indices.astype(np.int64), axis=axis)
+            except Exception:
+                return False
+            set_const(node.output[0], out_arr.astype(np.int64))
+            nodes_to_remove.append(node)
+            return True
+
+        # Unsqueeze(const)
+        if op == "Unsqueeze" and len(node.input) == 1:
+            x = get_const(node.input[0])
+            if x is None:
+                return False
+            axes = get_attr("axes")
+            if axes is None:
+                return False
+            arr = x
+            for ax in sorted([int(a) for a in axes]):
+                arr = np.expand_dims(arr, axis=ax)
+            set_const(node.output[0], arr.astype(np.int64))
+            nodes_to_remove.append(node)
+            return True
+
+        # Concat of constants
+        if op == "Concat" and len(node.input) >= 2:
+            axis = get_attr("axis", 0)
+            vals = [get_const(nm) for nm in node.input]
+            if any(v is None for v in vals):
+                return False
+            try:
+                out_arr = np.concatenate(vals, axis=axis)
+            except Exception:
+                return False
+            set_const(node.output[0], out_arr.astype(vals[0].dtype))
+            nodes_to_remove.append(node)
+            return True
+
+        # Cast of constant
+        if op == "Cast" and len(node.input) == 1:
+            x = get_const(node.input[0])
+            to = get_attr("to", None)
+            if x is None or to is None:
+                return False
+            # Map ONNX tensor type to numpy dtype (limited to common ones)
+            type_map = {
+                onnx.TensorProto.FLOAT: np.float32,
+                onnx.TensorProto.FLOAT16: np.float16,
+                onnx.TensorProto.DOUBLE: np.float64,
+                onnx.TensorProto.INT64: np.int64,
+                onnx.TensorProto.INT32: np.int32,
+                onnx.TensorProto.INT16: np.int16,
+                onnx.TensorProto.INT8: np.int8,
+                onnx.TensorProto.UINT8: np.uint8,
+                onnx.TensorProto.BOOL: np.bool_,
+            }
+            dtype = type_map.get(int(to))
+            if dtype is None:
+                return False
+            set_const(node.output[0], x.astype(dtype))
+            nodes_to_remove.append(node)
+            return True
+
+        return False
+
+    changed = True
+    any_change = False
+    # Iterate a few times to fold chains
+    for _ in range(4):
+        if not changed:
+            break
+        changed = False
+        for node in list(g.node):
+            if node in nodes_to_remove:
+                continue
+            if try_fold(node):
+                changed = True
+                any_change = True
+
+    if not any_change:
+        onnx.save(m, out_path)
+        return out_path
+
+    # Remove folded nodes
+    kept = [n for n in g.node if n not in nodes_to_remove]
+    del g.node[:]
+    g.node.extend(kept)
+    onnx.save(m, out_path)
+    print(f"Folded static shape chains: {len(nodes_to_remove)} node(s) replaced by constants")
+    return out_path
+
+
+def prune_outputs(model_path: str, out_path: str, keep_outputs: List[str]) -> str:
+    """Keep only a subset of outputs and prune unreachable nodes."""
+    if not keep_outputs:
+        shutil.copyfile(model_path, out_path)
+        return out_path
+    m = onnx.load(model_path)
+    input_names = [vi.name for vi in m.graph.input]
+    try:
+        onnx.utils.extract_model(model_path, out_path, input_names, keep_outputs)
+        return out_path
+    except Exception:
+        # Fallback: just copy if extract_model not available
+        shutil.copyfile(model_path, out_path)
+        return out_path
+
+def rewrite_div_by_const(model_path: str, out_path: str) -> str:
+    """Replace Div(x, c) where c is constant (scalar or broadcastable) with Mul(x, 1/c)."""
+    m = onnx.load(model_path)
+    g = m.graph
+    consts = {init.name: numpy_helper.to_array(init) for init in g.initializer}
+    new_inits = []
+    new_nodes = []
+    changed = 0
+
+    def unique_name(base: str) -> str:
+        idx = 0
+        existing = {n.name for n in g.node}
+        existing.update({vi.name for vi in list(g.input) + list(g.output)})
+        existing.update({init.name for init in g.initializer})
+        name = f"{base}__{idx}"
+        while name in existing:
+            idx += 1
+            name = f"{base}__{idx}"
+        return name
+
+    kept: List[onnx.NodeProto] = []
+    for node in g.node:
+        if node.op_type != "Div" or len(node.input) != 2:
+            kept.append(node)
+            continue
+        x, y = node.input
+        y_val = consts.get(y)
+        if y_val is None:
+            kept.append(node)
+            continue
+        # Avoid divide by zero
+        if np.any(y_val == 0):
+            kept.append(node)
+            continue
+        recip = (1.0 / y_val.astype(np.float32)).astype(np.float32)
+        recip_name = unique_name(node.name + "_recip")
+        new_inits.append(numpy_helper.from_array(recip, name=recip_name))
+        mul_node = helper.make_node("Mul", [x, recip_name], list(node.output), name=unique_name(node.name + "_Mul"))
+        new_nodes.append(mul_node)
+        changed += 1
+
+    if changed == 0:
+        onnx.save(m, out_path)
+        return out_path
+
+    g.initializer.extend(new_inits)
+    kept.extend(new_nodes)
+    del g.node[:]
+    g.node.extend(kept)
+    onnx.save(m, out_path)
+    print(f"Rewrote Div by constant: {changed} node(s)")
+    return out_path
+
+
+def rewrite_pow_patterns(model_path: str, out_path: str) -> str:
+    """Rewrite Pow(x, c) where c is constant: 2->Mul(x,x), 0.5->Sqrt(x), -1->Reciprocal(x), 1->Identity."""
+    m = onnx.load(model_path)
+    g = m.graph
+    consts = {init.name: numpy_helper.to_array(init) for init in g.initializer}
+
+    def get_scalar(v):
+        arr = consts.get(v)
+        if arr is None:
+            return None
+        try:
+            return float(arr.reshape(-1)[0])
+        except Exception:
+            return None
+
+    def unique_name(base: str) -> str:
+        idx = 0
+        existing = {n.name for n in g.node}
+        existing.update({vi.name for vi in list(g.input) + list(g.output)})
+        existing.update({init.name for init in g.initializer})
+        name = f"{base}__{idx}"
+        while name in existing:
+            idx += 1
+            name = f"{base}__{idx}"
+        return name
+
+    kept: List[onnx.NodeProto] = []
+    new_nodes: List[onnx.NodeProto] = []
+    changed = 0
+    for node in g.node:
+        if node.op_type != "Pow" or len(node.input) != 2:
+            kept.append(node)
+            continue
+        x, y = node.input
+        c = get_scalar(y)
+        if c is None:
+            kept.append(node)
+            continue
+        out = list(node.output)
+        if abs(c - 2.0) < 1e-6:
+            new_nodes.append(helper.make_node("Mul", [x, x], out, name=unique_name(node.name + "_MulPow2")))
+            changed += 1
+            continue
+        if abs(c - 0.5) < 1e-6:
+            new_nodes.append(helper.make_node("Sqrt", [x], out, name=unique_name(node.name + "_Sqrt")))
+            changed += 1
+            continue
+        if abs(c + 1.0) < 1e-6:
+            new_nodes.append(helper.make_node("Reciprocal", [x], out, name=unique_name(node.name + "_Recip")))
+            changed += 1
+            continue
+        if abs(c - 1.0) < 1e-6:
+            new_nodes.append(helper.make_node("Identity", [x], out, name=unique_name(node.name + "_Id")))
+            changed += 1
+            continue
+        kept.append(node)
+
+    if changed == 0:
+        onnx.save(m, out_path)
+        return out_path
+
+    kept.extend(new_nodes)
+    del g.node[:]
+    g.node.extend(kept)
+    onnx.save(m, out_path)
+    print(f"Rewrote Pow patterns: {changed} node(s)")
+    return out_path
+
+
 def main():
     parser = argparse.ArgumentParser(description="Graph surgery and performance compare for PP-YOLOE ONNX")
     parser.add_argument(
@@ -353,6 +669,15 @@ def main():
         default=0,
         help="If >0, split Concat nodes with more than N inputs into a concat tree",
     )
+    parser.add_argument("--fold-static-shapes", action="store_true", help="Fold Shape/Gather/Unsqueeze/Concat chains to constants")
+    parser.add_argument(
+        "--keep-outputs",
+        type=str,
+        default="",
+        help="Comma-separated list of outputs to keep (prune others)",
+    )
+    parser.add_argument("--rewrite-div", action="store_true", help="Rewrite Div by constant to Mul with reciprocal")
+    parser.add_argument("--rewrite-pow", action="store_true", help="Rewrite Pow(x,c) with simpler ops (2, 0.5, -1, 1)")
 
     args = parser.parse_args()
     os.makedirs(args.outdir, exist_ok=True)
@@ -402,6 +727,35 @@ def main():
         print("Running shape inference (post-rewrite)…")
         mod2b = mod_path.replace("_mod.onnx", "_shape2.onnx")
         work_path = shape_infer_model(work_path, mod2b)
+
+    if args.fold_static_shapes:
+        print("Folding static shape chains…")
+        modF = os.path.join(args.outdir, os.path.basename(args.model).replace('.onnx', '_foldshape.onnx'))
+        work_path = fold_static_shape_chains(work_path, modF)
+
+    if args.rewrite_div:
+        print("Rewriting Div by constant…")
+        modD = os.path.join(args.outdir, os.path.basename(args.model).replace('.onnx', '_div2mul.onnx'))
+        work_path = rewrite_div_by_const(work_path, modD)
+
+    if args.rewrite_pow:
+        print("Rewriting Pow patterns…")
+        modW = os.path.join(args.outdir, os.path.basename(args.model).replace('.onnx', '_powrew.onnx'))
+        work_path = rewrite_pow_patterns(work_path, modW)
+
+    # Optional pruning of outputs to maximize CoreML partition sizes
+    if args.keep_outputs:
+        keep = [s.strip() for s in args.keep_outputs.split(",") if s.strip()]
+        if keep:
+            print("Pruning outputs; keeping:", keep)
+            modP = os.path.join(args.outdir, os.path.basename(args.model).replace('.onnx', '_pruned.onnx'))
+            work_path = prune_outputs(work_path, modP, keep)
+
+    # One more shape inference pass after folding/pruning
+    if not args.no_shape_infer:
+        print("Running shape inference (final)…")
+        mod2c = mod_path.replace("_mod.onnx", "_shape3.onnx")
+        work_path = shape_infer_model(work_path, mod2c)
 
     if not args.no_optimizer:
         print("Applying onnxoptimizer passes…")
