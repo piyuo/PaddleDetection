@@ -166,8 +166,14 @@ def pick_providers(pref: str) -> List[Any]:
     provs = available_providers()
     pref = (pref or "cpu").lower()
     if pref in ("coreml", "ane") and "CoreMLExecutionProvider" in provs:
-        # Prefer CoreML with CPU fallback (no options to avoid version mismatch)
-        return ["CoreMLExecutionProvider", "CPUExecutionProvider"]
+        # Use the same CoreML options as onnx_inference_image.py for realistic results
+        coreml_opts: Dict[str, str] = {
+            "ModelFormat": "MLProgram",
+            "EnableOnSubgraphs": "1",
+            "MLComputeUnits": "ALL",
+            "RequireStaticInputShapes": "1",
+        }
+        return [("CoreMLExecutionProvider", coreml_opts), "CPUExecutionProvider"]
     if pref in ("cpu", "default"):
         return ["CPUExecutionProvider"]
     # Generic: try exact match tokenizing by 'ExecutionProvider'
@@ -210,8 +216,16 @@ def run_benchmark(model_path: str, input_shape: Tuple[int, ...], ep: str, warmup
         arr = np.array(times)
         return float(np.percentile(arr, p)) if len(arr) else float("nan")
 
+    # Normalize providers for reporting: expand tuples to display options
+    shown_providers: List[Any] = []
+    for p in providers:
+        if isinstance(p, tuple):
+            shown_providers.append(p)
+        else:
+            shown_providers.append(p)
+
     result = {
-        "providers": providers,
+        "providers": shown_providers,
         "warmup": warmup,
         "runs": runs,
         "latency_ms_avg": float(np.mean(times)) if times else float("nan"),
@@ -290,12 +304,13 @@ def main():
         print("onnxruntime not available; skipping benchmark. Install 'onnxruntime' or 'onnxruntime-silicon'.")
         return
 
+
     print("\n=== Benchmark ===")
     print("Available providers:", available_providers())
     res = run_benchmark(args.model, ishape, args.ep, args.warmup, args.runs, enable_profile=args.ort_profile, profile_dir=args.ort_profile_dir)
     bench = res["benchmark"]
     print("Providers:", bench["providers"])
-    print("Runs:", bench["runs"], "Warmup:", bench["warmup"])
+    print("EP:",args.ep,"Runs:", bench["runs"], "Warmup:", bench["warmup"])
     print(
         "Latency (ms): avg={avg:.2f} p50={p50:.2f} p90={p90:.2f} p95={p95:.2f} min={min:.2f} max={max:.2f}".format(
             avg=bench["latency_ms_avg"],
