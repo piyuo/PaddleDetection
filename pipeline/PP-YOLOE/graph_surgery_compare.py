@@ -364,6 +364,7 @@ def main():
         return
     base = run_benchmark(args.model, ishape, args.ep, args.warmup, args.runs)
     b = base["benchmark"]
+    print("Providers (baseline):", b.get("providers"))
     print(
         "Baseline Latency (ms) avg={:.2f} p50={:.2f} p90={:.2f} p95={:.2f}".format(
             b["latency_ms_avg"], b["latency_ms_p50"], b["latency_ms_p90"], b["latency_ms_p95"]
@@ -419,13 +420,23 @@ def main():
         mod3 = os.path.join(args.outdir, os.path.basename(args.model).replace('.onnx', '_fp16.onnx'))
         work_path = cast_graph_to_fp16(work_path, mod3)
 
+    # Also copy to a stable "final" name for convenience
+    final_path = os.path.join(
+        args.outdir, os.path.basename(args.model).replace('.onnx', '_final.onnx')
+    )
+    try:
+        shutil.copyfile(work_path, final_path)
+    except Exception:
+        final_path = work_path
     print("Modified model:", work_path)
+    print("Final model (stable name):", final_path)
     mod_info = load_model_info(work_path)
     print("Nodes:", mod_info["node_count"], "Unique ops:", mod_info["unique_ops"])
 
     print("=== Modified Benchmark ===")
     mod = run_benchmark(work_path, ishape, args.ep, args.warmup, args.runs)
     m = mod["benchmark"]
+    print("Providers (modified):", m.get("providers"))
     print(
         "Modified Latency (ms) avg={:.2f} p50={:.2f} p90={:.2f} p95={:.2f}".format(
             m["latency_ms_avg"], m["latency_ms_p50"], m["latency_ms_p90"], m["latency_ms_p95"]
