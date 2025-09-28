@@ -1,0 +1,320 @@
+#!/usr/bin/env python3
+import argparse
+import time
+import json
+import os
+from typing import Any, Dict, List, Tuple
+
+import numpy as np
+import onnx
+
+try:
+    import onnxruntime as ort
+except Exception as e:
+    ort = None
+
+
+def _elem_type_to_dtype(tensor_type: int):
+    # https://onnx.ai/onnx/api/mapping.html#onnx-mapping-tensor-dtype
+    import onnx
+
+    m = {
+        onnx.TensorProto.FLOAT: np.float32,
+        onnx.TensorProto.UINT8: np.uint8,
+        onnx.TensorProto.INT8: np.int8,
+        onnx.TensorProto.UINT16: np.uint16,
+        onnx.TensorProto.INT16: np.int16,
+        onnx.TensorProto.INT32: np.int32,
+        onnx.TensorProto.INT64: np.int64,
+        onnx.TensorProto.BOOL: np.bool_,
+        onnx.TensorProto.FLOAT16: np.float16,
+        onnx.TensorProto.DOUBLE: np.float64,
+        onnx.TensorProto.COMPLEX64: np.complex64,
+        onnx.TensorProto.COMPLEX128: np.complex128,
+        onnx.TensorProto.STRING: np.object_,
+        onnx.TensorProto.UINT32: np.uint32 if hasattr(np, 'uint32') else np.uint64,
+        onnx.TensorProto.UINT64: np.uint64,
+        onnx.TensorProto.BFLOAT16: np.float16,  # best effort
+    }
+    return m.get(tensor_type, np.float32)
+
+
+def load_model_info(model_path: str) -> Dict[str, Any]:
+    m = onnx.load(model_path)
+    info: Dict[str, Any] = {}
+    info["ir_version"] = m.ir_version
+    info["opsets"] = [(o.domain or "ai.onnx", o.version) for o in m.opset_import]
+
+    def shape_of(value_info) -> List[Any]:
+        t = value_info.type.tensor_type
+        shp = []
+        for d in t.shape.dim:
+            if d.dim_value:
+                shp.append(int(d.dim_value))
+            else:
+                shp.append(d.dim_param or "?")
+        return shp
+
+    inputs = []
+    for i in m.graph.input:
+        t = i.type.tensor_type
+        inputs.append({
+            "name": i.name,
+            "dtype": t.elem_type,
+            "shape": shape_of(i),
+        })
+    outputs = []
+    for o in m.graph.output:
+        t = o.type.tensor_type
+        outputs.append({
+            "name": o.name,
+            "dtype": t.elem_type,
+            "shape": shape_of(o),
+        })
+
+    ops: Dict[str, int] = {}
+    for n in m.graph.node:
+        ops[n.op_type] = ops.get(n.op_type, 0) + 1
+
+    initializers = [(init.name, list(init.dims), init.data_type) for init in m.graph.initializer]
+    total_params = 0
+    for _, dims, _ in initializers:
+        if dims:
+            prod = 1
+            for d in dims:
+                prod *= int(d)
+            total_params += prod
+
+    info.update({
+        "inputs": inputs,
+        "outputs": outputs,
+        "node_count": len(m.graph.node),
+        "unique_ops": len(ops),
+        "ops_hist": sorted(ops.items(), key=lambda kv: -kv[1]),
+        "initializers": len(initializers),
+        "total_params": int(total_params),
+    })
+    return info
+
+
+def parse_shape(s: str) -> Tuple[int, ...]:
+    return tuple(int(x) for x in s.split(",") if x)
+
+
+def make_dummy_inputs(model_info: Dict[str, Any], input_shape: Tuple[int, ...]) -> Dict[str, np.ndarray]:
+    # Heuristics for PP-YOLOE: main image is NCHW; may also have inputs like 'im_shape' (N,2) and 'scale_factor' (N,2)
+    inputs: Dict[str, np.ndarray] = {}
+    n, c, h, w = None, None, None, None
+    if len(input_shape) == 4:
+        n, c, h, w = input_shape
+
+    for inp in model_info["inputs"]:
+        name = inp["name"]
+        dtype = _elem_type_to_dtype(inp["dtype"])  # default mapping
+        shp = inp["shape"]
+
+        # Resolve dynamic dims
+        resolved = []
+        for j, d in enumerate(shp):
+            if isinstance(d, int) and d > 0:
+                resolved.append(d)
+            else:
+                # Guess from provided input_shape
+                if len(shp) == 4 and len(input_shape) == 4:
+                    resolved.append(input_shape[j])
+                elif len(shp) == 2 and len(input_shape) == 4 and j == 0 and n is not None:
+                    resolved.append(n)
+                elif len(shp) == 1 and j == 0 and n is not None:
+                    resolved.append(n)
+                else:
+                    # fallback
+                    resolved.append(1)
+
+        # Special-cases common helper inputs
+        if len(resolved) == 2 and resolved[1] == 2 and dtype in (np.float16, np.float32, np.float64) and h and w:
+            if name.lower().endswith("im_shape") or "im_shape" in name.lower():
+                arr = np.array([[float(h), float(w)]], dtype=dtype)
+                arr = np.repeat(arr, resolved[0], axis=0)
+                inputs[name] = arr
+                continue
+            if name.lower().endswith("scale_factor") or "scale" in name.lower():
+                arr = np.ones((resolved[0], 2), dtype=dtype)
+                inputs[name] = arr
+                continue
+
+        # Main tensor-like inputs
+        if np.issubdtype(dtype, np.floating):
+            data = np.random.rand(*resolved).astype(dtype)
+        elif np.issubdtype(dtype, np.integer):
+            data = np.random.randint(0, 10, size=resolved, dtype=dtype)
+        elif dtype == np.bool_:
+            data = np.random.rand(*resolved) > 0.5
+        else:
+            # Strings/objects not supported for inference inputs in ORT; use zeros
+            data = np.zeros(resolved, dtype=np.float32)
+        inputs[name] = data
+    return inputs
+
+
+def available_providers() -> List[str]:
+    if ort is None:
+        return []
+    return list(ort.get_available_providers())
+
+
+def pick_providers(pref: str) -> List[Any]:
+    provs = available_providers()
+    pref = (pref or "cpu").lower()
+    if pref in ("coreml", "ane") and "CoreMLExecutionProvider" in provs:
+        # Prefer CoreML with CPU fallback (no options to avoid version mismatch)
+        return ["CoreMLExecutionProvider", "CPUExecutionProvider"]
+    if pref in ("cpu", "default"):
+        return ["CPUExecutionProvider"]
+    # Generic: try exact match tokenizing by 'ExecutionProvider'
+    matches = [p for p in provs if pref.lower() in p.lower()]
+    if matches:
+        return [matches[0], "CPUExecutionProvider"]
+    # Fallback
+    return ["CPUExecutionProvider"]
+
+
+def run_benchmark(model_path: str, input_shape: Tuple[int, ...], ep: str, warmup: int, runs: int, enable_profile: bool = False, profile_dir: str = "") -> Dict[str, Any]:
+    if ort is None:
+        raise RuntimeError("onnxruntime is not installed. Please install 'onnxruntime' or 'onnxruntime-silicon'.")
+
+    model_info = load_model_info(model_path)
+
+    so = ort.SessionOptions()
+    so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+    if enable_profile:
+        so.enable_profiling = True
+
+    providers = pick_providers(ep)
+    sess = ort.InferenceSession(model_path, sess_options=so, providers=providers)
+
+    feeds = make_dummy_inputs(model_info, input_shape)
+
+    # Warmup
+    for _ in range(max(0, warmup)):
+        sess.run(None, feeds)
+
+    # Timed runs
+    times: List[float] = []
+    for _ in range(runs):
+        t0 = time.perf_counter()
+        sess.run(None, feeds)
+        t1 = time.perf_counter()
+        times.append((t1 - t0) * 1000.0)  # ms
+
+    def pct(p: float) -> float:
+        arr = np.array(times)
+        return float(np.percentile(arr, p)) if len(arr) else float("nan")
+
+    result = {
+        "providers": providers,
+        "warmup": warmup,
+        "runs": runs,
+        "latency_ms_avg": float(np.mean(times)) if times else float("nan"),
+        "latency_ms_p50": pct(50),
+        "latency_ms_p90": pct(90),
+        "latency_ms_p95": pct(95),
+        "latency_ms_min": float(np.min(times)) if times else float("nan"),
+        "latency_ms_max": float(np.max(times)) if times else float("nan"),
+    }
+    profile_path = ""
+    if enable_profile:
+        try:
+            prof_file = sess.end_profiling()
+            if profile_dir:
+                os.makedirs(profile_dir, exist_ok=True)
+                # Move or copy profile
+                dest = os.path.join(profile_dir, os.path.basename(prof_file))
+                try:
+                    import shutil
+                    shutil.move(prof_file, dest)
+                    profile_path = dest
+                except Exception:
+                    profile_path = prof_file
+            else:
+                profile_path = prof_file
+        except Exception:
+            profile_path = ""
+    return {"model": model_info, "benchmark": result, "ort_profile": profile_path}
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Inspect and benchmark an ONNX model with onnxruntime")
+    parser.add_argument(
+        "--model",
+        type=str,
+        default="pipeline/PP-YOLOE/models/ppyoloe_crn_s_36e_pphuman_embed.onnx",
+        help="Path to ONNX model",
+    )
+    parser.add_argument(
+        "--input-shape",
+        type=str,
+        default="1,3,640,640",
+        help="Input shape for the main 4D input (N,C,H,W)",
+    )
+    parser.add_argument(
+        "--ep",
+        type=str,
+        default="coreml",
+        help="Execution provider preference: coreml|cpu|…",
+    )
+    parser.add_argument("--warmup", type=int, default=5)
+    parser.add_argument("--runs", type=int, default=50)
+    parser.add_argument("--json", type=str, default="", help="Optional path to write JSON report")
+    parser.add_argument("--ort-profile", action="store_true", help="Enable onnxruntime profiling and save timeline JSON")
+    parser.add_argument("--ort-profile-dir", type=str, default="pipeline/PP-YOLOE/output", help="Directory to place ORT profile JSON")
+
+    args = parser.parse_args()
+    ishape = parse_shape(args.input_shape)
+
+    info = load_model_info(args.model)
+    print("=== Model Info ===")
+    print("ir_version:", info["ir_version"])
+    print("opset_import:", info["opsets"])
+    print("inputs:")
+    for i in info["inputs"]:
+        print(" -", i["name"], i["shape"], i["dtype"])  # dtype is TensorProto enum
+    print("outputs:")
+    for o in info["outputs"]:
+        print(" -", o["name"], o["shape"], o["dtype"])  # dtype is TensorProto enum
+    print("node_count:", info["node_count"], "unique_ops:", info["unique_ops"], "initializers:", info["initializers"], "total_params:", info["total_params"])
+    print("top ops:")
+    for k, v in info["ops_hist"][:25]:
+        print(f"  {k}: {v}")
+
+    if ort is None:
+        print("onnxruntime not available; skipping benchmark. Install 'onnxruntime' or 'onnxruntime-silicon'.")
+        return
+
+    print("\n=== Benchmark ===")
+    print("Available providers:", available_providers())
+    res = run_benchmark(args.model, ishape, args.ep, args.warmup, args.runs, enable_profile=args.ort_profile, profile_dir=args.ort_profile_dir)
+    bench = res["benchmark"]
+    print("Providers:", bench["providers"])
+    print("Runs:", bench["runs"], "Warmup:", bench["warmup"])
+    print(
+        "Latency (ms): avg={avg:.2f} p50={p50:.2f} p90={p90:.2f} p95={p95:.2f} min={min:.2f} max={max:.2f}".format(
+            avg=bench["latency_ms_avg"],
+            p50=bench["latency_ms_p50"],
+            p90=bench["latency_ms_p90"],
+            p95=bench["latency_ms_p95"],
+            min=bench["latency_ms_min"],
+            max=bench["latency_ms_max"],
+        )
+    )
+
+    if args.json:
+        os.makedirs(os.path.dirname(args.json) or ".", exist_ok=True)
+        with open(args.json, "w") as f:
+            json.dump(res, f, indent=2)
+        print("Saved JSON report to:", args.json)
+    if res.get("ort_profile"):
+        print("Saved ORT profile to:", res["ort_profile"])
+
+
+if __name__ == "__main__":
+    main()
