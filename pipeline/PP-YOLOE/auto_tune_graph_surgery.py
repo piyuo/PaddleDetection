@@ -46,6 +46,27 @@ from typing import Dict, List, Optional, Tuple
 GRAPH_SCRIPT = Path(__file__).with_name("graph_surgery_compare.py")
 
 
+class TunerLogger:
+    """Simple logger that writes to stdout and a tuner.log file under outdir."""
+    def __init__(self, outdir: Path):
+        self.outdir = outdir
+        self.log_path = outdir / "tuner.log"
+        try:
+            outdir.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+
+    def log(self, msg: str) -> None:
+        line = str(msg)
+        print(line)
+        try:
+            with open(self.log_path, "a") as f:
+                f.write(line + "\n")
+        except Exception:
+            # best effort; ignore file write errors
+            pass
+
+
 @dataclass
 class TrialConfig:
     rewrite_hardswish: bool = False
@@ -97,7 +118,8 @@ _RE_COREML_PARTS = re.compile(r"CoreML.*partitions.*?:\s*(\d+)", re.IGNORECASE)
 
 def run_trial(base_model: str, input_shape: str, ep: str, warmup: int, runs: int,
               outdir: Path, trial_name: str, cfg: TrialConfig,
-              extra_args: Optional[List[str]] = None) -> TrialResult:
+              extra_args: Optional[List[str]] = None,
+              logger: Optional[TunerLogger] = None) -> TrialResult:
     trial_outdir = outdir / trial_name
     trial_outdir.mkdir(parents=True, exist_ok=True)
 
@@ -112,6 +134,13 @@ def run_trial(base_model: str, input_shape: str, ep: str, warmup: int, runs: int
     ] + cfg.to_flags()
     if extra_args:
         cmd += extra_args
+
+    # Debug: print a compact config summary
+    if logger:
+        logger.log(f"[trial] {trial_name}")
+        logger.log(f"        flags: {' '.join(cfg.to_flags())}")
+        if extra_args:
+            logger.log(f"        extra_args: {' '.join(extra_args)}")
 
     log_path = trial_outdir / "trial.log"
     with open(log_path, "w") as logf:
@@ -228,89 +257,153 @@ def copy_best_artifacts(best: TrialResult, outdir: Path) -> None:
 
 def greedy_staged_search(base_model: str, input_shape: str, ep: str, warmup: int, runs: int,
                          outdir: Path, keep_outputs: Optional[str], split_candidates: List[int],
-                         try_fp16: bool, extra_args: Optional[List[str]]) -> Tuple[List[TrialResult], TrialResult]:
+                         try_fp16: bool, extra_args: Optional[List[str]], logger: TunerLogger) -> Tuple[List[TrialResult], TrialResult]:
     results: List[TrialResult] = []
     best_cfg = TrialConfig()
 
     def eval_cfg(name: str, cfg: TrialConfig) -> TrialResult:
-        r = run_trial(base_model, input_shape, ep, warmup, runs, outdir, name, cfg, extra_args)
+        r = run_trial(base_model, input_shape, ep, warmup, runs, outdir, name, cfg, extra_args, logger)
         results.append(r)
+        # Immediate feedback on metrics
+        logger.log(
+            f"[result] {name}: modified={r.modified_avg_ms:.3f} ms, baseline={r.baseline_avg_ms:.3f} ms, "
+            f"delta={r.avg_delta_pct:.2f}%, parts={r.coreml_partitions}, nodes={r.coreml_supported_nodes}"
+        )
         return r
 
+    # Stage overview
+    stage_docs = {
+        0: "Baseline (no transforms beyond fix-input-shapes)",
+        1: "HardSwish rewrite toggle (off/on)",
+        2: "Concat split sweep (limit inputs to N)",
+        3: "Fold static shape chains (off/on)",
+        4: "Arithmetic rewrites (Div-by-const / Pow patterns)",
+        5: "FP16 cast toggle (off/on) if enabled",
+        6: "Outputs pruning (off/on) if keep-outputs provided",
+    }
+
+    # Planned steps for progress estimate
+    total_est = 1  # stage 0
+    total_est += 2  # stage 1
+    total_est += 1 + len(split_candidates)  # stage 2
+    total_est += 2  # stage 3
+    total_est += 4  # stage 4
+    total_est += (2 if try_fp16 else 1)  # stage 5 (we still evaluate current best once)
+    total_est += (2 if keep_outputs else 1)  # stage 6 (evaluate current best once)
+    logger.log(f"[tuner] Staged search plan: ~{total_est} trials")
+    logger.log("[tuner] Stage meanings:")
+    for k in sorted(stage_docs.keys()):
+        logger.log(f"  - Stage {k}: {stage_docs[k]}")
+
+    trial_counter = 0
+
     # Stage 0: baseline (no extra passes besides fix-input-shapes)
+    logger.log("\n[stage 0] Baseline")
     baseline_res = eval_cfg("stage0_baseline", best_cfg)
     best = baseline_res
     best_cfg = best.config
+    trial_counter += 1
+    logger.log(f"[stage 0] done. best modified avg = {best.modified_avg_ms:.3f} ms (delta {best.avg_delta_pct:.2f}%)")
 
     # Stage 1: HardSwish rewrite
+    logger.log("\n[stage 1] HardSwish rewrite toggle (0=off, 1=on)")
     for hs in [False, True]:
+        step = 1 if not hs else 2
         cfg = TrialConfig(**asdict(best_cfg))
         cfg.rewrite_hardswish = hs
+        logger.log(f"[stage 1] step {step}/2 -> hs={int(hs)}")
         r = eval_cfg(f"stage1_hs_{int(hs)}", cfg)
         if r.modified_avg_ms < best.modified_avg_ms:
             best = r
             best_cfg = cfg
+        trial_counter += 1
+    logger.log(f"[stage 1] done. best modified avg = {best.modified_avg_ms:.3f} ms")
 
     # Stage 2: split concat sweep
+    candidates = [None] + split_candidates
+    logger.log(f"\n[stage 2] Concat split sweep over {candidates}")
+    total_steps = len(candidates)
     for sc in [None] + split_candidates:
+        idx = candidates.index(sc) + 1
         cfg = TrialConfig(**asdict(best_cfg))
         cfg.split_concat = sc
+        logger.log(f"[stage 2] step {idx}/{total_steps} -> split_concat={sc if sc is not None else 'none'}")
         r = eval_cfg(f"stage2_sc_{'none' if sc is None else sc}", cfg)
         if r.modified_avg_ms < best.modified_avg_ms:
             best = r
             best_cfg = cfg
+        trial_counter += 1
+    logger.log(f"[stage 2] done. best modified avg = {best.modified_avg_ms:.3f} ms")
 
     # Stage 3: fold static shapes
+    logger.log("\n[stage 3] Fold static shape chains toggle (0=off, 1=on)")
     for fs in [False, True]:
+        step = 1 if not fs else 2
         cfg = TrialConfig(**asdict(best_cfg))
         cfg.fold_static_shapes = fs
+        logger.log(f"[stage 3] step {step}/2 -> fold_static_shapes={int(fs)}")
         r = eval_cfg(f"stage3_fold_{int(fs)}", cfg)
         if r.modified_avg_ms < best.modified_avg_ms:
             best = r
             best_cfg = cfg
+        trial_counter += 1
+    logger.log(f"[stage 3] done. best modified avg = {best.modified_avg_ms:.3f} ms")
 
     # Stage 4: arithmetic rewrites combos
+    logger.log("\n[stage 4] Arithmetic rewrites combinations: none/div/pow/both")
     combos = [
         (False, False, "none"),
         (True, False, "div"),
         (False, True, "pow"),
         (True, True, "both"),
     ]
-    for div, pow_, tag in combos:
+    total_steps = len(combos)
+    for i, (div, pow_, tag) in enumerate(combos, start=1):
         cfg = TrialConfig(**asdict(best_cfg))
         cfg.rewrite_div = div
         cfg.rewrite_pow = pow_
+        logger.log(f"[stage 4] step {i}/{total_steps} -> rewrite_div={int(div)} rewrite_pow={int(pow_)}")
         r = eval_cfg(f"stage4_ar_{tag}", cfg)
         if r.modified_avg_ms < best.modified_avg_ms:
             best = r
             best_cfg = cfg
+        trial_counter += 1
+    logger.log(f"[stage 4] done. best modified avg = {best.modified_avg_ms:.3f} ms")
 
     # Stage 5: FP16 optional
     if try_fp16:
-        for f16 in [False, True]:
+        logger.log("\n[stage 5] FP16 casting toggle (0=off, 1=on)")
+        for i, f16 in enumerate([False, True], start=1):
             cfg = TrialConfig(**asdict(best_cfg))
             cfg.fp16 = f16
+            logger.log(f"[stage 5] step {i}/2 -> fp16={int(f16)}")
             r = eval_cfg(f"stage5_fp16_{int(f16)}", cfg)
             if r.modified_avg_ms < best.modified_avg_ms:
                 best = r
                 best_cfg = cfg
+            trial_counter += 1
+        logger.log(f"[stage 5] done. best modified avg = {best.modified_avg_ms:.3f} ms")
 
     # Stage 6: keep outputs if provided (test off vs on)
     if keep_outputs:
-        for keep_on in [False, True]:
+        logger.log("\n[stage 6] Outputs pruning toggle (0=off, 1=on)")
+        for i, keep_on in enumerate([False, True], start=1):
             cfg = TrialConfig(**asdict(best_cfg))
             cfg.keep_outputs = keep_outputs if keep_on else None
+            logger.log(f"[stage 6] step {i}/2 -> keep_outputs={'on' if keep_on else 'off'}")
             r = eval_cfg(f"stage6_keep_{int(keep_on)}", cfg)
             if r.modified_avg_ms < best.modified_avg_ms:
                 best = r
                 best_cfg = cfg
+            trial_counter += 1
+        logger.log(f"[stage 6] done. best modified avg = {best.modified_avg_ms:.3f} ms")
 
     return results, best
 
 
 def full_grid_search(base_model: str, input_shape: str, ep: str, warmup: int, runs: int,
                      outdir: Path, keep_outputs: Optional[str], split_candidates: List[int],
-                     try_fp16: bool, extra_args: Optional[List[str]]) -> Tuple[List[TrialResult], TrialResult]:
+                     try_fp16: bool, extra_args: Optional[List[str]], logger: TunerLogger) -> Tuple[List[TrialResult], TrialResult]:
     results: List[TrialResult] = []
     best: Optional[TrialResult] = None
 
@@ -326,6 +419,9 @@ def full_grid_search(base_model: str, input_shape: str, ep: str, warmup: int, ru
     fp16_opts = [False, True] if try_fp16 else [False]
     keep_opts = [None, keep_outputs] if keep_outputs else [None]
 
+    # Compute total combinations for progress info
+    total = len(hs_opts) * len(sc_opts) * len(fs_opts) * len(ar_opts) * len(fp16_opts) * len(keep_opts)
+    logger.log(f"[tuner] Full grid: {total} combinations")
     idx = 0
     for hs, sc, fs, (dv, pw, _), fp16, ko in product(hs_opts, sc_opts, fs_opts, ar_opts, fp16_opts, keep_opts):
         cfg = TrialConfig(
@@ -338,8 +434,13 @@ def full_grid_search(base_model: str, input_shape: str, ep: str, warmup: int, ru
             keep_outputs=ko,
         )
         tag = f"grid_{idx:04d}"
-        r = run_trial(base_model, input_shape, ep, warmup, runs, outdir, tag, cfg, extra_args)
+        logger.log(f"[grid] {idx+1}/{total} -> {tag} hs={int(hs)} sc={'none' if sc is None else sc} fs={int(fs)} div={int(dv)} pow={int(pw)} fp16={int(fp16)} keep={'on' if ko else 'off'}")
+        r = run_trial(base_model, input_shape, ep, warmup, runs, outdir, tag, cfg, extra_args, logger)
         results.append(r)
+        logger.log(
+            f"[result] {tag}: modified={r.modified_avg_ms:.3f} ms, baseline={r.baseline_avg_ms:.3f} ms, "
+            f"delta={r.avg_delta_pct:.2f}%, parts={r.coreml_partitions}, nodes={r.coreml_supported_nodes}"
+        )
         if best is None or r.modified_avg_ms < best.modified_avg_ms:
             best = r
         idx += 1
@@ -394,12 +495,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     outdir.mkdir(parents=True, exist_ok=True)
 
     print(f"Auto-tuning: model={model} shape={input_shape} ep={ep}")
+    print(f"Warmup={warmup} Runs={runs}")
     print(f"Run dir: {outdir}")
 
+    logger = TunerLogger(outdir)
     if args.full_grid:
-        results, best = full_grid_search(model, input_shape, ep, warmup, runs, outdir, keep_outputs, split_candidates, try_fp16, extra_args)
+        results, best = full_grid_search(model, input_shape, ep, warmup, runs, outdir, keep_outputs, split_candidates, try_fp16, extra_args, logger)
     else:
-        results, best = greedy_staged_search(model, input_shape, ep, warmup, runs, outdir, keep_outputs, split_candidates, try_fp16, extra_args)
+        results, best = greedy_staged_search(model, input_shape, ep, warmup, runs, outdir, keep_outputs, split_candidates, try_fp16, extra_args, logger)
 
     # Summarize
     results_sorted = sorted(results, key=lambda r: r.modified_avg_ms)
