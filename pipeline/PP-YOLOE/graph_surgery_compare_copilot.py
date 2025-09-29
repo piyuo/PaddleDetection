@@ -1,18 +1,22 @@
 #!/usr/bin/env python3
 """
-Enhanced graph surgery for PP-YOLOE ONNX with aggressive ANE-targeted optimizations.
+Experimental graph surgery for PP-YOLOE ONNX to explore ANE-friendly transforms, with baseline vs modified timing.
 
-New optimizations targeting CoreML ANE acceleration:
-- ReduceMean -> GlobalAveragePool/AvgPool conversion
-- Aggressive constant folding (15 iterations)
-- Identity chain elimination
-- Reshape/Transpose chain simplification
-- Enhanced ANE compatibility analysis
+This script:
+ 1) Loads original model, benchmarks it.
+ 2) Applies optional transformations:
+    - onnx-simplifier (fold constants, remove redundant ops)
+    - onnx.shape_inference (infer shapes)
+    - Cast clamp (e.g., f32->f16) if requested
+ 3) Saves modified model and benchmarks it.
+ 4) Prints side-by-side latency comparison.
+
+Note: For actual ANE-targeted improvements, tailor transforms to CoreML EP supported ops.
 """
 import argparse
 import os
 import shutil
-from typing import Tuple, List, Dict, Set
+from typing import Tuple, List
 import sys
 import subprocess
 
@@ -35,6 +39,7 @@ from profile_onnx import (
 
 def simplify_model(model_path: str, out_path: str) -> str:
     """Run onnx-simplifier in a subprocess to isolate potential segfaults; fallback to copy on failure."""
+    # Check if onnxsim is importable; if not, fall back early
     try:
         import onnxsim  # noqa: F401
     except Exception:
@@ -46,6 +51,7 @@ def simplify_model(model_path: str, out_path: str) -> str:
         res = subprocess.run(cmd, check=True, capture_output=True, text=True)
         return out_path
     except Exception:
+        # Fallback: copy original when simplification not applicable or crashed
         shutil.copyfile(model_path, out_path)
         return out_path
 
@@ -53,10 +59,12 @@ def simplify_model(model_path: str, out_path: str) -> str:
 def shape_infer_model(model_path: str, out_path: str) -> str:
     try:
         inferred = onnx.shape_inference.infer_shapes_path(model_path)
+        # Note: infer_shapes_path returns path in newer onnx; fallback to in-memory
         if isinstance(inferred, str) and os.path.exists(inferred):
             return inferred
     except Exception:
         pass
+    # Try in-memory API
     m = onnx.load(model_path)
     m2 = onnx.shape_inference.infer_shapes(m)
     onnx.save(m2, out_path)
@@ -80,6 +88,7 @@ def fix_input_shapes(model_path: str, out_path: str, nchw: Tuple[int, int, int, 
                 d.dim_param = ""
                 d.dim_value = int(dims[i])
         elif rank == 1:
+            # batch-like vectors
             tt.shape.dim[0].dim_param = ""
             tt.shape.dim[0].dim_value = int(n)
     onnx.save(m, out_path)
@@ -90,9 +99,12 @@ def run_onnxoptimizer(model_path: str, out_path: str) -> str:
     try:
         import onnxoptimizer
     except Exception:
-        shutil.copyfile(model_path, out_path)
+        # Package not available; just copy
+        import shutil as _sh
+        _sh.copyfile(model_path, out_path)
         return out_path
     m = onnx.load(model_path)
+    # List of reasonable passes for inference graphs
     available = set(getattr(onnxoptimizer, 'get_available_passes', lambda: [])())
     desired = [
         "eliminate_identity",
@@ -117,20 +129,25 @@ def run_onnxoptimizer(model_path: str, out_path: str) -> str:
         onnx.save(m_opt, out_path)
         return out_path
     except Exception:
-        shutil.copyfile(model_path, out_path)
+        import shutil as _sh
+        _sh.copyfile(model_path, out_path)
         return out_path
 
 
 def cast_graph_to_fp16(model_path: str, out_path: str) -> str:
-    """Best-effort FP16 casting while preserving I/O dtypes."""
+    """Best-effort FP16 casting while preserving I/O dtypes.
+    Requires onnxmltools or float16 converter; implement a minimal fallback.
+    """
     try:
         import importlib
         mod = importlib.import_module('onnxmltools.utils.float16_converter')
         convert_float_to_float16 = getattr(mod, 'convert_float_to_float16')
     except Exception:
+        # Minimal fallback: just return original; caller may choose CoreML EP fp16 via provider settings.
         shutil.copyfile(model_path, out_path)
         return out_path
     m = onnx.load(model_path)
+    # Keep inputs/outputs in original precision to avoid mismatch at runtime
     keep_io_types = {vi.name for vi in list(m.graph.input) + list(m.graph.output)}
     m_fp16 = convert_float_to_float16(m, keep_io_types=keep_io_types)
     onnx.save(m_fp16, out_path)
@@ -138,7 +155,11 @@ def cast_graph_to_fp16(model_path: str, out_path: str) -> str:
 
 
 def rewrite_hardswish(model_path: str, out_path: str) -> str:
-    """Replace HardSwish nodes with x * Clip(x + 3, 0, 6) * (1/6)."""
+    """Replace HardSwish nodes with x * Clip(x + 3, 0, 6) * (1/6).
+
+    This form uses only Add/Clip/Mul which are generally well-supported and ANE-friendly.
+    Clip is created with min/max as inputs (opset >= 11).
+    """
     m = onnx.load(model_path)
     g = m.graph
     changed = 0
@@ -163,6 +184,7 @@ def rewrite_hardswish(model_path: str, out_path: str) -> str:
         x = node.input[0]
         y = node.output[0]
 
+        # Constants (0-D scalars for CoreML Clip min/max requirements)
         c3_name = unique_name("hardswish_c3")
         c3_tensor = numpy_helper.from_array(np.array(3.0, dtype=np.float32), name=c3_name)
         g.initializer.extend([c3_tensor])
@@ -179,15 +201,19 @@ def rewrite_hardswish(model_path: str, out_path: str) -> str:
         cscale_tensor = numpy_helper.from_array(np.array(1.0 / 6.0, dtype=np.float32), name=cscale_name)
         g.initializer.extend([cscale_tensor])
 
+        # x + 3
         add_out = unique_name(node.name + "_add3")
         add_node = helper.make_node("Add", [x, c3_name], [add_out], name=unique_name(node.name + "_Add"))
 
+        # Clip(x + 3, 0, 6) - use min/max inputs for opset >= 11
         clip_out = unique_name(node.name + "_clip")
         clip_node = helper.make_node("Clip", [add_out, c0_name, c6_name], [clip_out], name=unique_name(node.name + "_Clip"))
 
+        # x * clip
         mul1_out = unique_name(node.name + "_mul1")
         mul1_node = helper.make_node("Mul", [x, clip_out], [mul1_out], name=unique_name(node.name + "_Mul1"))
 
+        # * (1/6)
         mul2_node = helper.make_node("Mul", [mul1_out, cscale_name], [y], name=unique_name(node.name + "_Mul2"))
 
         new_nodes.extend([add_node, clip_node, mul1_node, mul2_node])
@@ -195,16 +221,24 @@ def rewrite_hardswish(model_path: str, out_path: str) -> str:
         changed += 1
 
     if changed == 0:
+        # Nothing to do
         onnx.save(m, out_path)
         return out_path
 
+    # Rebuild node list: insert new nodes in place of removed HardSwish nodes preserving order
     rebuilt: List[onnx.NodeProto] = []
     for node in g.node:
         if node in nodes_to_remove:
+            # append the corresponding sequence in the order they were created
+            start = len(rebuilt)
+            # We can't easily match per-node here without mapping, so just extend all new nodes at the end.
+            # To keep relative order, extend new_nodes once at the end after loop.
             continue
         rebuilt.append(node)
+
+    # Append all new nodes at the end to avoid complicated in-place mapping; shape infer will sort out types.
     rebuilt.extend(new_nodes)
-    del g.node[:]
+    del g.node[:]  # clear
     g.node.extend(rebuilt)
 
     onnx.save(m, out_path)
@@ -213,10 +247,17 @@ def rewrite_hardswish(model_path: str, out_path: str) -> str:
 
 
 def rewrite_swish_to_hardswish(model_path: str, out_path: str) -> str:
-    """Detect Swish/SiLU patterns (x * Sigmoid(x)) and rewrite into Add+Clip+Mul style."""
+    """Detect Swish/SiLU patterns (x * Sigmoid(x)) and rewrite into Add+Clip+Mul style.
+
+    Heuristic pattern:
+      - Mul node where one input is Sigmoid of the other input (same tensor)
+    Caveat:
+      - This is an approximation; mathematically Swish != HardSwish, but ANE often prefers the latter form.
+    """
     m = onnx.load(model_path)
     g = m.graph
 
+    # Map tensor -> producer node
     producer = {}
     for node in g.node:
         for out in node.output:
@@ -241,9 +282,10 @@ def rewrite_swish_to_hardswish(model_path: str, out_path: str) -> str:
         if node.op_type != "Mul" or len(node.input) != 2:
             continue
         a, b = node.input
+        # Check if one side is Sigmoid of the other
         pa = producer.get(a)
         pb = producer.get(b)
-
+        # pattern: Mul(x, Sigmoid(x)) or Mul(Sigmoid(x), x)
         def is_sigmoid_of_x(pnode, xname):
             return pnode is not None and pnode.op_type == "Sigmoid" and len(pnode.input) == 1 and pnode.input[0] == xname
 
@@ -256,6 +298,7 @@ def rewrite_swish_to_hardswish(model_path: str, out_path: str) -> str:
 
         y = node.output[0]
 
+        # Inject Add+Clip+Mul*(1/6) sequence similar to HardSwish rewrite
         c3_name = unique_name("swish_c3")
         c0_name = unique_name("swish_c0")
         c6_name = unique_name("swish_c6")
@@ -266,6 +309,7 @@ def rewrite_swish_to_hardswish(model_path: str, out_path: str) -> str:
             (c6_name, 6.0),
             (cscale_name, 1.0/6.0),
         ]:
+            # Create 0-D scalar initializers
             g.initializer.extend([numpy_helper.from_array(np.array(val, dtype=np.float32), name=nm)])
 
         add_out = unique_name(node.name + "_add3")
@@ -281,12 +325,14 @@ def rewrite_swish_to_hardswish(model_path: str, out_path: str) -> str:
 
         new_nodes.extend([add_node, clip_node, mul1_node, mul2_node])
         nodes_to_remove.append(node)
+        # If we consumed a Sigmoid predecessor and it's now dead, let optimizer prune it later
         changed += 1
 
     if changed == 0:
         onnx.save(m, out_path)
         return out_path
 
+    # Rebuild node list (remove replaced Mul nodes, append the new sequence)
     kept: List[onnx.NodeProto] = []
     for n in g.node:
         if n in nodes_to_remove:
@@ -300,9 +346,11 @@ def rewrite_swish_to_hardswish(model_path: str, out_path: str) -> str:
     print(f"Rewrote Swish/SiLU -> Add+Clip+Mul: {changed} node(s)")
     return out_path
 
-
 def split_large_concats(model_path: str, out_path: str, max_inputs: int = 8) -> str:
-    """Split Concat nodes with too many inputs into a tree of smaller Concat nodes."""
+    """Split Concat nodes with too many inputs into a tree of smaller Concat nodes.
+
+    Keeps the input order. Useful when CoreML has limits on Concat input count.
+    """
     assert max_inputs >= 2
     m = onnx.load(model_path)
     g = m.graph
@@ -337,6 +385,8 @@ def split_large_concats(model_path: str, out_path: str, max_inputs: int = 8) -> 
             axis = 1
 
         current = inputs
+        level_outputs: List[str] = []
+        # Build tree layers until a single tensor remains
         while len(current) > 1:
             next_level: List[str] = []
             for i in range(0, len(current), max_inputs):
@@ -356,7 +406,9 @@ def split_large_concats(model_path: str, out_path: str, max_inputs: int = 8) -> 
                     next_level.append(out_name)
             current = next_level
 
+        # current[0] is the final output tensor
         final_out = current[0]
+        # Redirect downstream consumers by creating an Identity if names differ
         if final_out != node.output[0]:
             id_node = helper.make_node(
                 "Identity", inputs=[final_out], outputs=list(node.output), name=unique_name(node.name + "_Id")
@@ -369,6 +421,7 @@ def split_large_concats(model_path: str, out_path: str, max_inputs: int = 8) -> 
         onnx.save(m, out_path)
         return out_path
 
+    # Rebuild graph nodes list: retain original nodes except removed, then append new nodes
     rebuilt: List[onnx.NodeProto] = []
     for node in g.node:
         if node in nodes_to_remove:
@@ -383,11 +436,20 @@ def split_large_concats(model_path: str, out_path: str, max_inputs: int = 8) -> 
     return out_path
 
 
-def fold_static_shape_chains(model_path: str, out_path: str, iterations: int = 4) -> str:
-    """Constant-fold common shape computation chains with configurable iterations."""
+def fold_static_shape_chains(model_path: str, out_path: str) -> str:
+    """Constant-fold common shape computation chains once input shapes are static.
+
+    Handles a small subset of ops typically seen around shape building:
+      - Shape(x) -> Constant (int64 dims)
+      - Gather(const, axis=0) -> Constant
+      - Unsqueeze(const, axes) -> Constant
+      - Concat(consts, axis) -> Constant
+      - Cast(const) -> Constant
+    """
     m = onnx.load(model_path)
     g = m.graph
 
+    # Collect static shapes per value (from value_info & inputs after shape inference)
     value_shapes = {}
     def record_shape(vi):
         try:
@@ -404,6 +466,7 @@ def fold_static_shape_chains(model_path: str, out_path: str, iterations: int = 4
     for vi in list(g.input) + list(g.value_info) + list(g.output):
         record_shape(vi)
 
+    # Prepare constant map: name -> np.ndarray
     const_vals = {}
     for init in g.initializer:
         const_vals[init.name] = numpy_helper.to_array(init)
@@ -412,6 +475,8 @@ def fold_static_shape_chains(model_path: str, out_path: str, iterations: int = 4
         return const_vals.get(name)
 
     def set_const(target_name: str, arr: np.ndarray):
+        # Add/replace initializer; keep the same tensor name
+        # Remove any existing initializer with same name first
         for i, init in enumerate(list(g.initializer)):
             if init.name == target_name:
                 del g.initializer[i]
@@ -423,6 +488,7 @@ def fold_static_shape_chains(model_path: str, out_path: str, iterations: int = 4
 
     def try_fold(node: onnx.NodeProto) -> bool:
         op = node.op_type
+        # Helper to fetch attribute
         def get_attr(name, default=None):
             for a in node.attribute:
                 if a.name == name:
@@ -438,6 +504,7 @@ def fold_static_shape_chains(model_path: str, out_path: str, iterations: int = 4
                         return a.s
             return default
 
+        # Shape: output dims of input tensor
         if op == "Shape" and len(node.input) == 1:
             x = node.input[0]
             out = node.output[0]
@@ -449,6 +516,7 @@ def fold_static_shape_chains(model_path: str, out_path: str, iterations: int = 4
                 return True
             return False
 
+        # Gather(const, indices) along axis (default 0)
         if op == "Gather" and len(node.input) >= 2:
             data = get_const(node.input[0])
             indices = get_const(node.input[1])
@@ -463,6 +531,7 @@ def fold_static_shape_chains(model_path: str, out_path: str, iterations: int = 4
             nodes_to_remove.append(node)
             return True
 
+        # Unsqueeze(const)
         if op == "Unsqueeze" and len(node.input) == 1:
             x = get_const(node.input[0])
             if x is None:
@@ -477,6 +546,7 @@ def fold_static_shape_chains(model_path: str, out_path: str, iterations: int = 4
             nodes_to_remove.append(node)
             return True
 
+        # Concat of constants
         if op == "Concat" and len(node.input) >= 2:
             axis = get_attr("axis", 0)
             vals = [get_const(nm) for nm in node.input]
@@ -490,11 +560,13 @@ def fold_static_shape_chains(model_path: str, out_path: str, iterations: int = 4
             nodes_to_remove.append(node)
             return True
 
+        # Cast of constant
         if op == "Cast" and len(node.input) == 1:
             x = get_const(node.input[0])
             to = get_attr("to", None)
             if x is None or to is None:
                 return False
+            # Map ONNX tensor type to numpy dtype (limited to common ones)
             type_map = {
                 onnx.TensorProto.FLOAT: np.float32,
                 onnx.TensorProto.FLOAT16: np.float16,
@@ -517,7 +589,8 @@ def fold_static_shape_chains(model_path: str, out_path: str, iterations: int = 4
 
     changed = True
     any_change = False
-    for _ in range(iterations):
+    # Iterate a few times to fold chains
+    for _ in range(4):
         if not changed:
             break
         changed = False
@@ -532,11 +605,12 @@ def fold_static_shape_chains(model_path: str, out_path: str, iterations: int = 4
         onnx.save(m, out_path)
         return out_path
 
+    # Remove folded nodes
     kept = [n for n in g.node if n not in nodes_to_remove]
     del g.node[:]
     g.node.extend(kept)
     onnx.save(m, out_path)
-    print(f"Folded static shape chains: {len(nodes_to_remove)} node(s) replaced by constants ({iterations} iterations)")
+    print(f"Folded static shape chains: {len(nodes_to_remove)} node(s) replaced by constants")
     return out_path
 
 
@@ -551,12 +625,12 @@ def prune_outputs(model_path: str, out_path: str, keep_outputs: List[str]) -> st
         onnx.utils.extract_model(model_path, out_path, input_names, keep_outputs)
         return out_path
     except Exception:
+        # Fallback: just copy if extract_model not available
         shutil.copyfile(model_path, out_path)
         return out_path
 
-
 def rewrite_div_by_const(model_path: str, out_path: str) -> str:
-    """Replace Div(x, c) where c is constant with Mul(x, 1/c)."""
+    """Replace Div(x, c) where c is constant (scalar or broadcastable) with Mul(x, 1/c)."""
     m = onnx.load(model_path)
     g = m.graph
     consts = {init.name: numpy_helper.to_array(init) for init in g.initializer}
@@ -585,6 +659,7 @@ def rewrite_div_by_const(model_path: str, out_path: str) -> str:
         if y_val is None:
             kept.append(node)
             continue
+        # Avoid divide by zero
         if np.any(y_val == 0):
             kept.append(node)
             continue
@@ -614,6 +689,7 @@ def rewrite_pow_patterns(model_path: str, out_path: str) -> str:
     g = m.graph
     consts = {init.name: numpy_helper.to_array(init) for init in g.initializer}
 
+    # Also capture Constant node values (their output tensor names map to constant arrays)
     const_node_vals = {}
     for node in g.node:
         if node.op_type != "Constant" or not node.output:
@@ -652,6 +728,7 @@ def rewrite_pow_patterns(model_path: str, out_path: str) -> str:
             flat = np.array(arr).reshape(-1)
             if flat.size == 0:
                 return None
+            # If tensor has more than one element, ensure all values are equal to treat as a scalar
             if flat.size > 1 and not np.allclose(flat, flat[0]):
                 return None
             return float(flat[0])
@@ -691,6 +768,7 @@ def rewrite_pow_patterns(model_path: str, out_path: str) -> str:
             changed += 1
             continue
         if abs(c + 0.5) < 1e-6:
+            # Pow(x, -0.5) == 1 / sqrt(x)
             s_out = unique_name(node.name + "_SqrtTmp")
             new_nodes.append(helper.make_node("Sqrt", [x], [s_out], name=unique_name(node.name + "_Sqrt")))
             new_nodes.append(helper.make_node("Reciprocal", [s_out], out, name=unique_name(node.name + "_RecipSqrt")))
@@ -719,7 +797,11 @@ def rewrite_pow_patterns(model_path: str, out_path: str) -> str:
 
 
 def rewrite_hardsigmoid_linear(model_path: str, out_path: str) -> str:
-    """Rewrite HardSigmoid to a mul+add+clip linear form using min/max inputs for Clip."""
+    """Rewrite HardSigmoid to a mul+add+clip linear form using min/max inputs for Clip.
+
+    HardSigmoid(x) = max(0, min(1, alpha * x + beta))
+    We'll materialize alpha and beta as initializers and build Mul/Add/Clip.
+    """
     m = onnx.load(model_path)
     g = m.graph
     new_nodes: List[onnx.NodeProto] = []
@@ -757,6 +839,7 @@ def rewrite_hardsigmoid_linear(model_path: str, out_path: str) -> str:
         for nm, val in [
             (a_name, alpha), (b_name, beta), (z_name, 0.0), (o_name, 1.0)
         ]:
+            # Use 0-D scalars for CoreML Clip inputs
             g.initializer.extend([numpy_helper.from_array(np.array(val, dtype=np.float32), name=nm)])
 
         mul_out = unique_name(node.name + "_mul")
@@ -782,10 +865,24 @@ def rewrite_hardsigmoid_linear(model_path: str, out_path: str) -> str:
 
 
 def rewrite_slice_to_gather(model_path: str, out_path: str) -> str:
-    """Rewrite simple Slice with fixed single-axis indices into Gather for better CoreML support."""
+    """Rewrite simple Slice with fixed single-axis indices into Gather for better CoreML support.
+
+    Pattern: Slice(data, starts, ends, axes=[k], steps=[1]) with starts/ends scalar constants
+    Transforms into Gather along axis=k for a single index when the slice selects exactly one index.
+    """
     m = onnx.load(model_path)
     g = m.graph
     consts = {init.name: numpy_helper.to_array(init) for init in g.initializer}
+
+    def get_const_scalar(name):
+        arr = consts.get(name)
+        if arr is None:
+            return None
+        try:
+            v = int(np.array(arr).reshape(-1)[0])
+            return v
+        except Exception:
+            return None
 
     new_nodes: List[onnx.NodeProto] = []
     nodes_to_remove: List[onnx.NodeProto] = []
@@ -817,10 +914,12 @@ def rewrite_slice_to_gather(model_path: str, out_path: str) -> str:
             continue
         if int(st[0]) != 1:
             continue
+        # Select exactly one index
         if int(e[0]) - int(s[0]) != 1:
             continue
         idx = int(s[0])
         axis = int(ax[0])
+        # Build an initializer for the Gather index
         idx_name = node.name + "_gather_idx"
         g.initializer.extend([numpy_helper.from_array(np.array([idx], dtype=np.int64), name=idx_name)])
         gather = helper.make_node("Gather", [data, idx_name], list(node.output), name=node.name + "_toGather", axis=axis)
@@ -841,328 +940,8 @@ def rewrite_slice_to_gather(model_path: str, out_path: str) -> str:
     return out_path
 
 
-# NEW OPTIMIZATIONS FOR ANE
-
-def rewrite_reducemean_to_avgpool(model_path: str, out_path: str) -> str:
-    """Convert spatial ReduceMean to GlobalAveragePool or AvgPool (ANE-optimized)."""
-    m = onnx.load(model_path)
-    g = m.graph
-
-    # Get value info for shapes
-    value_shapes = {}
-    for vi in list(g.input) + list(g.value_info) + list(g.output):
-        try:
-            shp = []
-            tt = vi.type.tensor_type
-            for d in tt.shape.dim:
-                if d.dim_value:
-                    shp.append(int(d.dim_value))
-                else:
-                    shp.append(None)
-            value_shapes[vi.name] = shp
-        except Exception:
-            pass
-
-    def unique_name(base: str) -> str:
-        idx = 0
-        existing = {n.name for n in g.node}
-        existing.update({vi.name for vi in list(g.input) + list(g.output)})
-        existing.update({init.name for init in g.initializer})
-        name = f"{base}__{idx}"
-        while name in existing:
-            idx += 1
-            name = f"{base}__{idx}"
-        return name
-
-    new_nodes: List[onnx.NodeProto] = []
-    nodes_to_remove: List[onnx.NodeProto] = []
-    changed = 0
-
-    for node in g.node:
-        if node.op_type != "ReduceMean":
-            continue
-
-        axes = None
-        keepdims = 1
-        for a in node.attribute:
-            if a.name == "axes":
-                axes = list(a.ints) if a.ints else None
-            if a.name == "keepdims":
-                keepdims = int(a.i)
-
-        if axes is None:
-            continue
-
-        input_name = node.input[0]
-        output_name = node.output[0]
-        input_shape = value_shapes.get(input_name)
-
-        # Pattern 1: ReduceMean on axes [2,3] (spatial H,W) for 4D tensor -> GlobalAveragePool
-        if input_shape and len(input_shape) == 4 and set(axes) == {2, 3}:
-            gap_out = output_name if keepdims else unique_name(node.name + "_gap")
-            gap_node = helper.make_node(
-                "GlobalAveragePool",
-                [input_name],
-                [gap_out],
-                name=unique_name(node.name + "_GAP")
-            )
-            new_nodes.append(gap_node)
-
-            # If keepdims=0, need to squeeze out H,W dims
-            if not keepdims:
-                # Create axes constant for Squeeze (opset >= 13 uses input instead of attribute)
-                axes_name = unique_name(node.name + "_squeeze_axes")
-                axes_tensor = numpy_helper.from_array(np.array([2, 3], dtype=np.int64), name=axes_name)
-                g.initializer.extend([axes_tensor])
-
-                squeeze_node = helper.make_node(
-                    "Squeeze",
-                    [gap_out, axes_name],
-                    [output_name],
-                    name=unique_name(node.name + "_Squeeze")
-                )
-                new_nodes.append(squeeze_node)
-
-            nodes_to_remove.append(node)
-            changed += 1
-            continue
-
-        # Pattern 2: ReduceMean on single spatial axis -> AveragePool with kernel covering that dimension
-        # This is more complex and may not always be beneficial, so we're conservative
-
-    if changed == 0:
-        onnx.save(m, out_path)
-        return out_path
-
-    kept = [n for n in g.node if n not in nodes_to_remove]
-    kept.extend(new_nodes)
-    del g.node[:]
-    g.node.extend(kept)
-    onnx.save(m, out_path)
-    print(f"Rewrote ReduceMean -> GlobalAveragePool: {changed} node(s)")
-    return out_path
-
-
-def eliminate_identity_chains(model_path: str, out_path: str) -> str:
-    """Eliminate long chains of Identity nodes by directly connecting producers to consumers."""
-    m = onnx.load(model_path)
-    g = m.graph
-
-    # Build producer map
-    producer = {}
-    for node in g.node:
-        for out in node.output:
-            producer[out] = node
-
-    # Find Identity chains
-    def trace_identity_chain(tensor_name: str) -> str:
-        """Follow Identity chain to find the original source tensor."""
-        visited = set()
-        current = tensor_name
-        while current not in visited:
-            visited.add(current)
-            prod = producer.get(current)
-            if prod is None or prod.op_type != "Identity":
-                return current
-            if len(prod.input) != 1:
-                return current
-            current = prod.input[0]
-        return tensor_name  # Cycle detected, return original
-
-    # Rewrite all tensor references
-    tensor_map = {}
-    for node in g.node:
-        for inp in node.input:
-            source = trace_identity_chain(inp)
-            if source != inp:
-                tensor_map[inp] = source
-
-    # Apply rewrites
-    changed_nodes = 0
-    for node in g.node:
-        rewrote = False
-        new_inputs = []
-        for inp in node.input:
-            if inp in tensor_map:
-                new_inputs.append(tensor_map[inp])
-                rewrote = True
-            else:
-                new_inputs.append(inp)
-        if rewrote:
-            del node.input[:]
-            node.input.extend(new_inputs)
-            changed_nodes += 1
-
-    # Remove dead Identity nodes
-    output_names = {o.name for o in g.output}
-    consumers = {}
-    for node in g.node:
-        for inp in node.input:
-            consumers.setdefault(inp, []).append(node)
-
-    kept = []
-    removed_identities = 0
-    for node in g.node:
-        if node.op_type == "Identity":
-            out = node.output[0]
-            # Keep if it's a graph output
-            if out in output_names:
-                kept.append(node)
-            # Keep if it still has consumers
-            elif out in consumers and consumers[out]:
-                kept.append(node)
-            else:
-                removed_identities += 1
-        else:
-            kept.append(node)
-
-    if removed_identities == 0:
-        onnx.save(m, out_path)
-        return out_path
-
-    del g.node[:]
-    g.node.extend(kept)
-    onnx.save(m, out_path)
-    print(f"Eliminated Identity chains: {removed_identities} Identity node(s) removed, {changed_nodes} node(s) rewired")
-    return out_path
-
-
-def fuse_reshape_transpose_chains(model_path: str, out_path: str) -> str:
-    """Eliminate redundant Reshape/Transpose sequences."""
-    m = onnx.load(model_path)
-    g = m.graph
-
-    producer = {}
-    for node in g.node:
-        for out in node.output:
-            producer[out] = node
-
-    consts = {init.name: numpy_helper.to_array(init) for init in g.initializer}
-
-    def unique_name(base: str) -> str:
-        idx = 0
-        existing = {n.name for n in g.node}
-        existing.update({vi.name for vi in list(g.input) + list(g.output)})
-        existing.update({init.name for init in g.initializer})
-        name = f"{base}__{idx}"
-        while name in existing:
-            idx += 1
-            name = f"{base}__{idx}"
-        return name
-
-    new_nodes: List[onnx.NodeProto] = []
-    nodes_to_remove: List[onnx.NodeProto] = []
-    changed = 0
-
-    # Pattern: Transpose -> Transpose (inverse) = Identity
-    for node in g.node:
-        if node.op_type != "Transpose":
-            continue
-
-        perm1 = None
-        for a in node.attribute:
-            if a.name == "perm":
-                perm1 = list(a.ints)
-                break
-        if perm1 is None:
-            continue
-
-        # Check if consumer is also Transpose
-        consumers = [n for n in g.node if node.output[0] in n.input]
-        if len(consumers) != 1:
-            continue
-
-        consumer = consumers[0]
-        if consumer.op_type != "Transpose":
-            continue
-
-        perm2 = None
-        for a in consumer.attribute:
-            if a.name == "perm":
-                perm2 = list(a.ints)
-                break
-        if perm2 is None:
-            continue
-
-        # Check if perm2 is inverse of perm1
-        if len(perm1) != len(perm2):
-            continue
-
-        composed = [perm1[i] for i in perm2]
-        if composed == list(range(len(composed))):
-            # This is identity! Replace with direct connection
-            identity_node = helper.make_node(
-                "Identity",
-                [node.input[0]],
-                list(consumer.output),
-                name=unique_name(node.name + "_fused_id")
-            )
-            new_nodes.append(identity_node)
-            nodes_to_remove.extend([node, consumer])
-            changed += 1
-
-    if changed == 0:
-        onnx.save(m, out_path)
-        return out_path
-
-    kept = [n for n in g.node if n not in nodes_to_remove]
-    kept.extend(new_nodes)
-    del g.node[:]
-    g.node.extend(kept)
-    onnx.save(m, out_path)
-    print(f"Fused Reshape/Transpose chains: {changed} pattern(s)")
-    return out_path
-
-
-def analyze_ane_compatibility(profile_summary: Dict) -> None:
-    """Analyze and report ops most likely blocking ANE execution."""
-    if not profile_summary:
-        return
-
-    cpu_ops = profile_summary.get("top_ops_by_time", {}).get("CPUExecutionProvider", [])
-    if not cpu_ops:
-        return
-
-    known_ane_unfriendly = {
-        "NonMaxSuppression", "RoiAlign", "TopK", "Where", "IsNaN",
-        "Loop", "If", "Scan", "Resize"  # Some Resize modes
-    }
-
-    print("\n=== ANE Compatibility Analysis ===")
-    print("Top CPU ops (candidates for optimization):")
-    for op, time_ms, count in cpu_ops[:15]:
-        marker = " ⚠️  ANE-unfriendly" if op in known_ane_unfriendly else ""
-        pct = ""
-        total_cpu = profile_summary.get("provider_total_time_ms", {}).get("CPUExecutionProvider", 0)
-        if total_cpu > 0:
-            pct = f" ({100.0 * time_ms / total_cpu:.1f}%)"
-        print(f"  • {op}: {time_ms:.2f}ms ({count} nodes){pct}{marker}")
-
-    # Suggest specific optimizations
-    op_names = {op for op, _, _ in cpu_ops[:15]}
-    suggestions = []
-
-    if "ReduceMean" in op_names:
-        suggestions.append("  → Try --reducemean-to-avgpool to convert spatial ReduceMean to GlobalAveragePool")
-    if "Reshape" in op_names or "Transpose" in op_names:
-        suggestions.append("  → Try --fuse-reshape-transpose to eliminate redundant layout changes")
-    if "Identity" in op_names:
-        suggestions.append("  → Identity chains detected (already using --eliminate-identity-chains)")
-    if "Slice" in op_names:
-        suggestions.append("  → Try --rewrite-slice-to-gather for simple slicing patterns")
-    if "NonMaxSuppression" in op_names:
-        suggestions.append("  → NMS is inherently CPU-bound; consider splitting model at detection head")
-    if "RoiAlign" in op_names:
-        suggestions.append("  → RoiAlign may not be ANE-supported; consider alternative pooling")
-
-    if suggestions:
-        print("\nOptimization suggestions:")
-        for s in suggestions:
-            print(s)
-
-
 def main():
-    parser = argparse.ArgumentParser(description="Enhanced graph surgery for PP-YOLOE ONNX with ANE optimizations")
+    parser = argparse.ArgumentParser(description="Graph surgery and performance compare for PP-YOLOE ONNX")
     parser.add_argument(
         "--model",
         type=str,
@@ -1173,65 +952,52 @@ def main():
     parser.add_argument("--ep", type=str, default="coreml")
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--runs", type=int, default=50)
-    parser.add_argument("--img", type=str, required=True, help="Path to image for realistic preprocessing")
+    parser.add_argument("--img", type=str, required=True, help="Path to image for realistic preprocessing (required)")
     parser.add_argument("--outdir", type=str, default="pipeline/PP-YOLOE/models/surgery")
-    parser.add_argument("--ort-profile", action="store_true", help="Enable ORT timeline profiling")
-    parser.add_argument("--ort-profile-dir", type=str, default="pipeline/PP-YOLOE/output")
+    parser.add_argument("--ort-profile", action="store_true", help="Enable ORT timeline profiling for both baseline and modified runs")
+    parser.add_argument("--ort-profile-dir", type=str, default="pipeline/PP-YOLOE/output", help="Directory for ORT profile files")
     parser.add_argument("--no-simplify", action="store_true")
     parser.add_argument("--no-shape-infer", action="store_true")
-    parser.add_argument("--fp16", action="store_true", help="Attempt FP16 casting")
-    parser.add_argument("--fix-input-shapes", action="store_true", help="Rewrite graph inputs to static shapes")
+    parser.add_argument("--fp16", action="store_true", help="Attempt FP16 casting (if tools available)")
+    parser.add_argument("--fix-input-shapes", action="store_true", help="Rewrite graph inputs to static [N,C,H,W] and common 2D helpers")
     parser.add_argument("--no-optimizer", action="store_true", help="Disable onnxoptimizer passes")
-    parser.add_argument("--rewrite-hardswish", action="store_true", help="Rewrite HardSwish to Add+Clip+Mul")
-    parser.add_argument("--split-concat", type=int, default=0, help="Split large Concat nodes")
-    parser.add_argument("--fold-static-shapes", action="store_true", help="Fold shape computation chains")
-    parser.add_argument("--fold-iterations", type=int, default=15, help="Iterations for constant folding (default: 15)")
-    parser.add_argument("--keep-outputs", type=str, default="", help="Comma-separated outputs to keep")
-    parser.add_argument("--rewrite-div", action="store_true", help="Rewrite Div to Mul with reciprocal")
-    parser.add_argument("--rewrite-pow", action="store_true", help="Rewrite Pow patterns")
-    parser.add_argument("--rewrite-swish", action="store_true", help="Rewrite Swish to HardSwish-style")
-    parser.add_argument("--rewrite-hardsigmoid", action="store_true", help="Rewrite HardSigmoid to Mul+Add+Clip")
-    parser.add_argument("--rewrite-slice-to-gather", action="store_true", help="Rewrite Slice to Gather")
-
-    # NEW FLAGS
-    parser.add_argument("--reducemean-to-avgpool", action="store_true", help="Convert ReduceMean to GlobalAveragePool (ANE-optimized)")
-    parser.add_argument("--eliminate-identity-chains", action="store_true", help="Remove redundant Identity node chains")
-    parser.add_argument("--fuse-reshape-transpose", action="store_true", help="Fuse inverse Reshape/Transpose pairs")
-    parser.add_argument("--aggressive-mode", action="store_true", help="Enable all ANE optimizations")
+    parser.add_argument("--rewrite-hardswish", action="store_true", help="Rewrite HardSwish to Add+Clip+Mul for ANE")
+    parser.add_argument(
+        "--split-concat",
+        type=int,
+        default=0,
+        help="If >0, split Concat nodes with more than N inputs into a concat tree",
+    )
+    parser.add_argument("--fold-static-shapes", action="store_true", help="Fold Shape/Gather/Unsqueeze/Concat chains to constants")
+    parser.add_argument(
+        "--keep-outputs",
+        type=str,
+        default="",
+        help="Comma-separated list of outputs to keep (prune others)",
+    )
+    parser.add_argument("--rewrite-div", action="store_true", help="Rewrite Div by constant to Mul with reciprocal")
+    parser.add_argument("--rewrite-pow", action="store_true", help="Rewrite Pow(x,c) with simpler ops (2, 0.5, -1, 1)")
+    parser.add_argument("--rewrite-swish", action="store_true", help="Rewrite Swish/SiLU pattern x*Sigmoid(x) to HardSwish-style Add+Clip+Mul (ANE-friendly)")
+    parser.add_argument("--rewrite-hardsigmoid", action="store_true", help="Rewrite HardSigmoid to Mul+Add+Clip with min/max inputs")
+    parser.add_argument("--rewrite-slice-to-gather", action="store_true", help="Rewrite simple Slice with single index to Gather (fixed axes, step=1)")
 
     args = parser.parse_args()
-
-    # Aggressive mode enables all optimizations
-    if args.aggressive_mode:
-        args.fix_input_shapes = True
-        args.rewrite_hardswish = True
-        args.rewrite_swish = True
-        args.rewrite_hardsigmoid = True
-        args.rewrite_div = True
-        args.rewrite_pow = True
-        args.rewrite_slice_to_gather = True
-        args.fold_static_shapes = True
-        args.reducemean_to_avgpool = True
-        args.eliminate_identity_chains = True
-        args.fuse_reshape_transpose = True
-        if not args.split_concat:
-            args.split_concat = 4
-        print("[Aggressive mode enabled - all ANE optimizations active]")
-
     os.makedirs(args.outdir, exist_ok=True)
     ishape = parse_shape(args.input_shape)
+    # Resolve image requirement (no demo fallback; real image required)
     img_path = args.img if os.path.isabs(args.img) else os.path.abspath(args.img)
     if not os.path.exists(img_path):
         print(f"[ERROR] Image not found: {img_path}")
         return
+    else:
+        print(f"Using real image inputs: {img_path}")
 
     print("=== Baseline ===")
     if ort is None:
         print("onnxruntime not available; install 'onnxruntime' or 'onnxruntime-silicon'.")
         return
-
-    base = run_benchmark(args.model, ishape, args.ep, args.warmup, args.runs,
-                        enable_profile=args.ort_profile, profile_dir=args.ort_profile_dir, img_path=img_path)
+    print(f"[Debug] run config: ep={args.ep}, warmup={args.warmup}, runs={args.runs}")
+    base = run_benchmark(args.model, ishape, args.ep, args.warmup, args.runs, enable_profile=args.ort_profile, profile_dir=args.ort_profile_dir, img_path=img_path)
     b = base["benchmark"]
     print("Providers (baseline):", b.get("providers"))
     if base.get("coreml_capability"):
@@ -1242,9 +1008,17 @@ def main():
             b["latency_ms_avg"], b["latency_ms_p50"], b["latency_ms_p90"], b["latency_ms_p95"]
         )
     )
-
-    if base.get("profile_summary"):
-        analyze_ane_compatibility(base["profile_summary"])
+    if base.get("ort_profile"):
+        print("Baseline ORT profile:", base.get("ort_profile"))
+        if base.get("profile_summary"):
+            ps = base["profile_summary"]
+            print(" - provider node_counts:", ps.get("provider_node_counts", {}))
+            print(" - provider total time (ms):", ps.get("provider_total_time_ms", {}))
+            tops = (ps.get("top_ops_by_time") or {}).get("CPUExecutionProvider")
+            if tops:
+                print(" - top CPU ops by time:")
+                for op, t, cnt in tops[:8]:
+                    print(f"    * {op}: {t} ms ({cnt} nodes)")
 
     # Build modified path
     mod_path = os.path.join(args.outdir, os.path.basename(args.model).replace('.onnx', '_mod.onnx'))
@@ -1259,6 +1033,8 @@ def main():
         print("[stage] Shape inference…")
         mod2 = mod_path.replace("_mod.onnx", "_shape.onnx")
         work_path = shape_infer_model(work_path, mod2)
+    else:
+        work_path = mod_path
 
     if args.rewrite_hardswish:
         print("[stage] Rewriting HardSwish nodes…")
@@ -1266,7 +1042,7 @@ def main():
         work_path = rewrite_hardswish(work_path, modH)
 
     if args.rewrite_swish:
-        print("[stage] Rewriting Swish/SiLU to HardSwish-style…")
+        print("[stage] Rewriting Swish/SiLU (x*Sigmoid(x)) to HardSwish-style…")
         modHS = os.path.join(args.outdir, os.path.basename(args.model).replace('.onnx', '_swish2hs.onnx'))
         work_path = rewrite_swish_to_hardswish(work_path, modHS)
 
@@ -1275,28 +1051,16 @@ def main():
         modC = os.path.join(args.outdir, os.path.basename(args.model).replace('.onnx', '_splitconcat.onnx'))
         work_path = split_large_concats(work_path, modC, max_inputs=int(args.split_concat))
 
-    # NEW: ReduceMean -> AvgPool
-    if args.reducemean_to_avgpool:
-        print("[stage] Converting ReduceMean to GlobalAveragePool…")
-        modRM = os.path.join(args.outdir, os.path.basename(args.model).replace('.onnx', '_reducemean.onnx'))
-        work_path = rewrite_reducemean_to_avgpool(work_path, modRM)
-
-    # NEW: Fuse Reshape/Transpose
-    if args.fuse_reshape_transpose:
-        print("[stage] Fusing Reshape/Transpose chains…")
-        modRT = os.path.join(args.outdir, os.path.basename(args.model).replace('.onnx', '_fuseRT.onnx'))
-        work_path = fuse_reshape_transpose_chains(work_path, modRT)
-
-    # Re-run shape inference after structural rewrites
-    if not args.no_shape_infer:
+    # Re-run shape inference after structural rewrites so later passes have shape info
+    if not args.no_shape_infer and (args.rewrite_hardswish or args.rewrite_swish or (args.split_concat and args.split_concat > 0)):
         print("[stage] Running shape inference (post-rewrite)…")
         mod2b = mod_path.replace("_mod.onnx", "_shape2.onnx")
         work_path = shape_infer_model(work_path, mod2b)
 
     if args.fold_static_shapes:
-        print(f"[stage] Folding static shape chains ({args.fold_iterations} iterations)…")
+        print("[stage] Folding static shape chains…")
         modF = os.path.join(args.outdir, os.path.basename(args.model).replace('.onnx', '_foldshape.onnx'))
-        work_path = fold_static_shape_chains(work_path, modF, iterations=args.fold_iterations)
+        work_path = fold_static_shape_chains(work_path, modF)
 
     if args.rewrite_hardsigmoid:
         print("[stage] Rewriting HardSigmoid to Mul+Add+Clip…")
@@ -1318,12 +1082,7 @@ def main():
         modSG = os.path.join(args.outdir, os.path.basename(args.model).replace('.onnx', '_slice2gather.onnx'))
         work_path = rewrite_slice_to_gather(work_path, modSG)
 
-    # NEW: Eliminate Identity chains
-    if args.eliminate_identity_chains:
-        print("[stage] Eliminating Identity chains…")
-        modID = os.path.join(args.outdir, os.path.basename(args.model).replace('.onnx', '_no_identity.onnx'))
-        work_path = eliminate_identity_chains(work_path, modID)
-
+    # Optional pruning of outputs to maximize CoreML partition sizes
     if args.keep_outputs:
         keep = [s.strip() for s in args.keep_outputs.split(",") if s.strip()]
         if keep:
@@ -1331,7 +1090,7 @@ def main():
             modP = os.path.join(args.outdir, os.path.basename(args.model).replace('.onnx', '_pruned.onnx'))
             work_path = prune_outputs(work_path, modP, keep)
 
-    # Final shape inference
+    # One more shape inference pass after folding/pruning
     if not args.no_shape_infer:
         print("[stage] Running shape inference (final)…")
         mod2c = mod_path.replace("_mod.onnx", "_shape3.onnx")
@@ -1346,13 +1105,15 @@ def main():
         print("[stage] Applying onnx-simplifier…")
         modS = os.path.join(args.outdir, os.path.basename(args.model).replace('.onnx', '_simp.onnx'))
         work_path = simplify_model(work_path, modS)
+    else:
+        shutil.copyfile(work_path, mod_path)
 
     if args.fp16:
         print("[stage] Attempting FP16 casting…")
         mod3 = os.path.join(args.outdir, os.path.basename(args.model).replace('.onnx', '_fp16.onnx'))
         work_path = cast_graph_to_fp16(work_path, mod3)
 
-    # Copy to final artifact
+    # Also copy to a stable "final" name for convenience
     final_path = os.path.join(
         args.outdir, os.path.basename(args.model).replace('.onnx', '_final.onnx')
     )
@@ -1360,22 +1121,21 @@ def main():
         shutil.copyfile(work_path, final_path)
     except Exception:
         final_path = work_path
-
     mod_info = load_model_info(work_path)
-    print("\n=== Modified Model Info ===")
     print("Nodes:", mod_info["node_count"], "Unique ops:", mod_info["unique_ops"])
+
     print("Modified model:", work_path)
     print("Final model:", final_path)
-
+    # Print a concise summary with filename and absolute path for easy copy/paste
     final_abs = os.path.abspath(final_path)
     final_name = os.path.basename(final_path)
-    print("\n=== Final Artifact ===")
-    print(f"Filename: {final_name}")
-    print(f"Path: {final_abs}")
-
-    print("\n=== Modified Benchmark ===")
-    mod = run_benchmark(work_path, ishape, args.ep, args.warmup, args.runs,
-                       enable_profile=args.ort_profile, profile_dir=args.ort_profile_dir, img_path=img_path)
+    print("=== Final Artifact ===")
+    print(f"Final filename: {final_name}")
+    print(f"Final absolute path: {final_abs}")
+    # Plain absolute path for direct copy/paste
+    print(final_abs)
+    print("=== Modified Benchmark ===")
+    mod = run_benchmark(work_path, ishape, args.ep, args.warmup, args.runs, enable_profile=args.ort_profile, profile_dir=args.ort_profile_dir, img_path=img_path)
     m = mod["benchmark"]
     print("Providers (modified):", m.get("providers"))
     if mod.get("coreml_capability"):
@@ -1386,45 +1146,27 @@ def main():
             m["latency_ms_avg"], m["latency_ms_p50"], m["latency_ms_p90"], m["latency_ms_p95"]
         )
     )
+    if mod.get("ort_profile"):
+        print("Modified ORT profile:", mod.get("ort_profile"))
+        if mod.get("profile_summary"):
+            ps = mod["profile_summary"]
+            print(" - provider node_counts:", ps.get("provider_node_counts", {}))
+            print(" - provider total time (ms):", ps.get("provider_total_time_ms", {}))
+            tops = (ps.get("top_ops_by_time") or {}).get("CPUExecutionProvider")
+            if tops:
+                print(" - top CPU ops by time:")
+                for op, t, cnt in tops[:8]:
+                    print(f"    * {op}: {t} ms ({cnt} nodes)")
 
-    if mod.get("profile_summary"):
-        analyze_ane_compatibility(mod["profile_summary"])
-
-    # Comparison
+    # Simple compare
     def pct_delta(a, b):
         return 100.0 * (b - a) / a if a and np.isfinite(a) else float('nan')
 
-    print("\n=== Performance Comparison (Modified vs Baseline) ===")
-    avg_delta = pct_delta(b["latency_ms_avg"], m["latency_ms_avg"])
-    p50_delta = pct_delta(b["latency_ms_p50"], m["latency_ms_p50"])
-    p90_delta = pct_delta(b["latency_ms_p90"], m["latency_ms_p90"])
-    p95_delta = pct_delta(b["latency_ms_p95"], m["latency_ms_p95"])
-
-    def format_delta(d):
-        sign = "+" if d > 0 else ""
-        return f"{sign}{d:.2f}%"
-
-    print(f"Average latency: {b['latency_ms_avg']:.2f}ms → {m['latency_ms_avg']:.2f}ms ({format_delta(avg_delta)})")
-    print(f"P50 latency:     {b['latency_ms_p50']:.2f}ms → {m['latency_ms_p50']:.2f}ms ({format_delta(p50_delta)})")
-    print(f"P90 latency:     {b['latency_ms_p90']:.2f}ms → {m['latency_ms_p90']:.2f}ms ({format_delta(p90_delta)})")
-    print(f"P95 latency:     {b['latency_ms_p95']:.2f}ms → {m['latency_ms_p95']:.2f}ms ({format_delta(p95_delta)})")
-
-    # Speedup summary
-    if avg_delta < 0:
-        speedup = b["latency_ms_avg"] / m["latency_ms_avg"]
-        print(f"\n🚀 Speedup: {speedup:.2f}x faster")
-
-    # CoreML partition improvement
-    if base.get("coreml_capability") and mod.get("coreml_capability"):
-        base_parts = base["coreml_capability"].get("num_partitions", 0)
-        mod_parts = mod["coreml_capability"].get("num_partitions", 0)
-        base_nodes = base["coreml_capability"].get("num_nodes", 0)
-        mod_nodes = mod["coreml_capability"].get("num_nodes", 0)
-
-        if base_parts != mod_parts or base_nodes != mod_nodes:
-            print("\n=== CoreML Partition Changes ===")
-            print(f"Partitions: {base_parts} → {mod_parts}")
-            print(f"ANE-supported nodes: {base_nodes} → {mod_nodes} ({mod_nodes - base_nodes:+d})")
+    print("\n=== Compare (Modified vs Baseline) ===")
+    print("avg delta: {:.2f}%".format(pct_delta(b["latency_ms_avg"], m["latency_ms_avg"])) )
+    print("p50 delta: {:.2f}%".format(pct_delta(b["latency_ms_p50"], m["latency_ms_p50"])) )
+    print("p90 delta: {:.2f}%".format(pct_delta(b["latency_ms_p90"], m["latency_ms_p90"])) )
+    print("p95 delta: {:.2f}%".format(pct_delta(b["latency_ms_p95"], m["latency_ms_p95"])) )
 
 
 if __name__ == "__main__":
