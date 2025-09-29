@@ -23,6 +23,7 @@ python3 pipeline/PP-YOLOE/coreml_graph_surgery.py \
 --rewrite-div \
 --rewrite-pow \
 --rewrite-hardsigmoid \
---rewrite-slice-to-gather
+--rewrite-slice-to-gather \
+--fp16
 
 rm -rf pipeline/PP-YOLOE/models/surgery
