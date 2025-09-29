@@ -232,6 +232,7 @@ def run_benchmark(model_path: str, input_shape: Tuple[int, ...], ep: str, warmup
         "latency_ms_max": float(np.max(times)) if times else float("nan"),
     }
     profile_path = ""
+    profile_summary: Dict[str, Any] = {}
     if enable_profile:
         try:
             prof_file = sess.end_profiling()
@@ -247,9 +248,56 @@ def run_benchmark(model_path: str, input_shape: Tuple[int, ...], ep: str, warmup
                     profile_path = prof_file
             else:
                 profile_path = prof_file
+            # Parse a brief provider/node/time summary from ORT profile JSON
+            try:
+                import json as _json
+                from collections import defaultdict
+                with open(profile_path, "r") as pf:
+                    trace = _json.load(pf)
+                # ORT profile is a Chrome trace format; node events typically have category 'Node'
+                provider_counts: Dict[str, int] = {}
+                provider_time_ms: Dict[str, float] = {}
+                op_type_counts: Dict[str, int] = {}
+                provider_op_time_ms: Dict[str, Dict[str, float]] = defaultdict(lambda: defaultdict(float))
+                provider_op_counts: Dict[str, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
+                for ev in trace:
+                    if not isinstance(ev, dict):
+                        continue
+                    if ev.get("cat") != "Node":
+                        continue
+                    args = ev.get("args", {}) or {}
+                    prov = args.get("provider") or args.get("execution_provider") or "UNKNOWN"
+                    op = args.get("op_name") or args.get("op") or "?"
+                    dur_us = float(ev.get("dur", 0.0))
+                    dur_ms = dur_us / 1000.0
+                    provider_counts[prov] = provider_counts.get(prov, 0) + 1
+                    provider_time_ms[prov] = provider_time_ms.get(prov, 0.0) + dur_ms
+                    op_type_counts[op] = op_type_counts.get(op, 0) + 1
+                    provider_op_time_ms[prov][op] += dur_ms
+                    provider_op_counts[prov][op] += 1
+
+                # Compute top ops by time per provider (limit to top 10)
+                top_ops_by_time: Dict[str, List[Tuple[str, float, int]]] = {}
+                for prov, op_times in provider_op_time_ms.items():
+                    items = sorted(op_times.items(), key=lambda kv: -kv[1])
+                    top = []
+                    for op, t in items[:10]:
+                        top.append((op, round(t, 3), int(provider_op_counts[prov].get(op, 0))))
+                    top_ops_by_time[prov] = top
+
+                profile_summary = {
+                    "provider_node_counts": provider_counts,
+                    "provider_total_time_ms": {k: round(v, 3) for k, v in provider_time_ms.items()},
+                    "unique_op_types": len(op_type_counts),
+                    "provider_op_time_ms": {p: {op: round(t, 3) for op, t in d.items()} for p, d in provider_op_time_ms.items()},
+                    "provider_op_counts": {p: dict(d) for p, d in provider_op_counts.items()},
+                    "top_ops_by_time": top_ops_by_time,
+                }
+            except Exception:
+                profile_summary = {}
         except Exception:
             profile_path = ""
-    return {"model": model_info, "benchmark": result, "ort_profile": profile_path}
+    return {"model": model_info, "benchmark": result, "ort_profile": profile_path, "profile_summary": profile_summary}
 
 
 def main():
@@ -338,6 +386,15 @@ def main():
         print("Saved JSON report to:", args.json)
     if res.get("ort_profile"):
         print("Saved ORT profile to:", res["ort_profile"])
+        if res.get("profile_summary"):
+            ps = res["profile_summary"]
+            print("ORT provider summary: node_counts=", ps.get("provider_node_counts", {}), " time_ms=", ps.get("provider_total_time_ms", {}))
+            # Print top CPU ops by total time for quick insight
+            tops = (ps.get("top_ops_by_time") or {}).get("CPUExecutionProvider")
+            if tops:
+                print("Top CPU ops by time:")
+                for op, t, cnt in tops[:8]:
+                    print(f" - {op}: {t} ms ({cnt} nodes)")
 
 
 if __name__ == "__main__":

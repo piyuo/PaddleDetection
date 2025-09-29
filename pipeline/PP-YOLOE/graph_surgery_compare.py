@@ -911,6 +911,8 @@ def main():
     parser.add_argument("--img", type=str, default="", help="Path to image for realistic preprocessing (required, unless --use-demo)")
     parser.add_argument("--use-demo", action="store_true", help="Use pipeline/dataset/demo/demo.jpg for preprocessing")
     parser.add_argument("--outdir", type=str, default="pipeline/PP-YOLOE/models/surgery")
+    parser.add_argument("--ort-profile", action="store_true", help="Enable ORT timeline profiling for both baseline and modified runs")
+    parser.add_argument("--ort-profile-dir", type=str, default="pipeline/PP-YOLOE/output", help="Directory for ORT profile files")
     parser.add_argument("--no-simplify", action="store_true")
     parser.add_argument("--no-shape-infer", action="store_true")
     parser.add_argument("--fp16", action="store_true", help="Attempt FP16 casting (if tools available)")
@@ -960,7 +962,7 @@ def main():
         print("onnxruntime not available; install 'onnxruntime' or 'onnxruntime-silicon'.")
         return
     print(f"[Debug] run config: ep={args.ep}, warmup={args.warmup}, runs={args.runs}")
-    base = run_benchmark(args.model, ishape, args.ep, args.warmup, args.runs, img_path=img_path)
+    base = run_benchmark(args.model, ishape, args.ep, args.warmup, args.runs, enable_profile=args.ort_profile, profile_dir=args.ort_profile_dir, img_path=img_path)
     b = base["benchmark"]
     print("Providers (baseline):", b.get("providers"))
     if base.get("coreml_capability"):
@@ -971,6 +973,17 @@ def main():
             b["latency_ms_avg"], b["latency_ms_p50"], b["latency_ms_p90"], b["latency_ms_p95"]
         )
     )
+    if base.get("ort_profile"):
+        print("Baseline ORT profile:", base.get("ort_profile"))
+        if base.get("profile_summary"):
+            ps = base["profile_summary"]
+            print(" - provider node_counts:", ps.get("provider_node_counts", {}))
+            print(" - provider total time (ms):", ps.get("provider_total_time_ms", {}))
+            tops = (ps.get("top_ops_by_time") or {}).get("CPUExecutionProvider")
+            if tops:
+                print(" - top CPU ops by time:")
+                for op, t, cnt in tops[:8]:
+                    print(f"    * {op}: {t} ms ({cnt} nodes)")
 
     # Build modified path
     mod_path = os.path.join(args.outdir, os.path.basename(args.model).replace('.onnx', '_mod.onnx'))
@@ -1073,13 +1086,21 @@ def main():
         shutil.copyfile(work_path, final_path)
     except Exception:
         final_path = work_path
-    print("Modified model:", work_path)
-    print("Final model:", final_path)
     mod_info = load_model_info(work_path)
     print("Nodes:", mod_info["node_count"], "Unique ops:", mod_info["unique_ops"])
 
+    print("Modified model:", work_path)
+    print("Final model:", final_path)
+    # Print a concise summary with filename and absolute path for easy copy/paste
+    final_abs = os.path.abspath(final_path)
+    final_name = os.path.basename(final_path)
+    print("=== Final Artifact ===")
+    print(f"Final filename: {final_name}")
+    print(f"Final absolute path: {final_abs}")
+    # Plain absolute path for direct copy/paste
+    print(final_abs)
     print("=== Modified Benchmark ===")
-    mod = run_benchmark(work_path, ishape, args.ep, args.warmup, args.runs, img_path=img_path)
+    mod = run_benchmark(work_path, ishape, args.ep, args.warmup, args.runs, enable_profile=args.ort_profile, profile_dir=args.ort_profile_dir, img_path=img_path)
     m = mod["benchmark"]
     print("Providers (modified):", m.get("providers"))
     if mod.get("coreml_capability"):
@@ -1090,6 +1111,17 @@ def main():
             m["latency_ms_avg"], m["latency_ms_p50"], m["latency_ms_p90"], m["latency_ms_p95"]
         )
     )
+    if mod.get("ort_profile"):
+        print("Modified ORT profile:", mod.get("ort_profile"))
+        if mod.get("profile_summary"):
+            ps = mod["profile_summary"]
+            print(" - provider node_counts:", ps.get("provider_node_counts", {}))
+            print(" - provider total time (ms):", ps.get("provider_total_time_ms", {}))
+            tops = (ps.get("top_ops_by_time") or {}).get("CPUExecutionProvider")
+            if tops:
+                print(" - top CPU ops by time:")
+                for op, t, cnt in tops[:8]:
+                    print(f"    * {op}: {t} ms ({cnt} nodes)")
 
     # Simple compare
     def pct_delta(a, b):
