@@ -1198,6 +1198,7 @@ def main():
     parser.add_argument("--eliminate-identity-chains", action="store_true", help="Remove redundant Identity node chains")
     parser.add_argument("--fuse-reshape-transpose", action="store_true", help="Fuse inverse Reshape/Transpose pairs")
     parser.add_argument("--aggressive-mode", action="store_true", help="Enable all ANE optimizations")
+    parser.add_argument("--output-model", type=str, help="Path to copy final optimized model to")
 
     args = parser.parse_args()
 
@@ -1353,12 +1354,22 @@ def main():
         work_path = cast_graph_to_fp16(work_path, mod3)
 
     # Copy to final artifact
-    final_path = os.path.join(
-        args.outdir, os.path.basename(args.model).replace('.onnx', '_final.onnx')
-    )
+    if args.output_model:
+        # Use the specified output model path
+        final_path = args.output_model
+        # Create directory if it doesn't exist
+        os.makedirs(os.path.dirname(os.path.abspath(final_path)), exist_ok=True)
+    else:
+        # Use default naming in output directory
+        final_path = os.path.join(
+            args.outdir, os.path.basename(args.model).replace('.onnx', '_final.onnx')
+        )
+
     try:
         shutil.copyfile(work_path, final_path)
-    except Exception:
+        print(f"[stage] Copied final model to: {final_path}")
+    except Exception as e:
+        print(f"[WARNING] Failed to copy to final path: {e}")
         final_path = work_path
 
     mod_info = load_model_info(work_path)

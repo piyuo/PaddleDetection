@@ -3,7 +3,7 @@
 Auto-tuner for PP-YOLOE ONNX graph surgery options.
 
 This script runs staged search over transformation toggles in
-`graph_surgery_compare.py` and reports the best configuration based on
+`coreml_graph_surgery.py` and reports the best configuration based on
 Modified avg latency measured with ONNX Runtime (CoreML EP by default).
 
 Outputs:
@@ -13,7 +13,7 @@ Outputs:
 - A copy of the best model as best/best_final.onnx
 
 Example:
-  python3 pipeline/PP-YOLOE/auto_tune_graph_surgery.py \
+  python3 pipeline/PP-YOLOE/coreml_auto_tune_graph_surgery.py \
     --model output/ppyoloe_crn_s_36e_pphuman/best_model.onnx \
     --input-shape 1,3,640,640 --ep coreml --runs 10 --warmup 3 \
     --split-candidates 10,8,6 --keep-outputs ppyoloe_output1,ppyoloe_output2
@@ -43,7 +43,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 
-GRAPH_SCRIPT = Path(__file__).with_name("graph_surgery_compare.py")
+GRAPH_SCRIPT = Path(__file__).with_name("coreml_graph_surgery.py")
 
 
 class TunerLogger:
@@ -532,13 +532,13 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument("--ep", default="coreml", help="Execution provider: coreml/cpu/cuda/etc.")
     p.add_argument("--warmup", type=int, default=3)
     p.add_argument("--runs", type=int, default=10)
-    p.add_argument("--img", default=None, help="Path to a real image for benchmarking; forwarded to graph_surgery_compare.py")
+    p.add_argument("--img", default=None, help="Path to a real image for benchmarking; forwarded to coreml_graph_surgery.py")
     p.add_argument("--outdir", default=None, help="Output directory for the tuning run")
     p.add_argument("--keep-outputs", default=None, help="Comma-separated output tensor names to keep; if set, tuner will try both with and without keeping")
     p.add_argument("--split-candidates", default="10,8,6", help="Comma-separated list of max inputs for Concat split sweep")
     p.add_argument("--no-fp16", action="store_true", help="Do not try FP16 variations")
     p.add_argument("--full-grid", action="store_true", help="Run a full grid search (may be slow)")
-    p.add_argument("--extra-args", default=None, help="Extra args to pass to graph_surgery_compare.py (quoted string)")
+    p.add_argument("--extra-args", default=None, help="Extra args to pass to coreml_graph_surgery.py (quoted string)")
     args = p.parse_args(argv)
     return args
 
@@ -563,7 +563,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"Model not found: {model}", file=sys.stderr)
         return 2
     if not GRAPH_SCRIPT.is_file():
-        print(f"graph_surgery_compare.py not found at {GRAPH_SCRIPT}", file=sys.stderr)
+        print(f"coreml_graph_surgery.py not found at {GRAPH_SCRIPT}", file=sys.stderr)
         return 2
 
     # Prepare run dir

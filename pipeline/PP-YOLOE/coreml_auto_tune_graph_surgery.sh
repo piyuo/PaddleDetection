@@ -1,7 +1,7 @@
-# pipeline/PP-YOLOE/auto_tune_graph_surgery.sh
+# pipeline/PP-YOLOE/coreml_auto_tune_graph_surgery.sh
 #!/usr/bin/env bash
 
-  python3 pipeline/PP-YOLOE/auto_tune_graph_surgery.py \
+  python3 pipeline/PP-YOLOE/coreml_auto_tune_graph_surgery.py \
     --model pipeline/PP-YOLOE/models/ppyoloe_crn_s_36e_pphuman_embed.onnx \
     --input-shape 1,3,640,640 --ep coreml --runs 10 --warmup 3 \
     --img pipeline/dataset/demo/demo.jpg \

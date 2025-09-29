@@ -8,7 +8,7 @@ python3 pipeline/PP-YOLOE/coreml_graph_surgery.py \
 --input-shape 1,3,640,640 --ep coreml --warmup 10 --runs 20 \
 --img pipeline/dataset/demo/demo.jpg \
 --outdir pipeline/PP-YOLOE/models/surgery \
---output-model pipeline/PP-YOLOE/models/ppyoloe_crn_s_36e_pphuman_embed_ane \
+--output-model pipeline/PP-YOLOE/models/ppyoloe_crn_s_36e_pphuman_embed_ane.onnx \
 --fix-input-shapes \
 --split-concat 8 \
 --fold-static-shapes \
@@ -18,3 +18,5 @@ python3 pipeline/PP-YOLOE/coreml_graph_surgery.py \
 --rewrite-swish \
 --rewrite-hardsigmoid \
 --rewrite-slice-to-gather
+
+rm -rf pipeline/PP-YOLOE/models/surgery
