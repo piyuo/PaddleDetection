@@ -3,7 +3,7 @@ import argparse
 import time
 import json
 import os
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Tuple, Optional
 
 import numpy as np
 import onnx
@@ -101,59 +101,51 @@ def parse_shape(s: str) -> Tuple[int, ...]:
     return tuple(int(x) for x in s.split(",") if x)
 
 
-def make_dummy_inputs(model_info: Dict[str, Any], input_shape: Tuple[int, ...]) -> Dict[str, np.ndarray]:
-    # Heuristics for PP-YOLOE: main image is NCHW; may also have inputs like 'im_shape' (N,2) and 'scale_factor' (N,2)
-    inputs: Dict[str, np.ndarray] = {}
-    n, c, h, w = None, None, None, None
-    if len(input_shape) == 4:
-        n, c, h, w = input_shape
+# Removed synthetic input generation; benchmarking now requires a real image via --img/--use-demo.
 
-    for inp in model_info["inputs"]:
-        name = inp["name"]
-        dtype = _elem_type_to_dtype(inp["dtype"])  # default mapping
-        shp = inp["shape"]
 
-        # Resolve dynamic dims
-        resolved = []
-        for j, d in enumerate(shp):
-            if isinstance(d, int) and d > 0:
-                resolved.append(d)
-            else:
-                # Guess from provided input_shape
-                if len(shp) == 4 and len(input_shape) == 4:
-                    resolved.append(input_shape[j])
-                elif len(shp) == 2 and len(input_shape) == 4 and j == 0 and n is not None:
-                    resolved.append(n)
-                elif len(shp) == 1 and j == 0 and n is not None:
-                    resolved.append(n)
-                else:
-                    # fallback
-                    resolved.append(1)
+def _repo_root() -> str:
+    # This file is at <repo>/pipeline/PP-YOLOE/profile_onnx.py
+    return os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
 
-        # Special-cases common helper inputs
-        if len(resolved) == 2 and resolved[1] == 2 and dtype in (np.float16, np.float32, np.float64) and h and w:
-            if name.lower().endswith("im_shape") or "im_shape" in name.lower():
-                arr = np.array([[float(h), float(w)]], dtype=dtype)
-                arr = np.repeat(arr, resolved[0], axis=0)
-                inputs[name] = arr
-                continue
-            if name.lower().endswith("scale_factor") or "scale" in name.lower():
-                arr = np.ones((resolved[0], 2), dtype=dtype)
-                inputs[name] = arr
-                continue
 
-        # Main tensor-like inputs
-        if np.issubdtype(dtype, np.floating):
-            data = np.random.rand(*resolved).astype(dtype)
-        elif np.issubdtype(dtype, np.integer):
-            data = np.random.randint(0, 10, size=resolved, dtype=dtype)
-        elif dtype == np.bool_:
-            data = np.random.rand(*resolved) > 0.5
-        else:
-            # Strings/objects not supported for inference inputs in ORT; use zeros
-            data = np.zeros(resolved, dtype=np.float32)
-        inputs[name] = data
-    return inputs
+def _default_demo_image() -> str:
+    root = _repo_root()
+    return os.path.join(root, 'pipeline', 'dataset', 'demo', 'demo.jpg')
+
+
+def make_image_inputs(model_info: Dict[str, Any], input_shape: Tuple[int, ...], img_path: str) -> Dict[str, np.ndarray]:
+    """Build feeds using real image preprocessing to better reflect real-world latency.
+
+    Falls back to dummy inputs if preprocessing import fails.
+    """
+    feeds = None
+    try:
+        # Reuse the exact preprocessing from onnx_inference_image.py for parity
+        from onnx_inference_image import preprocess_image  # type: ignore
+        # Determine target size from provided input_shape if possible
+        target_hw = None
+        if len(input_shape) == 4 and input_shape[2] and input_shape[3]:
+            target_hw = (int(input_shape[2]), int(input_shape[3]))
+        if target_hw is None:
+            target_hw = (640, 640)
+        prep = preprocess_image(img_path, target_size=target_hw, keep_ratio=False)
+        # Map by input names declared in the model
+        feeds = {}
+        for inp in model_info["inputs"]:
+            name = inp["name"]
+            if name == 'image' and 'image' in prep:
+                feeds[name] = prep['image'][None, :]
+            elif name in ('im_shape', 'scale_factor') and name in prep:
+                feeds[name] = prep[name][None, :]
+        # Ensure all inputs are covered without synthetic fallbacks
+        expected = {i["name"] for i in model_info["inputs"]}
+        missing = expected - set(feeds.keys())
+        if missing:
+            raise RuntimeError(f"Missing required inputs for image preprocessing: {sorted(missing)}")
+    except Exception as e:
+        raise RuntimeError(f"Failed to build image-based inputs: {e}")
+    return feeds
 
 
 def available_providers() -> List[str]:
@@ -184,7 +176,7 @@ def pick_providers(pref: str) -> List[Any]:
     return ["CPUExecutionProvider"]
 
 
-def run_benchmark(model_path: str, input_shape: Tuple[int, ...], ep: str, warmup: int, runs: int, enable_profile: bool = False, profile_dir: str = "") -> Dict[str, Any]:
+def run_benchmark(model_path: str, input_shape: Tuple[int, ...], ep: str, warmup: int, runs: int, enable_profile: bool = False, profile_dir: str = "", img_path: Optional[str] = None) -> Dict[str, Any]:
     if ort is None:
         raise RuntimeError("onnxruntime is not installed. Please install 'onnxruntime' or 'onnxruntime-silicon'.")
 
@@ -198,7 +190,10 @@ def run_benchmark(model_path: str, input_shape: Tuple[int, ...], ep: str, warmup
     providers = pick_providers(ep)
     sess = ort.InferenceSession(model_path, sess_options=so, providers=providers)
 
-    feeds = make_dummy_inputs(model_info, input_shape)
+    # Build feeds: require real image inputs
+    if not img_path:
+        raise RuntimeError("img_path is required for benchmarking; pass --img or --use-demo")
+    feeds = make_image_inputs(model_info, input_shape, img_path)
 
     # Warmup
     for _ in range(max(0, warmup)):
@@ -228,6 +223,7 @@ def run_benchmark(model_path: str, input_shape: Tuple[int, ...], ep: str, warmup
         "providers": shown_providers,
         "warmup": warmup,
         "runs": runs,
+        "img_path": img_path or "",
         "latency_ms_avg": float(np.mean(times)) if times else float("nan"),
         "latency_ms_p50": pct(50),
         "latency_ms_p90": pct(90),
@@ -279,6 +275,8 @@ def main():
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--runs", type=int, default=50)
     parser.add_argument("--json", type=str, default="", help="Optional path to write JSON report")
+    parser.add_argument("--img", type=str, default="", help="Path to image for realistic preprocessing (required, unless --use-demo provided)")
+    parser.add_argument("--use-demo", action="store_true", help="Use pipeline/dataset/demo/demo.jpg for preprocessing")
     parser.add_argument("--ort-profile", action="store_true", help="Enable onnxruntime profiling and save timeline JSON")
     parser.add_argument("--ort-profile-dir", type=str, default="pipeline/PP-YOLOE/output", help="Directory to place ORT profile JSON")
 
@@ -307,10 +305,21 @@ def main():
 
     print("\n=== Benchmark ===")
     print("Available providers:", available_providers())
-    res = run_benchmark(args.model, ishape, args.ep, args.warmup, args.runs, enable_profile=args.ort_profile, profile_dir=args.ort_profile_dir)
+    use_img = args.img or (_default_demo_image() if args.use_demo else "")
+    if not use_img:
+        print("[ERROR] --img is required (or use --use-demo). No synthetic inputs are supported.")
+        return
+    # Resolve to absolute path and ensure it exists
+    img_path = use_img if os.path.isabs(use_img) else os.path.abspath(use_img)
+    if not os.path.exists(img_path):
+        print(f"[ERROR] Image not found: {img_path}")
+        return
+    else:
+        print(f"Using real image inputs: {img_path}")
+    res = run_benchmark(args.model, ishape, args.ep, args.warmup, args.runs, enable_profile=args.ort_profile, profile_dir=args.ort_profile_dir, img_path=img_path)
     bench = res["benchmark"]
     print("Providers:", bench["providers"])
-    print("EP:",args.ep,"Runs:", bench["runs"], "Warmup:", bench["warmup"])
+    print("EP:",args.ep,"Runs:", bench["runs"], "Warmup:", bench["warmup"], "Image:", bench.get("img_path","(synthetic)"))
     print(
         "Latency (ms): avg={avg:.2f} p50={p50:.2f} p90={p90:.2f} p95={p95:.2f} min={min:.2f} max={max:.2f}".format(
             avg=bench["latency_ms_avg"],

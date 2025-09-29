@@ -908,6 +908,8 @@ def main():
     parser.add_argument("--ep", type=str, default="coreml")
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--runs", type=int, default=50)
+    parser.add_argument("--img", type=str, default="", help="Path to image for realistic preprocessing (required, unless --use-demo)")
+    parser.add_argument("--use-demo", action="store_true", help="Use pipeline/dataset/demo/demo.jpg for preprocessing")
     parser.add_argument("--outdir", type=str, default="pipeline/PP-YOLOE/models/surgery")
     parser.add_argument("--no-simplify", action="store_true")
     parser.add_argument("--no-shape-infer", action="store_true")
@@ -937,13 +939,28 @@ def main():
     args = parser.parse_args()
     os.makedirs(args.outdir, exist_ok=True)
     ishape = parse_shape(args.input_shape)
+    # Resolve image requirement
+    def _repo_root():
+        return os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
+    def _default_demo_image():
+        return os.path.join(_repo_root(), 'pipeline', 'dataset', 'demo', 'demo.jpg')
+    use_img = args.img or (_default_demo_image() if args.use_demo else "")
+    if not use_img:
+        print("[ERROR] --img is required (or use --use-demo). No synthetic inputs are supported.")
+        return
+    img_path = use_img if os.path.isabs(use_img) else os.path.abspath(use_img)
+    if not os.path.exists(img_path):
+        print(f"[ERROR] Image not found: {img_path}")
+        return
+    else:
+        print(f"Using real image inputs: {img_path}")
 
     print("=== Baseline ===")
     if ort is None:
         print("onnxruntime not available; install 'onnxruntime' or 'onnxruntime-silicon'.")
         return
     print(f"[Debug] run config: ep={args.ep}, warmup={args.warmup}, runs={args.runs}")
-    base = run_benchmark(args.model, ishape, args.ep, args.warmup, args.runs)
+    base = run_benchmark(args.model, ishape, args.ep, args.warmup, args.runs, img_path=img_path)
     b = base["benchmark"]
     print("Providers (baseline):", b.get("providers"))
     if base.get("coreml_capability"):
@@ -1062,7 +1079,7 @@ def main():
     print("Nodes:", mod_info["node_count"], "Unique ops:", mod_info["unique_ops"])
 
     print("=== Modified Benchmark ===")
-    mod = run_benchmark(work_path, ishape, args.ep, args.warmup, args.runs)
+    mod = run_benchmark(work_path, ishape, args.ep, args.warmup, args.runs, img_path=img_path)
     m = mod["benchmark"]
     print("Providers (modified):", m.get("providers"))
     if mod.get("coreml_capability"):
