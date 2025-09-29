@@ -105,17 +105,25 @@ def run_onnxoptimizer(model_path: str, out_path: str) -> str:
         return out_path
     m = onnx.load(model_path)
     # List of reasonable passes for inference graphs
-    passes = [
+    available = set(getattr(onnxoptimizer, 'get_available_passes', lambda: [])())
+    desired = [
         "eliminate_identity",
         "eliminate_deadend",
         "eliminate_nop_transpose",
         "eliminate_nop_pad",
         "eliminate_nop_dropout",
+        "eliminate_nop_cast",
+        "eliminate_nop_reshape",
+        "eliminate_nop_monotone_argmax",
         "fuse_consecutive_transposes",
         "fuse_add_bias_into_conv",
         "fuse_bn_into_conv",
+        "fuse_consecutive_squeezes",
+        "fuse_consecutive_unsqueezes",
+        "fuse_pad_into_conv",
         "eliminate_unused_initializer",
     ]
+    passes = [p for p in desired if not available or p in available]
     try:
         m_opt = onnxoptimizer.optimize(m, passes)
         onnx.save(m_opt, out_path)
@@ -176,21 +184,21 @@ def rewrite_hardswish(model_path: str, out_path: str) -> str:
         x = node.input[0]
         y = node.output[0]
 
-        # Constants
+        # Constants (0-D scalars for CoreML Clip min/max requirements)
         c3_name = unique_name("hardswish_c3")
-        c3_tensor = numpy_helper.from_array(np.array([3.0], dtype=np.float32), name=c3_name)
+        c3_tensor = numpy_helper.from_array(np.array(3.0, dtype=np.float32), name=c3_name)
         g.initializer.extend([c3_tensor])
 
         c0_name = unique_name("hardswish_c0")
-        c0_tensor = numpy_helper.from_array(np.array([0.0], dtype=np.float32), name=c0_name)
+        c0_tensor = numpy_helper.from_array(np.array(0.0, dtype=np.float32), name=c0_name)
         g.initializer.extend([c0_tensor])
 
         c6_name = unique_name("hardswish_c6")
-        c6_tensor = numpy_helper.from_array(np.array([6.0], dtype=np.float32), name=c6_name)
+        c6_tensor = numpy_helper.from_array(np.array(6.0, dtype=np.float32), name=c6_name)
         g.initializer.extend([c6_tensor])
 
         cscale_name = unique_name("hardswish_c1_div6")
-        cscale_tensor = numpy_helper.from_array(np.array([1.0 / 6.0], dtype=np.float32), name=cscale_name)
+        cscale_tensor = numpy_helper.from_array(np.array(1.0 / 6.0, dtype=np.float32), name=cscale_name)
         g.initializer.extend([cscale_tensor])
 
         # x + 3
@@ -237,6 +245,106 @@ def rewrite_hardswish(model_path: str, out_path: str) -> str:
     print(f"Rewrote HardSwish -> Add+Clip+Mul: {changed} node(s)")
     return out_path
 
+
+def rewrite_swish_to_hardswish(model_path: str, out_path: str) -> str:
+    """Detect Swish/SiLU patterns (x * Sigmoid(x)) and rewrite into Add+Clip+Mul style.
+
+    Heuristic pattern:
+      - Mul node where one input is Sigmoid of the other input (same tensor)
+    Caveat:
+      - This is an approximation; mathematically Swish != HardSwish, but ANE often prefers the latter form.
+    """
+    m = onnx.load(model_path)
+    g = m.graph
+
+    # Map tensor -> producer node
+    producer = {}
+    for node in g.node:
+        for out in node.output:
+            producer[out] = node
+
+    def unique_name(base: str) -> str:
+        idx = 0
+        existing = {n.name for n in g.node}
+        existing.update({vi.name for vi in list(g.input) + list(g.output)})
+        existing.update({init.name for init in g.initializer})
+        name = f"{base}__{idx}"
+        while name in existing:
+            idx += 1
+            name = f"{base}__{idx}"
+        return name
+
+    new_nodes: List[onnx.NodeProto] = []
+    nodes_to_remove: List[onnx.NodeProto] = []
+    changed = 0
+
+    for node in g.node:
+        if node.op_type != "Mul" or len(node.input) != 2:
+            continue
+        a, b = node.input
+        # Check if one side is Sigmoid of the other
+        pa = producer.get(a)
+        pb = producer.get(b)
+        # pattern: Mul(x, Sigmoid(x)) or Mul(Sigmoid(x), x)
+        def is_sigmoid_of_x(pnode, xname):
+            return pnode is not None and pnode.op_type == "Sigmoid" and len(pnode.input) == 1 and pnode.input[0] == xname
+
+        if is_sigmoid_of_x(pa, b):
+            x = b
+        elif is_sigmoid_of_x(pb, a):
+            x = a
+        else:
+            continue
+
+        y = node.output[0]
+
+        # Inject Add+Clip+Mul*(1/6) sequence similar to HardSwish rewrite
+        c3_name = unique_name("swish_c3")
+        c0_name = unique_name("swish_c0")
+        c6_name = unique_name("swish_c6")
+        cscale_name = unique_name("swish_c1_div6")
+        for nm, val in [
+            (c3_name, 3.0),
+            (c0_name, 0.0),
+            (c6_name, 6.0),
+            (cscale_name, 1.0/6.0),
+        ]:
+            # Create 0-D scalar initializers
+            g.initializer.extend([numpy_helper.from_array(np.array(val, dtype=np.float32), name=nm)])
+
+        add_out = unique_name(node.name + "_add3")
+        add_node = helper.make_node("Add", [x, c3_name], [add_out], name=unique_name(node.name + "_Add"))
+
+        clip_out = unique_name(node.name + "_clip")
+        clip_node = helper.make_node("Clip", [add_out, c0_name, c6_name], [clip_out], name=unique_name(node.name + "_Clip"))
+
+        mul1_out = unique_name(node.name + "_mul1")
+        mul1_node = helper.make_node("Mul", [x, clip_out], [mul1_out], name=unique_name(node.name + "_Mul1"))
+
+        mul2_node = helper.make_node("Mul", [mul1_out, cscale_name], [y], name=unique_name(node.name + "_Mul2"))
+
+        new_nodes.extend([add_node, clip_node, mul1_node, mul2_node])
+        nodes_to_remove.append(node)
+        # If we consumed a Sigmoid predecessor and it's now dead, let optimizer prune it later
+        changed += 1
+
+    if changed == 0:
+        onnx.save(m, out_path)
+        return out_path
+
+    # Rebuild node list (remove replaced Mul nodes, append the new sequence)
+    kept: List[onnx.NodeProto] = []
+    for n in g.node:
+        if n in nodes_to_remove:
+            continue
+        kept.append(n)
+    kept.extend(new_nodes)
+    del g.node[:]
+    g.node.extend(kept)
+
+    onnx.save(m, out_path)
+    print(f"Rewrote Swish/SiLU -> Add+Clip+Mul: {changed} node(s)")
+    return out_path
 
 def split_large_concats(model_path: str, out_path: str, max_inputs: int = 8) -> str:
     """Split Concat nodes with too many inputs into a tree of smaller Concat nodes.
@@ -644,6 +752,150 @@ def rewrite_pow_patterns(model_path: str, out_path: str) -> str:
     return out_path
 
 
+def rewrite_hardsigmoid_linear(model_path: str, out_path: str) -> str:
+    """Rewrite HardSigmoid to a mul+add+clip linear form using min/max inputs for Clip.
+
+    HardSigmoid(x) = max(0, min(1, alpha * x + beta))
+    We'll materialize alpha and beta as initializers and build Mul/Add/Clip.
+    """
+    m = onnx.load(model_path)
+    g = m.graph
+    new_nodes: List[onnx.NodeProto] = []
+    nodes_to_remove: List[onnx.NodeProto] = []
+    changed = 0
+
+    def unique_name(base: str) -> str:
+        idx = 0
+        existing = {n.name for n in g.node}
+        existing.update({vi.name for vi in list(g.input) + list(g.output)})
+        existing.update({init.name for init in g.initializer})
+        name = f"{base}__{idx}"
+        while name in existing:
+            idx += 1
+            name = f"{base}__{idx}"
+        return name
+
+    for node in g.node:
+        if node.op_type != "HardSigmoid":
+            continue
+        x = node.input[0]
+        y = node.output[0]
+        alpha = 0.2
+        beta = 0.5
+        for a in node.attribute:
+            if a.name == "alpha":
+                alpha = float(a.f)
+            if a.name == "beta":
+                beta = float(a.f)
+
+        a_name = unique_name("hsig_alpha")
+        b_name = unique_name("hsig_beta")
+        z_name = unique_name("zero")
+        o_name = unique_name("one")
+        for nm, val in [
+            (a_name, alpha), (b_name, beta), (z_name, 0.0), (o_name, 1.0)
+        ]:
+            # Use 0-D scalars for CoreML Clip inputs
+            g.initializer.extend([numpy_helper.from_array(np.array(val, dtype=np.float32), name=nm)])
+
+        mul_out = unique_name(node.name + "_mul")
+        mul_node = helper.make_node("Mul", [x, a_name], [mul_out], name=unique_name(node.name + "_Mul"))
+        add_out = unique_name(node.name + "_add")
+        add_node = helper.make_node("Add", [mul_out, b_name], [add_out], name=unique_name(node.name + "_Add"))
+        clip_node = helper.make_node("Clip", [add_out, z_name, o_name], [y], name=unique_name(node.name + "_Clip"))
+        new_nodes.extend([mul_node, add_node, clip_node])
+        nodes_to_remove.append(node)
+        changed += 1
+
+    if changed == 0:
+        onnx.save(m, out_path)
+        return out_path
+
+    kept = [n for n in g.node if n not in nodes_to_remove]
+    kept.extend(new_nodes)
+    del g.node[:]
+    g.node.extend(kept)
+    onnx.save(m, out_path)
+    print(f"Rewrote HardSigmoid -> Mul+Add+Clip: {changed} node(s)")
+    return out_path
+
+
+def rewrite_slice_to_gather(model_path: str, out_path: str) -> str:
+    """Rewrite simple Slice with fixed single-axis indices into Gather for better CoreML support.
+
+    Pattern: Slice(data, starts, ends, axes=[k], steps=[1]) with starts/ends scalar constants
+    Transforms into Gather along axis=k for a single index when the slice selects exactly one index.
+    """
+    m = onnx.load(model_path)
+    g = m.graph
+    consts = {init.name: numpy_helper.to_array(init) for init in g.initializer}
+
+    def get_const_scalar(name):
+        arr = consts.get(name)
+        if arr is None:
+            return None
+        try:
+            v = int(np.array(arr).reshape(-1)[0])
+            return v
+        except Exception:
+            return None
+
+    new_nodes: List[onnx.NodeProto] = []
+    nodes_to_remove: List[onnx.NodeProto] = []
+    changed = 0
+    for node in g.node:
+        if node.op_type != "Slice":
+            continue
+        if len(node.input) < 3:
+            continue
+        data, starts, ends = node.input[:3]
+        axes = None
+        steps = None
+        if len(node.input) >= 4:
+            axes = consts.get(node.input[3])
+        if len(node.input) >= 5:
+            steps = consts.get(node.input[4])
+        s = consts.get(starts)
+        e = consts.get(ends)
+        if s is None or e is None:
+            continue
+        try:
+            s = np.array(s).astype(np.int64).reshape(-1)
+            e = np.array(e).astype(np.int64).reshape(-1)
+            ax = np.array(axes).astype(np.int64).reshape(-1) if axes is not None else np.array([0], dtype=np.int64)
+            st = np.array(steps).astype(np.int64).reshape(-1) if steps is not None else np.array([1], dtype=np.int64)
+        except Exception:
+            continue
+        if not (len(s) == len(e) == len(ax) == len(st) == 1):
+            continue
+        if int(st[0]) != 1:
+            continue
+        # Select exactly one index
+        if int(e[0]) - int(s[0]) != 1:
+            continue
+        idx = int(s[0])
+        axis = int(ax[0])
+        # Build an initializer for the Gather index
+        idx_name = node.name + "_gather_idx"
+        g.initializer.extend([numpy_helper.from_array(np.array([idx], dtype=np.int64), name=idx_name)])
+        gather = helper.make_node("Gather", [data, idx_name], list(node.output), name=node.name + "_toGather", axis=axis)
+        new_nodes.append(gather)
+        nodes_to_remove.append(node)
+        changed += 1
+
+    if changed == 0:
+        onnx.save(m, out_path)
+        return out_path
+
+    kept = [n for n in g.node if n not in nodes_to_remove]
+    kept.extend(new_nodes)
+    del g.node[:]
+    g.node.extend(kept)
+    onnx.save(m, out_path)
+    print(f"Rewrote Slice -> Gather: {changed} node(s)")
+    return out_path
+
+
 def main():
     parser = argparse.ArgumentParser(description="Graph surgery and performance compare for PP-YOLOE ONNX")
     parser.add_argument(
@@ -678,6 +930,9 @@ def main():
     )
     parser.add_argument("--rewrite-div", action="store_true", help="Rewrite Div by constant to Mul with reciprocal")
     parser.add_argument("--rewrite-pow", action="store_true", help="Rewrite Pow(x,c) with simpler ops (2, 0.5, -1, 1)")
+    parser.add_argument("--rewrite-swish", action="store_true", help="Rewrite Swish/SiLU pattern x*Sigmoid(x) to HardSwish-style Add+Clip+Mul (ANE-friendly)")
+    parser.add_argument("--rewrite-hardsigmoid", action="store_true", help="Rewrite HardSigmoid to Mul+Add+Clip with min/max inputs")
+    parser.add_argument("--rewrite-slice-to-gather", action="store_true", help="Rewrite simple Slice with single index to Gather (fixed axes, step=1)")
 
     args = parser.parse_args()
     os.makedirs(args.outdir, exist_ok=True)
@@ -687,9 +942,13 @@ def main():
     if ort is None:
         print("onnxruntime not available; install 'onnxruntime' or 'onnxruntime-silicon'.")
         return
+    print(f"[Debug] run config: ep={args.ep}, warmup={args.warmup}, runs={args.runs}")
     base = run_benchmark(args.model, ishape, args.ep, args.warmup, args.runs)
     b = base["benchmark"]
     print("Providers (baseline):", b.get("providers"))
+    if base.get("coreml_capability"):
+        cap = base["coreml_capability"]
+        print(f"CoreML capability (baseline): partitions={cap.get('num_partitions')} nodes supported={cap.get('num_nodes')}")
     print(
         "Baseline Latency (ms) avg={:.2f} p50={:.2f} p90={:.2f} p95={:.2f}".format(
             b["latency_ms_avg"], b["latency_ms_p50"], b["latency_ms_p90"], b["latency_ms_p95"]
@@ -701,76 +960,91 @@ def main():
     work_path = args.model
 
     if args.fix_input_shapes:
-        print("Fixing input shapes to static…")
+        print("[stage] Fix input shapes to static…")
         mod_fix = os.path.join(args.outdir, os.path.basename(args.model).replace('.onnx', '_fixed.onnx'))
         work_path = fix_input_shapes(work_path, mod_fix, ishape if len(ishape) == 4 else (1, 3, 640, 640))
 
     if not args.no_shape_infer:
-        print("Running shape inference…")
+        print("[stage] Shape inference…")
         mod2 = mod_path.replace("_mod.onnx", "_shape.onnx")
         work_path = shape_infer_model(work_path, mod2)
     else:
         work_path = mod_path
 
     if args.rewrite_hardswish:
-        print("Rewriting HardSwish nodes…")
+        print("[stage] Rewriting HardSwish nodes…")
         modH = os.path.join(args.outdir, os.path.basename(args.model).replace('.onnx', '_hardswish.onnx'))
         work_path = rewrite_hardswish(work_path, modH)
 
+    if args.rewrite_swish:
+        print("[stage] Rewriting Swish/SiLU (x*Sigmoid(x)) to HardSwish-style…")
+        modHS = os.path.join(args.outdir, os.path.basename(args.model).replace('.onnx', '_swish2hs.onnx'))
+        work_path = rewrite_swish_to_hardswish(work_path, modHS)
+
     if args.split_concat and args.split_concat > 0:
-        print(f"Splitting large Concat nodes (max_inputs={args.split_concat})…")
+        print(f"[stage] Splitting large Concat nodes (max_inputs={args.split_concat})…")
         modC = os.path.join(args.outdir, os.path.basename(args.model).replace('.onnx', '_splitconcat.onnx'))
         work_path = split_large_concats(work_path, modC, max_inputs=int(args.split_concat))
 
     # Re-run shape inference after structural rewrites so later passes have shape info
-    if not args.no_shape_infer and (args.rewrite_hardswish or (args.split_concat and args.split_concat > 0)):
-        print("Running shape inference (post-rewrite)…")
+    if not args.no_shape_infer and (args.rewrite_hardswish or args.rewrite_swish or (args.split_concat and args.split_concat > 0)):
+        print("[stage] Running shape inference (post-rewrite)…")
         mod2b = mod_path.replace("_mod.onnx", "_shape2.onnx")
         work_path = shape_infer_model(work_path, mod2b)
 
     if args.fold_static_shapes:
-        print("Folding static shape chains…")
+        print("[stage] Folding static shape chains…")
         modF = os.path.join(args.outdir, os.path.basename(args.model).replace('.onnx', '_foldshape.onnx'))
         work_path = fold_static_shape_chains(work_path, modF)
 
+    if args.rewrite_hardsigmoid:
+        print("[stage] Rewriting HardSigmoid to Mul+Add+Clip…")
+        modHSig = os.path.join(args.outdir, os.path.basename(args.model).replace('.onnx', '_hardsig.onnx'))
+        work_path = rewrite_hardsigmoid_linear(work_path, modHSig)
+
     if args.rewrite_div:
-        print("Rewriting Div by constant…")
+        print("[stage] Rewriting Div by constant…")
         modD = os.path.join(args.outdir, os.path.basename(args.model).replace('.onnx', '_div2mul.onnx'))
         work_path = rewrite_div_by_const(work_path, modD)
 
     if args.rewrite_pow:
-        print("Rewriting Pow patterns…")
+        print("[stage] Rewriting Pow patterns…")
         modW = os.path.join(args.outdir, os.path.basename(args.model).replace('.onnx', '_powrew.onnx'))
         work_path = rewrite_pow_patterns(work_path, modW)
+
+    if args.rewrite_slice_to_gather:
+        print("[stage] Rewriting simple Slice -> Gather…")
+        modSG = os.path.join(args.outdir, os.path.basename(args.model).replace('.onnx', '_slice2gather.onnx'))
+        work_path = rewrite_slice_to_gather(work_path, modSG)
 
     # Optional pruning of outputs to maximize CoreML partition sizes
     if args.keep_outputs:
         keep = [s.strip() for s in args.keep_outputs.split(",") if s.strip()]
         if keep:
-            print("Pruning outputs; keeping:", keep)
+            print("[stage] Pruning outputs; keeping:", keep)
             modP = os.path.join(args.outdir, os.path.basename(args.model).replace('.onnx', '_pruned.onnx'))
             work_path = prune_outputs(work_path, modP, keep)
 
     # One more shape inference pass after folding/pruning
     if not args.no_shape_infer:
-        print("Running shape inference (final)…")
+        print("[stage] Running shape inference (final)…")
         mod2c = mod_path.replace("_mod.onnx", "_shape3.onnx")
         work_path = shape_infer_model(work_path, mod2c)
 
     if not args.no_optimizer:
-        print("Applying onnxoptimizer passes…")
+        print("[stage] Applying onnxoptimizer passes…")
         modO = os.path.join(args.outdir, os.path.basename(args.model).replace('.onnx', '_opt.onnx'))
         work_path = run_onnxoptimizer(work_path, modO)
 
     if not args.no_simplify:
-        print("Applying onnx-simplifier…")
+        print("[stage] Applying onnx-simplifier…")
         modS = os.path.join(args.outdir, os.path.basename(args.model).replace('.onnx', '_simp.onnx'))
         work_path = simplify_model(work_path, modS)
     else:
         shutil.copyfile(work_path, mod_path)
 
     if args.fp16:
-        print("Attempting FP16 casting…")
+        print("[stage] Attempting FP16 casting…")
         mod3 = os.path.join(args.outdir, os.path.basename(args.model).replace('.onnx', '_fp16.onnx'))
         work_path = cast_graph_to_fp16(work_path, mod3)
 
@@ -783,7 +1057,7 @@ def main():
     except Exception:
         final_path = work_path
     print("Modified model:", work_path)
-    print("Final model (stable name):", final_path)
+    print("Final model:", final_path)
     mod_info = load_model_info(work_path)
     print("Nodes:", mod_info["node_count"], "Unique ops:", mod_info["unique_ops"])
 
@@ -791,6 +1065,9 @@ def main():
     mod = run_benchmark(work_path, ishape, args.ep, args.warmup, args.runs)
     m = mod["benchmark"]
     print("Providers (modified):", m.get("providers"))
+    if mod.get("coreml_capability"):
+        cap = mod["coreml_capability"]
+        print(f"CoreML capability (modified): partitions={cap.get('num_partitions')} nodes supported={cap.get('num_nodes')}")
     print(
         "Modified Latency (ms) avg={:.2f} p50={:.2f} p90={:.2f} p95={:.2f}".format(
             m["latency_ms_avg"], m["latency_ms_p50"], m["latency_ms_p90"], m["latency_ms_p95"]
