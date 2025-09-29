@@ -642,7 +642,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     # Prepare run dir
     model_stem = Path(model).stem
-    outdir = Path(args.outdir) if args.outdir else Path("pipeline/output/auto_tune") / f"{model_stem}"
+    outdir = Path(args.outdir) if args.outdir else Path("pipeline/output/auto_tune")
     outdir.mkdir(parents=True, exist_ok=True)
 
     print(f"Auto-tuning: model={model} shape={input_shape} ep={ep}")
