@@ -75,8 +75,12 @@ class TrialConfig:
     rewrite_slice_to_gather: bool = False
     split_concat: Optional[int] = None  # None means disabled
     fold_static_shapes: bool = False
+    fold_iterations: int = 15  # Number of iterations for constant folding
     rewrite_div: bool = False
     rewrite_pow: bool = False
+    reducemean_to_avgpool: bool = False  # Convert ReduceMean to GlobalAveragePool
+    eliminate_identity_chains: bool = False  # Remove redundant Identity chains
+    fuse_reshape_transpose: bool = False  # Fuse inverse Reshape/Transpose pairs
     fp16: bool = False
     keep_outputs: Optional[str] = None  # comma-separated names or None
 
@@ -94,10 +98,18 @@ class TrialConfig:
             flags += ["--split-concat", str(self.split_concat)]
         if self.fold_static_shapes:
             flags.append("--fold-static-shapes")
+            # Always include fold-iterations when fold-static-shapes is enabled
+            flags += ["--fold-iterations", str(self.fold_iterations)]
         if self.rewrite_div:
             flags.append("--rewrite-div")
         if self.rewrite_pow:
             flags.append("--rewrite-pow")
+        if self.reducemean_to_avgpool:
+            flags.append("--reducemean-to-avgpool")
+        if self.eliminate_identity_chains:
+            flags.append("--eliminate-identity-chains")
+        if self.fuse_reshape_transpose:
+            flags.append("--fuse-reshape-transpose")
         if self.fp16:
             flags.append("--fp16")
         if self.keep_outputs:
@@ -302,8 +314,11 @@ def greedy_staged_search(base_model: str, input_shape: str, ep: str, warmup: int
         5: "HardSigmoid linearization toggle (off/on)",
         6: "Arithmetic rewrites (Div-by-const / Pow patterns)",
         7: "Slice->Gather toggle (off/on)",
-        8: "FP16 cast toggle (off/on) if enabled",
-        9: "Outputs pruning (off/on) if keep-outputs provided",
+        8: "ReduceMean->AvgPool toggle (off/on) - ANE optimization",
+        9: "Eliminate Identity chains toggle (off/on) - ANE optimization",
+        10: "Fuse Reshape/Transpose toggle (off/on) - ANE optimization",
+        11: "FP16 cast toggle (off/on) if enabled",
+        12: "Outputs pruning (off/on) if keep-outputs provided",
     }
 
     # Planned steps for progress estimate
@@ -315,8 +330,11 @@ def greedy_staged_search(base_model: str, input_shape: str, ep: str, warmup: int
     total_est += 2  # stage 5
     total_est += 4  # stage 6
     total_est += 2  # stage 7
-    total_est += (2 if try_fp16 else 1)  # stage 8
-    total_est += (2 if keep_outputs else 1)  # stage 9
+    total_est += 2  # stage 8 (new - reducemean-to-avgpool)
+    total_est += 2  # stage 9 (new - eliminate-identity-chains)
+    total_est += 2  # stage 10 (new - fuse-reshape-transpose)
+    total_est += (2 if try_fp16 else 1)  # stage 11
+    total_est += (2 if keep_outputs else 1)  # stage 12
     logger.log(f"[tuner] Staged search plan: ~{total_est} trials")
     logger.log("[tuner] Stage meanings:")
     for k in sorted(stage_docs.keys()):
@@ -439,33 +457,75 @@ def greedy_staged_search(base_model: str, input_shape: str, ep: str, warmup: int
         trial_counter += 1
     logger.log(f"[stage 7] done. best modified avg = {best.modified_avg_ms:.3f} ms")
 
-    # Stage 5: FP16 optional
+    # Stage 8: ReduceMean->AvgPool (ANE optimization)
+    logger.log("\n[stage 8] ReduceMean->AvgPool toggle (0=off, 1=on) - ANE optimization")
+    for rm_avg in [False, True]:
+        step = 1 if not rm_avg else 2
+        cfg = TrialConfig(**asdict(best_cfg))
+        cfg.reducemean_to_avgpool = rm_avg
+        logger.log(f"[stage 8] step {step}/2 -> reducemean_to_avgpool={int(rm_avg)}")
+        r = eval_cfg(f"stage8_rmavg_{int(rm_avg)}", cfg)
+        if r.modified_avg_ms < best.modified_avg_ms:
+            best = r
+            best_cfg = cfg
+        trial_counter += 1
+    logger.log(f"[stage 8] done. best modified avg = {best.modified_avg_ms:.3f} ms")
+
+    # Stage 9: Eliminate Identity chains (ANE optimization)
+    logger.log("\n[stage 9] Eliminate Identity chains toggle (0=off, 1=on) - ANE optimization")
+    for elim_id in [False, True]:
+        step = 1 if not elim_id else 2
+        cfg = TrialConfig(**asdict(best_cfg))
+        cfg.eliminate_identity_chains = elim_id
+        logger.log(f"[stage 9] step {step}/2 -> eliminate_identity_chains={int(elim_id)}")
+        r = eval_cfg(f"stage9_elimid_{int(elim_id)}", cfg)
+        if r.modified_avg_ms < best.modified_avg_ms:
+            best = r
+            best_cfg = cfg
+        trial_counter += 1
+    logger.log(f"[stage 9] done. best modified avg = {best.modified_avg_ms:.3f} ms")
+
+    # Stage 10: Fuse Reshape/Transpose (ANE optimization)
+    logger.log("\n[stage 10] Fuse Reshape/Transpose toggle (0=off, 1=on) - ANE optimization")
+    for fuse_rt in [False, True]:
+        step = 1 if not fuse_rt else 2
+        cfg = TrialConfig(**asdict(best_cfg))
+        cfg.fuse_reshape_transpose = fuse_rt
+        logger.log(f"[stage 10] step {step}/2 -> fuse_reshape_transpose={int(fuse_rt)}")
+        r = eval_cfg(f"stage10_fusert_{int(fuse_rt)}", cfg)
+        if r.modified_avg_ms < best.modified_avg_ms:
+            best = r
+            best_cfg = cfg
+        trial_counter += 1
+    logger.log(f"[stage 10] done. best modified avg = {best.modified_avg_ms:.3f} ms")
+
+    # Stage 11: FP16 optional
     if try_fp16:
-        logger.log("\n[stage 8] FP16 casting toggle (0=off, 1=on)")
+        logger.log("\n[stage 11] FP16 casting toggle (0=off, 1=on)")
         for i, f16 in enumerate([False, True], start=1):
             cfg = TrialConfig(**asdict(best_cfg))
             cfg.fp16 = f16
-            logger.log(f"[stage 8] step {i}/2 -> fp16={int(f16)}")
-            r = eval_cfg(f"stage8_fp16_{int(f16)}", cfg)
+            logger.log(f"[stage 11] step {i}/2 -> fp16={int(f16)}")
+            r = eval_cfg(f"stage11_fp16_{int(f16)}", cfg)
             if r.modified_avg_ms < best.modified_avg_ms:
                 best = r
                 best_cfg = cfg
             trial_counter += 1
-        logger.log(f"[stage 8] done. best modified avg = {best.modified_avg_ms:.3f} ms")
+        logger.log(f"[stage 11] done. best modified avg = {best.modified_avg_ms:.3f} ms")
 
-    # Stage 6: keep outputs if provided (test off vs on)
+    # Stage 12: keep outputs if provided (test off vs on)
     if keep_outputs:
-        logger.log("\n[stage 9] Outputs pruning toggle (0=off, 1=on)")
+        logger.log("\n[stage 12] Outputs pruning toggle (0=off, 1=on)")
         for i, keep_on in enumerate([False, True], start=1):
             cfg = TrialConfig(**asdict(best_cfg))
             cfg.keep_outputs = keep_outputs if keep_on else None
-            logger.log(f"[stage 9] step {i}/2 -> keep_outputs={'on' if keep_on else 'off'}")
-            r = eval_cfg(f"stage9_keep_{int(keep_on)}", cfg)
+            logger.log(f"[stage 12] step {i}/2 -> keep_outputs={'on' if keep_on else 'off'}")
+            r = eval_cfg(f"stage12_keep_{int(keep_on)}", cfg)
             if r.modified_avg_ms < best.modified_avg_ms:
                 best = r
                 best_cfg = cfg
             trial_counter += 1
-        logger.log(f"[stage 9] done. best modified avg = {best.modified_avg_ms:.3f} ms")
+        logger.log(f"[stage 12] done. best modified avg = {best.modified_avg_ms:.3f} ms")
 
     return results, best
 
@@ -489,28 +549,42 @@ def full_grid_search(base_model: str, input_shape: str, ep: str, warmup: int, ru
         (False, True, "pow"),
         (True, True, "both"),
     ]
+    # New ANE optimization flags
+    rm_avgpool_opts = [False, True]  # reducemean-to-avgpool
+    elim_identity_opts = [False, True]  # eliminate-identity-chains
+    fuse_rt_opts = [False, True]  # fuse-reshape-transpose
+
     fp16_opts = [False, True] if try_fp16 else [False]
     keep_opts = [None, keep_outputs] if keep_outputs else [None]
 
     # Compute total combinations for progress info
-    total = len(hs_opts) * len(sw_opts) * len(sc_opts) * len(fs_opts) * len(hsig_opts) * len(ar_opts) * len(s2g_opts) * len(fp16_opts) * len(keep_opts)
+    total = (len(hs_opts) * len(sw_opts) * len(sc_opts) * len(fs_opts) * len(hsig_opts) * len(ar_opts) *
+             len(s2g_opts) * len(rm_avgpool_opts) * len(elim_identity_opts) * len(fuse_rt_opts) *
+             len(fp16_opts) * len(keep_opts))
     logger.log(f"[tuner] Full grid: {total} combinations")
     idx = 0
-    for hs, sw, sc, fs, hsig, (dv, pw, _), s2g, fp16, ko in product(hs_opts, sw_opts, sc_opts, fs_opts, hsig_opts, ar_opts, s2g_opts, fp16_opts, keep_opts):
+    for hs, sw, sc, fs, hsig, (dv, pw, _), s2g, rm_avg, elim_id, fuse_rt, fp16, ko in product(
+        hs_opts, sw_opts, sc_opts, fs_opts, hsig_opts, ar_opts, s2g_opts,
+        rm_avgpool_opts, elim_identity_opts, fuse_rt_opts, fp16_opts, keep_opts
+    ):
         cfg = TrialConfig(
             rewrite_hardswish=hs,
             rewrite_swish=sw,
             split_concat=sc,
             fold_static_shapes=fs,
+            fold_iterations=15,  # Always use 15 iterations when folding is enabled
             rewrite_hardsigmoid=hsig,
             rewrite_div=dv,
             rewrite_pow=pw,
             rewrite_slice_to_gather=s2g,
+            reducemean_to_avgpool=rm_avg,
+            eliminate_identity_chains=elim_id,
+            fuse_reshape_transpose=fuse_rt,
             fp16=fp16,
             keep_outputs=ko,
         )
         tag = f"grid_{idx:04d}"
-        logger.log(f"[grid] {idx+1}/{total} -> {tag} hs={int(hs)} sw={int(sw)} sc={'none' if sc is None else sc} fs={int(fs)} hsig={int(hsig)} div={int(dv)} pow={int(pw)} s2g={int(s2g)} fp16={int(fp16)} keep={'on' if ko else 'off'}")
+        logger.log(f"[grid] {idx+1}/{total} -> {tag} hs={int(hs)} sw={int(sw)} sc={'none' if sc is None else sc} fs={int(fs)} hsig={int(hsig)} div={int(dv)} pow={int(pw)} s2g={int(s2g)} rm_avg={int(rm_avg)} elim_id={int(elim_id)} fuse_rt={int(fuse_rt)} fp16={int(fp16)} keep={'on' if ko else 'off'}")
         r = run_trial(base_model, input_shape, ep, warmup, runs, outdir, tag, cfg, img, extra_args, logger)
         results.append(r)
         logger.log(
@@ -567,9 +641,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 2
 
     # Prepare run dir
-    ts = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
     model_stem = Path(model).stem
-    outdir = Path(args.outdir) if args.outdir else Path("pipeline/output/auto_tune") / f"{model_stem}_{ts}"
+    outdir = Path(args.outdir) if args.outdir else Path("pipeline/output/auto_tune") / f"{model_stem}"
     outdir.mkdir(parents=True, exist_ok=True)
 
     print(f"Auto-tuning: model={model} shape={input_shape} ep={ep}")
