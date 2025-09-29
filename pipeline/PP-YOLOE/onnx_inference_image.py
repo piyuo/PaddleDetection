@@ -227,7 +227,9 @@ def get_session(onnx_path: str):
             raise
     else:
         print(f'[WARN] CoreMLExecutionProvider not available. Using default providers: {available}')
-        sess = ort.InferenceSession(onnx_path, providers=providers)
+        so = ort.SessionOptions()
+        so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        sess = ort.InferenceSession(onnx_path, sess_options=so, providers=providers)
     return sess
 
 
@@ -366,11 +368,16 @@ def main():
         else:
             print(f'[WARN] Model input "{name}" not found in preprocessed data', file=sys.stderr)
 
-    # Run
+    # Warmup (3 runs to match profile_onnx.py)
+    print('[INFO] Warming up model (3 runs)...')
+    for i in range(3):
+        sess.run(None, feed)
+
+    # Run (measure after warmup)
     t0 = time.perf_counter()
     outputs = sess.run(None, feed)
     t1 = time.perf_counter()
-    print(f'[Timing] onnxruntime sess.run: {(t1 - t0)*1000.0:.2f} ms')
+    print(f'[Timing] onnxruntime sess.run (after warmup): {(t1 - t0)*1000.0:.2f} ms')
     out_names = [o.name for o in sess.get_outputs()]
 
     # C++ Porting Guide: Critical preprocessing and model info
