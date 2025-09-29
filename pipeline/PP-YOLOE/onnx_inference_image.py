@@ -377,7 +377,6 @@ def main():
     t0 = time.perf_counter()
     outputs = sess.run(None, feed)
     t1 = time.perf_counter()
-    print(f'[Timing] onnxruntime sess.run (after warmup): {(t1 - t0)*1000.0:.2f} ms')
     out_names = [o.name for o in sess.get_outputs()]
 
     # C++ Porting Guide: Critical preprocessing and model info
@@ -597,6 +596,7 @@ def main():
             print('  - Not enough valid detections for pairwise comparison.')
 
     # Final success message with specific file path
+    print(f'[Timing] onnxruntime sess.run (after warmup): {(t1 - t0)*1000.0:.2f} ms')
     print(f'\n✅ ONNX inference completed! Generated visualization: {vis_path}')
     return
 
