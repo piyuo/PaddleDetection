@@ -689,12 +689,49 @@ def rewrite_pow_patterns(model_path: str, out_path: str) -> str:
     g = m.graph
     consts = {init.name: numpy_helper.to_array(init) for init in g.initializer}
 
+    # Also capture Constant node values (their output tensor names map to constant arrays)
+    const_node_vals = {}
+    for node in g.node:
+        if node.op_type != "Constant" or not node.output:
+            continue
+        out_name = node.output[0]
+        arr = None
+        for a in node.attribute:
+            if a.name == "value" and a.type == onnx.AttributeProto.TENSOR:
+                try:
+                    arr = numpy_helper.to_array(a.t)
+                except Exception:
+                    arr = None
+                break
+            if a.name == "value_float" and a.type == onnx.AttributeProto.FLOAT:
+                arr = np.array(a.f, dtype=np.float32)
+                break
+            if a.name == "value_floats" and a.type == onnx.AttributeProto.FLOATS:
+                arr = np.array(list(a.floats), dtype=np.float32)
+                break
+            if a.name == "value_int" and a.type == onnx.AttributeProto.INT:
+                arr = np.array(a.i, dtype=np.int64)
+                break
+            if a.name == "value_ints" and a.type == onnx.AttributeProto.INTS:
+                arr = np.array(list(a.ints), dtype=np.int64)
+                break
+        if arr is not None:
+            const_node_vals[out_name] = arr
+
     def get_scalar(v):
         arr = consts.get(v)
         if arr is None:
+            arr = const_node_vals.get(v)
+        if arr is None:
             return None
         try:
-            return float(arr.reshape(-1)[0])
+            flat = np.array(arr).reshape(-1)
+            if flat.size == 0:
+                return None
+            # If tensor has more than one element, ensure all values are equal to treat as a scalar
+            if flat.size > 1 and not np.allclose(flat, flat[0]):
+                return None
+            return float(flat[0])
         except Exception:
             return None
 
@@ -728,6 +765,13 @@ def rewrite_pow_patterns(model_path: str, out_path: str) -> str:
             continue
         if abs(c - 0.5) < 1e-6:
             new_nodes.append(helper.make_node("Sqrt", [x], out, name=unique_name(node.name + "_Sqrt")))
+            changed += 1
+            continue
+        if abs(c + 0.5) < 1e-6:
+            # Pow(x, -0.5) == 1 / sqrt(x)
+            s_out = unique_name(node.name + "_SqrtTmp")
+            new_nodes.append(helper.make_node("Sqrt", [x], [s_out], name=unique_name(node.name + "_Sqrt")))
+            new_nodes.append(helper.make_node("Reciprocal", [s_out], out, name=unique_name(node.name + "_RecipSqrt")))
             changed += 1
             continue
         if abs(c + 1.0) < 1e-6:
@@ -908,8 +952,7 @@ def main():
     parser.add_argument("--ep", type=str, default="coreml")
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--runs", type=int, default=50)
-    parser.add_argument("--img", type=str, default="", help="Path to image for realistic preprocessing (required, unless --use-demo)")
-    parser.add_argument("--use-demo", action="store_true", help="Use pipeline/dataset/demo/demo.jpg for preprocessing")
+    parser.add_argument("--img", type=str, required=True, help="Path to image for realistic preprocessing (required)")
     parser.add_argument("--outdir", type=str, default="pipeline/PP-YOLOE/models/surgery")
     parser.add_argument("--ort-profile", action="store_true", help="Enable ORT timeline profiling for both baseline and modified runs")
     parser.add_argument("--ort-profile-dir", type=str, default="pipeline/PP-YOLOE/output", help="Directory for ORT profile files")
@@ -941,16 +984,8 @@ def main():
     args = parser.parse_args()
     os.makedirs(args.outdir, exist_ok=True)
     ishape = parse_shape(args.input_shape)
-    # Resolve image requirement
-    def _repo_root():
-        return os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
-    def _default_demo_image():
-        return os.path.join(_repo_root(), 'pipeline', 'dataset', 'demo', 'demo.jpg')
-    use_img = args.img or (_default_demo_image() if args.use_demo else "")
-    if not use_img:
-        print("[ERROR] --img is required (or use --use-demo). No synthetic inputs are supported.")
-        return
-    img_path = use_img if os.path.isabs(use_img) else os.path.abspath(use_img)
+    # Resolve image requirement (no demo fallback; real image required)
+    img_path = args.img if os.path.isabs(args.img) else os.path.abspath(args.img)
     if not os.path.exists(img_path):
         print(f"[ERROR] Image not found: {img_path}")
         return

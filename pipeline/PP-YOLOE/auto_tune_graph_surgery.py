@@ -127,6 +127,7 @@ _RE_COREML_PARTS = re.compile(r"CoreML.*partitions.*?:\s*(\d+)", re.IGNORECASE)
 
 def run_trial(base_model: str, input_shape: str, ep: str, warmup: int, runs: int,
               outdir: Path, trial_name: str, cfg: TrialConfig,
+              img: Optional[str] = None,
               extra_args: Optional[List[str]] = None,
               logger: Optional[TunerLogger] = None) -> TrialResult:
     trial_outdir = outdir / trial_name
@@ -141,6 +142,8 @@ def run_trial(base_model: str, input_shape: str, ep: str, warmup: int, runs: int
         "--runs", str(runs),
         "--outdir", str(trial_outdir),
     ] + cfg.to_flags()
+    if img:
+        cmd += ["--img", img]
     if extra_args:
         cmd += extra_args
 
@@ -148,6 +151,8 @@ def run_trial(base_model: str, input_shape: str, ep: str, warmup: int, runs: int
     if logger:
         logger.log(f"[trial] {trial_name}")
         logger.log(f"        flags: {' '.join(cfg.to_flags())}")
+        if img:
+            logger.log(f"        img: {img}")
         if extra_args:
             logger.log(f"        extra_args: {' '.join(extra_args)}")
 
@@ -272,12 +277,13 @@ def copy_best_artifacts(best: TrialResult, outdir: Path) -> None:
 
 def greedy_staged_search(base_model: str, input_shape: str, ep: str, warmup: int, runs: int,
                          outdir: Path, keep_outputs: Optional[str], split_candidates: List[int],
-                         try_fp16: bool, extra_args: Optional[List[str]], logger: TunerLogger) -> Tuple[List[TrialResult], TrialResult]:
+                         try_fp16: bool, extra_args: Optional[List[str]], logger: TunerLogger,
+                         img: Optional[str] = None) -> Tuple[List[TrialResult], TrialResult]:
     results: List[TrialResult] = []
     best_cfg = TrialConfig()
 
     def eval_cfg(name: str, cfg: TrialConfig) -> TrialResult:
-        r = run_trial(base_model, input_shape, ep, warmup, runs, outdir, name, cfg, extra_args, logger)
+        r = run_trial(base_model, input_shape, ep, warmup, runs, outdir, name, cfg, img, extra_args, logger)
         results.append(r)
         # Immediate feedback on metrics
         logger.log(
@@ -466,7 +472,8 @@ def greedy_staged_search(base_model: str, input_shape: str, ep: str, warmup: int
 
 def full_grid_search(base_model: str, input_shape: str, ep: str, warmup: int, runs: int,
                      outdir: Path, keep_outputs: Optional[str], split_candidates: List[int],
-                     try_fp16: bool, extra_args: Optional[List[str]], logger: TunerLogger) -> Tuple[List[TrialResult], TrialResult]:
+                     try_fp16: bool, extra_args: Optional[List[str]], logger: TunerLogger,
+                     img: Optional[str] = None) -> Tuple[List[TrialResult], TrialResult]:
     results: List[TrialResult] = []
     best: Optional[TrialResult] = None
 
@@ -504,7 +511,7 @@ def full_grid_search(base_model: str, input_shape: str, ep: str, warmup: int, ru
         )
         tag = f"grid_{idx:04d}"
         logger.log(f"[grid] {idx+1}/{total} -> {tag} hs={int(hs)} sw={int(sw)} sc={'none' if sc is None else sc} fs={int(fs)} hsig={int(hsig)} div={int(dv)} pow={int(pw)} s2g={int(s2g)} fp16={int(fp16)} keep={'on' if ko else 'off'}")
-        r = run_trial(base_model, input_shape, ep, warmup, runs, outdir, tag, cfg, extra_args, logger)
+        r = run_trial(base_model, input_shape, ep, warmup, runs, outdir, tag, cfg, img, extra_args, logger)
         results.append(r)
         logger.log(
             f"[result] {tag}: modified={r.modified_avg_ms:.3f} ms, baseline={r.baseline_avg_ms:.3f} ms, "
@@ -525,6 +532,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument("--ep", default="coreml", help="Execution provider: coreml/cpu/cuda/etc.")
     p.add_argument("--warmup", type=int, default=3)
     p.add_argument("--runs", type=int, default=10)
+    p.add_argument("--img", default=None, help="Path to a real image for benchmarking; forwarded to graph_surgery_compare.py")
     p.add_argument("--outdir", default=None, help="Output directory for the tuning run")
     p.add_argument("--keep-outputs", default=None, help="Comma-separated output tensor names to keep; if set, tuner will try both with and without keeping")
     p.add_argument("--split-candidates", default="10,8,6", help="Comma-separated list of max inputs for Concat split sweep")
@@ -542,6 +550,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     ep = args.ep
     warmup = int(args.warmup)
     runs = int(args.runs)
+    img = args.img
     keep_outputs = args.keep_outputs
     try_fp16 = not args.no_fp16
     split_candidates = [int(x) for x in str(args.split_candidates).split(',') if x]
@@ -569,9 +578,9 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     logger = TunerLogger(outdir)
     if args.full_grid:
-        results, best = full_grid_search(model, input_shape, ep, warmup, runs, outdir, keep_outputs, split_candidates, try_fp16, extra_args, logger)
+        results, best = full_grid_search(model, input_shape, ep, warmup, runs, outdir, keep_outputs, split_candidates, try_fp16, extra_args, logger, img)
     else:
-        results, best = greedy_staged_search(model, input_shape, ep, warmup, runs, outdir, keep_outputs, split_candidates, try_fp16, extra_args, logger)
+        results, best = greedy_staged_search(model, input_shape, ep, warmup, runs, outdir, keep_outputs, split_candidates, try_fp16, extra_args, logger, img)
 
     # Summarize
     results_sorted = sorted(results, key=lambda r: r.modified_avg_ms)
