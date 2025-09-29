@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Enhanced graph surgery for PP-YOLOE ONNX with aggressive ANE-targeted optimizations.
+Coreml graph surgery for PP-YOLOE ONNX with aggressive ANE-targeted optimizations.
 
 New optimizations targeting CoreML ANE acceleration:
 - ReduceMean -> GlobalAveragePool/AvgPool conversion
