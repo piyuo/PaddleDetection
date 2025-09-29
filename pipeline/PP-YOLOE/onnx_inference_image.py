@@ -214,8 +214,11 @@ def get_session(onnx_path: str):
             ]
         print('[INFO] Using CoreMLExecutionProvider (Apple Core ML) with options:', coreml_opts)
         try:
+            so = ort.SessionOptions()
+            so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+
             sess = ort.InferenceSession(
-                onnx_path,
+                onnx_path, sess_options=so,
                 providers=providers,
             )
         except Exception as e:
