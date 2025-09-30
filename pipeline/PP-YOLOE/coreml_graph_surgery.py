@@ -3,10 +3,7 @@
 Coreml graph surgery for PP-YOLOE ONNX with aggressive ANE-targeted optimizations.
 
 New optimizations targeting CoreML ANE acceleration:
-- ReduceMean -> GlobalAveragePool/AvgPool conversion
 - Aggressive constant folding (15 iterations)
-- Identity chain elimination
-- Reshape/Transpose chain simplification
 - Enhanced ANE compatibility analysis
 """
 import argparse
@@ -843,276 +840,6 @@ def rewrite_slice_to_gather(model_path: str, out_path: str) -> str:
 
 # NEW OPTIMIZATIONS FOR ANE
 
-def rewrite_reducemean_to_avgpool(model_path: str, out_path: str) -> str:
-    """Convert spatial ReduceMean to GlobalAveragePool or AvgPool (ANE-optimized)."""
-    m = onnx.load(model_path)
-    g = m.graph
-
-    # Get value info for shapes
-    value_shapes = {}
-    for vi in list(g.input) + list(g.value_info) + list(g.output):
-        try:
-            shp = []
-            tt = vi.type.tensor_type
-            for d in tt.shape.dim:
-                if d.dim_value:
-                    shp.append(int(d.dim_value))
-                else:
-                    shp.append(None)
-            value_shapes[vi.name] = shp
-        except Exception:
-            pass
-
-    def unique_name(base: str) -> str:
-        idx = 0
-        existing = {n.name for n in g.node}
-        existing.update({vi.name for vi in list(g.input) + list(g.output)})
-        existing.update({init.name for init in g.initializer})
-        name = f"{base}__{idx}"
-        while name in existing:
-            idx += 1
-            name = f"{base}__{idx}"
-        return name
-
-    new_nodes: List[onnx.NodeProto] = []
-    nodes_to_remove: List[onnx.NodeProto] = []
-    changed = 0
-
-    for node in g.node:
-        if node.op_type != "ReduceMean":
-            continue
-
-        axes = None
-        keepdims = 1
-        for a in node.attribute:
-            if a.name == "axes":
-                axes = list(a.ints) if a.ints else None
-            if a.name == "keepdims":
-                keepdims = int(a.i)
-
-        if axes is None:
-            continue
-
-        input_name = node.input[0]
-        output_name = node.output[0]
-        input_shape = value_shapes.get(input_name)
-
-        # Pattern 1: ReduceMean on axes [2,3] (spatial H,W) for 4D tensor -> GlobalAveragePool
-        if input_shape and len(input_shape) == 4 and set(axes) == {2, 3}:
-            gap_out = output_name if keepdims else unique_name(node.name + "_gap")
-            gap_node = helper.make_node(
-                "GlobalAveragePool",
-                [input_name],
-                [gap_out],
-                name=unique_name(node.name + "_GAP")
-            )
-            new_nodes.append(gap_node)
-
-            # If keepdims=0, need to squeeze out H,W dims
-            if not keepdims:
-                # Create axes constant for Squeeze (opset >= 13 uses input instead of attribute)
-                axes_name = unique_name(node.name + "_squeeze_axes")
-                axes_tensor = numpy_helper.from_array(np.array([2, 3], dtype=np.int64), name=axes_name)
-                g.initializer.extend([axes_tensor])
-
-                squeeze_node = helper.make_node(
-                    "Squeeze",
-                    [gap_out, axes_name],
-                    [output_name],
-                    name=unique_name(node.name + "_Squeeze")
-                )
-                new_nodes.append(squeeze_node)
-
-            nodes_to_remove.append(node)
-            changed += 1
-            continue
-
-        # Pattern 2: ReduceMean on single spatial axis -> AveragePool with kernel covering that dimension
-        # This is more complex and may not always be beneficial, so we're conservative
-
-    if changed == 0:
-        onnx.save(m, out_path)
-        return out_path
-
-    kept = [n for n in g.node if n not in nodes_to_remove]
-    kept.extend(new_nodes)
-    del g.node[:]
-    g.node.extend(kept)
-    onnx.save(m, out_path)
-    print(f"Rewrote ReduceMean -> GlobalAveragePool: {changed} node(s)")
-    return out_path
-
-
-def eliminate_identity_chains(model_path: str, out_path: str) -> str:
-    """Eliminate long chains of Identity nodes by directly connecting producers to consumers."""
-    m = onnx.load(model_path)
-    g = m.graph
-
-    # Build producer map
-    producer = {}
-    for node in g.node:
-        for out in node.output:
-            producer[out] = node
-
-    # Find Identity chains
-    def trace_identity_chain(tensor_name: str) -> str:
-        """Follow Identity chain to find the original source tensor."""
-        visited = set()
-        current = tensor_name
-        while current not in visited:
-            visited.add(current)
-            prod = producer.get(current)
-            if prod is None or prod.op_type != "Identity":
-                return current
-            if len(prod.input) != 1:
-                return current
-            current = prod.input[0]
-        return tensor_name  # Cycle detected, return original
-
-    # Rewrite all tensor references
-    tensor_map = {}
-    for node in g.node:
-        for inp in node.input:
-            source = trace_identity_chain(inp)
-            if source != inp:
-                tensor_map[inp] = source
-
-    # Apply rewrites
-    changed_nodes = 0
-    for node in g.node:
-        rewrote = False
-        new_inputs = []
-        for inp in node.input:
-            if inp in tensor_map:
-                new_inputs.append(tensor_map[inp])
-                rewrote = True
-            else:
-                new_inputs.append(inp)
-        if rewrote:
-            del node.input[:]
-            node.input.extend(new_inputs)
-            changed_nodes += 1
-
-    # Remove dead Identity nodes
-    output_names = {o.name for o in g.output}
-    consumers = {}
-    for node in g.node:
-        for inp in node.input:
-            consumers.setdefault(inp, []).append(node)
-
-    kept = []
-    removed_identities = 0
-    for node in g.node:
-        if node.op_type == "Identity":
-            out = node.output[0]
-            # Keep if it's a graph output
-            if out in output_names:
-                kept.append(node)
-            # Keep if it still has consumers
-            elif out in consumers and consumers[out]:
-                kept.append(node)
-            else:
-                removed_identities += 1
-        else:
-            kept.append(node)
-
-    if removed_identities == 0:
-        onnx.save(m, out_path)
-        return out_path
-
-    del g.node[:]
-    g.node.extend(kept)
-    onnx.save(m, out_path)
-    print(f"Eliminated Identity chains: {removed_identities} Identity node(s) removed, {changed_nodes} node(s) rewired")
-    return out_path
-
-
-def fuse_reshape_transpose_chains(model_path: str, out_path: str) -> str:
-    """Eliminate redundant Reshape/Transpose sequences."""
-    m = onnx.load(model_path)
-    g = m.graph
-
-    producer = {}
-    for node in g.node:
-        for out in node.output:
-            producer[out] = node
-
-    consts = {init.name: numpy_helper.to_array(init) for init in g.initializer}
-
-    def unique_name(base: str) -> str:
-        idx = 0
-        existing = {n.name for n in g.node}
-        existing.update({vi.name for vi in list(g.input) + list(g.output)})
-        existing.update({init.name for init in g.initializer})
-        name = f"{base}__{idx}"
-        while name in existing:
-            idx += 1
-            name = f"{base}__{idx}"
-        return name
-
-    new_nodes: List[onnx.NodeProto] = []
-    nodes_to_remove: List[onnx.NodeProto] = []
-    changed = 0
-
-    # Pattern: Transpose -> Transpose (inverse) = Identity
-    for node in g.node:
-        if node.op_type != "Transpose":
-            continue
-
-        perm1 = None
-        for a in node.attribute:
-            if a.name == "perm":
-                perm1 = list(a.ints)
-                break
-        if perm1 is None:
-            continue
-
-        # Check if consumer is also Transpose
-        consumers = [n for n in g.node if node.output[0] in n.input]
-        if len(consumers) != 1:
-            continue
-
-        consumer = consumers[0]
-        if consumer.op_type != "Transpose":
-            continue
-
-        perm2 = None
-        for a in consumer.attribute:
-            if a.name == "perm":
-                perm2 = list(a.ints)
-                break
-        if perm2 is None:
-            continue
-
-        # Check if perm2 is inverse of perm1
-        if len(perm1) != len(perm2):
-            continue
-
-        composed = [perm1[i] for i in perm2]
-        if composed == list(range(len(composed))):
-            # This is identity! Replace with direct connection
-            identity_node = helper.make_node(
-                "Identity",
-                [node.input[0]],
-                list(consumer.output),
-                name=unique_name(node.name + "_fused_id")
-            )
-            new_nodes.append(identity_node)
-            nodes_to_remove.extend([node, consumer])
-            changed += 1
-
-    if changed == 0:
-        onnx.save(m, out_path)
-        return out_path
-
-    kept = [n for n in g.node if n not in nodes_to_remove]
-    kept.extend(new_nodes)
-    del g.node[:]
-    g.node.extend(kept)
-    onnx.save(m, out_path)
-    print(f"Fused Reshape/Transpose chains: {changed} pattern(s)")
-    return out_path
-
 
 def analyze_ane_compatibility(profile_summary: Dict) -> None:
     """Analyze and report ops most likely blocking ANE execution."""
@@ -1142,12 +869,6 @@ def analyze_ane_compatibility(profile_summary: Dict) -> None:
     op_names = {op for op, _, _ in cpu_ops[:15]}
     suggestions = []
 
-    if "ReduceMean" in op_names:
-        suggestions.append("  → Try --reducemean-to-avgpool to convert spatial ReduceMean to GlobalAveragePool")
-    if "Reshape" in op_names or "Transpose" in op_names:
-        suggestions.append("  → Try --fuse-reshape-transpose to eliminate redundant layout changes")
-    if "Identity" in op_names:
-        suggestions.append("  → Identity chains detected (already using --eliminate-identity-chains)")
     if "Slice" in op_names:
         suggestions.append("  → Try --rewrite-slice-to-gather for simple slicing patterns")
     if "NonMaxSuppression" in op_names:
@@ -1194,9 +915,6 @@ def main():
     parser.add_argument("--rewrite-slice-to-gather", action="store_true", help="Rewrite Slice to Gather")
 
     # NEW FLAGS
-    parser.add_argument("--reducemean-to-avgpool", action="store_true", help="Convert ReduceMean to GlobalAveragePool (ANE-optimized)")
-    parser.add_argument("--eliminate-identity-chains", action="store_true", help="Remove redundant Identity node chains")
-    parser.add_argument("--fuse-reshape-transpose", action="store_true", help="Fuse inverse Reshape/Transpose pairs")
     parser.add_argument("--aggressive-mode", action="store_true", help="Enable all ANE optimizations")
     parser.add_argument("--output-model", type=str, help="Path to copy final optimized model to")
 
@@ -1212,9 +930,6 @@ def main():
         args.rewrite_pow = True
         args.rewrite_slice_to_gather = True
         args.fold_static_shapes = True
-        args.reducemean_to_avgpool = True
-        args.eliminate_identity_chains = True
-        args.fuse_reshape_transpose = True
         if not args.split_concat:
             args.split_concat = 4
         print("[Aggressive mode enabled - all ANE optimizations active]")
@@ -1276,18 +991,6 @@ def main():
         modC = os.path.join(args.outdir, os.path.basename(args.model).replace('.onnx', '_splitconcat.onnx'))
         work_path = split_large_concats(work_path, modC, max_inputs=int(args.split_concat))
 
-    # NEW: ReduceMean -> AvgPool
-    if args.reducemean_to_avgpool:
-        print("[stage] Converting ReduceMean to GlobalAveragePool…")
-        modRM = os.path.join(args.outdir, os.path.basename(args.model).replace('.onnx', '_reducemean.onnx'))
-        work_path = rewrite_reducemean_to_avgpool(work_path, modRM)
-
-    # NEW: Fuse Reshape/Transpose
-    if args.fuse_reshape_transpose:
-        print("[stage] Fusing Reshape/Transpose chains…")
-        modRT = os.path.join(args.outdir, os.path.basename(args.model).replace('.onnx', '_fuseRT.onnx'))
-        work_path = fuse_reshape_transpose_chains(work_path, modRT)
-
     # Re-run shape inference after structural rewrites
     if not args.no_shape_infer:
         print("[stage] Running shape inference (post-rewrite)…")
@@ -1318,12 +1021,6 @@ def main():
         print("[stage] Rewriting simple Slice -> Gather…")
         modSG = os.path.join(args.outdir, os.path.basename(args.model).replace('.onnx', '_slice2gather.onnx'))
         work_path = rewrite_slice_to_gather(work_path, modSG)
-
-    # NEW: Eliminate Identity chains
-    if args.eliminate_identity_chains:
-        print("[stage] Eliminating Identity chains…")
-        modID = os.path.join(args.outdir, os.path.basename(args.model).replace('.onnx', '_no_identity.onnx'))
-        work_path = eliminate_identity_chains(work_path, modID)
 
     if args.keep_outputs:
         keep = [s.strip() for s in args.keep_outputs.split(",") if s.strip()]
