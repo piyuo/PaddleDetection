@@ -134,82 +134,6 @@ def cast_graph_to_fp16(model_path: str, out_path: str) -> str:
     return out_path
 
 
-def rewrite_hardswish(model_path: str, out_path: str) -> str:
-    """Replace HardSwish nodes with x * Clip(x + 3, 0, 6) * (1/6)."""
-    m = onnx.load(model_path)
-    g = m.graph
-    changed = 0
-
-    def unique_name(base: str) -> str:
-        idx = 0
-        existing = {n.name for n in g.node}
-        existing.update({init.name for init in g.initializer})
-        existing.update({vi.name for vi in list(g.input) + list(g.output)})
-        name = f"{base}__{idx}"
-        while name in existing:
-            idx += 1
-            name = f"{base}__{idx}"
-        return name
-
-    new_nodes: List[onnx.NodeProto] = []
-    nodes_to_remove: List[onnx.NodeProto] = []
-
-    for node in g.node:
-        if node.op_type != "HardSwish":
-            continue
-        x = node.input[0]
-        y = node.output[0]
-
-        c3_name = unique_name("hardswish_c3")
-        c3_tensor = numpy_helper.from_array(np.array(3.0, dtype=np.float32), name=c3_name)
-        g.initializer.extend([c3_tensor])
-
-        c0_name = unique_name("hardswish_c0")
-        c0_tensor = numpy_helper.from_array(np.array(0.0, dtype=np.float32), name=c0_name)
-        g.initializer.extend([c0_tensor])
-
-        c6_name = unique_name("hardswish_c6")
-        c6_tensor = numpy_helper.from_array(np.array(6.0, dtype=np.float32), name=c6_name)
-        g.initializer.extend([c6_tensor])
-
-        cscale_name = unique_name("hardswish_c1_div6")
-        cscale_tensor = numpy_helper.from_array(np.array(1.0 / 6.0, dtype=np.float32), name=cscale_name)
-        g.initializer.extend([cscale_tensor])
-
-        add_out = unique_name(node.name + "_add3")
-        add_node = helper.make_node("Add", [x, c3_name], [add_out], name=unique_name(node.name + "_Add"))
-
-        clip_out = unique_name(node.name + "_clip")
-        clip_node = helper.make_node("Clip", [add_out, c0_name, c6_name], [clip_out], name=unique_name(node.name + "_Clip"))
-
-        mul1_out = unique_name(node.name + "_mul1")
-        mul1_node = helper.make_node("Mul", [x, clip_out], [mul1_out], name=unique_name(node.name + "_Mul1"))
-
-        mul2_node = helper.make_node("Mul", [mul1_out, cscale_name], [y], name=unique_name(node.name + "_Mul2"))
-
-        new_nodes.extend([add_node, clip_node, mul1_node, mul2_node])
-        nodes_to_remove.append(node)
-        changed += 1
-
-    if changed == 0:
-        onnx.save(m, out_path)
-        return out_path
-
-    rebuilt: List[onnx.NodeProto] = []
-    for node in g.node:
-        if node in nodes_to_remove:
-            continue
-        rebuilt.append(node)
-    rebuilt.extend(new_nodes)
-    del g.node[:]
-    g.node.extend(rebuilt)
-
-    onnx.save(m, out_path)
-    print(f"Rewrote HardSwish -> Add+Clip+Mul: {changed} node(s)")
-    return out_path
-
-
-
 def split_large_concats(model_path: str, out_path: str, max_inputs: int = 8) -> str:
     """Split Concat nodes with too many inputs into a tree of smaller Concat nodes."""
     assert max_inputs >= 2
@@ -815,7 +739,6 @@ def main():
     parser.add_argument("--fp16", action="store_true", help="Attempt FP16 casting")
     parser.add_argument("--fix-input-shapes", action="store_true", help="Rewrite graph inputs to static shapes")
     parser.add_argument("--no-optimizer", action="store_true", help="Disable onnxoptimizer passes")
-    parser.add_argument("--rewrite-hardswish", action="store_true", help="Rewrite HardSwish to Add+Clip+Mul")
     parser.add_argument("--split-concat", type=int, default=0, help="Split large Concat nodes")
     parser.add_argument("--fold-static-shapes", action="store_true", help="Fold shape computation chains")
     parser.add_argument("--fold-iterations", type=int, default=15, help="Iterations for constant folding (default: 15)")
@@ -834,8 +757,6 @@ def main():
     # Aggressive mode enables all optimizations
     if args.aggressive_mode:
         args.fix_input_shapes = True
-        args.rewrite_hardswish = True
-        args.rewrite_swish = True
         args.rewrite_hardsigmoid = True
         args.rewrite_div = True
         args.rewrite_pow = True
@@ -887,10 +808,6 @@ def main():
         mod2 = mod_path.replace("_mod.onnx", "_shape.onnx")
         work_path = shape_infer_model(work_path, mod2)
 
-    if args.rewrite_hardswish:
-        print("[stage] Rewriting HardSwish nodes…")
-        modH = os.path.join(args.outdir, os.path.basename(args.model).replace('.onnx', '_hardswish.onnx'))
-        work_path = rewrite_hardswish(work_path, modH)
 
 
     if args.split_concat and args.split_concat > 0:

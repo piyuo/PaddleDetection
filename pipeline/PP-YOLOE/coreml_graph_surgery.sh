@@ -2,8 +2,6 @@
 #!/usr/bin/env bash
 
 #--ort-profile --ort-profile-dir pipeline/output \
-#--rewrite-swish
-#--rewrite-hardswish
 
 python3 pipeline/PP-YOLOE/coreml_graph_surgery.py \
 --model pipeline/PP-YOLOE/models/ppyoloe_crn_s_36e_pphuman_embed.onnx \
