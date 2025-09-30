@@ -209,94 +209,6 @@ def rewrite_hardswish(model_path: str, out_path: str) -> str:
     return out_path
 
 
-def rewrite_swish_to_hardswish(model_path: str, out_path: str) -> str:
-    """Detect Swish/SiLU patterns (x * Sigmoid(x)) and rewrite into Add+Clip+Mul style."""
-    m = onnx.load(model_path)
-    g = m.graph
-
-    producer = {}
-    for node in g.node:
-        for out in node.output:
-            producer[out] = node
-
-    def unique_name(base: str) -> str:
-        idx = 0
-        existing = {n.name for n in g.node}
-        existing.update({vi.name for vi in list(g.input) + list(g.output)})
-        existing.update({init.name for init in g.initializer})
-        name = f"{base}__{idx}"
-        while name in existing:
-            idx += 1
-            name = f"{base}__{idx}"
-        return name
-
-    new_nodes: List[onnx.NodeProto] = []
-    nodes_to_remove: List[onnx.NodeProto] = []
-    changed = 0
-
-    for node in g.node:
-        if node.op_type != "Mul" or len(node.input) != 2:
-            continue
-        a, b = node.input
-        pa = producer.get(a)
-        pb = producer.get(b)
-
-        def is_sigmoid_of_x(pnode, xname):
-            return pnode is not None and pnode.op_type == "Sigmoid" and len(pnode.input) == 1 and pnode.input[0] == xname
-
-        if is_sigmoid_of_x(pa, b):
-            x = b
-        elif is_sigmoid_of_x(pb, a):
-            x = a
-        else:
-            continue
-
-        y = node.output[0]
-
-        c3_name = unique_name("swish_c3")
-        c0_name = unique_name("swish_c0")
-        c6_name = unique_name("swish_c6")
-        cscale_name = unique_name("swish_c1_div6")
-        for nm, val in [
-            (c3_name, 3.0),
-            (c0_name, 0.0),
-            (c6_name, 6.0),
-            (cscale_name, 1.0/6.0),
-        ]:
-            g.initializer.extend([numpy_helper.from_array(np.array(val, dtype=np.float32), name=nm)])
-
-        add_out = unique_name(node.name + "_add3")
-        add_node = helper.make_node("Add", [x, c3_name], [add_out], name=unique_name(node.name + "_Add"))
-
-        clip_out = unique_name(node.name + "_clip")
-        clip_node = helper.make_node("Clip", [add_out, c0_name, c6_name], [clip_out], name=unique_name(node.name + "_Clip"))
-
-        mul1_out = unique_name(node.name + "_mul1")
-        mul1_node = helper.make_node("Mul", [x, clip_out], [mul1_out], name=unique_name(node.name + "_Mul1"))
-
-        mul2_node = helper.make_node("Mul", [mul1_out, cscale_name], [y], name=unique_name(node.name + "_Mul2"))
-
-        new_nodes.extend([add_node, clip_node, mul1_node, mul2_node])
-        nodes_to_remove.append(node)
-        changed += 1
-
-    if changed == 0:
-        onnx.save(m, out_path)
-        return out_path
-
-    kept: List[onnx.NodeProto] = []
-    for n in g.node:
-        if n in nodes_to_remove:
-            continue
-        kept.append(n)
-    kept.extend(new_nodes)
-    del g.node[:]
-    g.node.extend(kept)
-
-    onnx.save(m, out_path)
-    print(f"Rewrote Swish/SiLU -> Add+Clip+Mul: {changed} node(s)")
-    return out_path
-
 
 def split_large_concats(model_path: str, out_path: str, max_inputs: int = 8) -> str:
     """Split Concat nodes with too many inputs into a tree of smaller Concat nodes."""
@@ -910,7 +822,6 @@ def main():
     parser.add_argument("--keep-outputs", type=str, default="", help="Comma-separated outputs to keep")
     parser.add_argument("--rewrite-div", action="store_true", help="Rewrite Div to Mul with reciprocal")
     parser.add_argument("--rewrite-pow", action="store_true", help="Rewrite Pow patterns")
-    parser.add_argument("--rewrite-swish", action="store_true", help="Rewrite Swish to HardSwish-style")
     parser.add_argument("--rewrite-hardsigmoid", action="store_true", help="Rewrite HardSigmoid to Mul+Add+Clip")
     parser.add_argument("--rewrite-slice-to-gather", action="store_true", help="Rewrite Slice to Gather")
 
@@ -981,10 +892,6 @@ def main():
         modH = os.path.join(args.outdir, os.path.basename(args.model).replace('.onnx', '_hardswish.onnx'))
         work_path = rewrite_hardswish(work_path, modH)
 
-    if args.rewrite_swish:
-        print("[stage] Rewriting Swish/SiLU to HardSwish-style…")
-        modHS = os.path.join(args.outdir, os.path.basename(args.model).replace('.onnx', '_swish2hs.onnx'))
-        work_path = rewrite_swish_to_hardswish(work_path, modHS)
 
     if args.split_concat and args.split_concat > 0:
         print(f"[stage] Splitting large Concat nodes (max_inputs={args.split_concat})…")
