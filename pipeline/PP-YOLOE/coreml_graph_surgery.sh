@@ -20,6 +20,7 @@ python3 pipeline/PP-YOLOE/coreml_graph_surgery.py \
 --remove-noop-slice \
 --rewrite-reduce-to-globalpool \
 --fp16 \
+--rewrite-slice-range-to-gather \
 --ort-profile --ort-profile-dir pipeline/output \
 --output-model pipeline/PP-YOLOE/models/ppyoloe_crn_s_36e_pphuman_embed_ane.onnx
 

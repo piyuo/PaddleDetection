@@ -677,6 +677,106 @@ def rewrite_slice_to_gather(model_path: str, out_path: str) -> str:
 # NEW OPTIMIZATIONS FOR ANE
 
 
+def rewrite_slice_range_to_gather(model_path: str, out_path: str) -> str:
+    """Rewrite Slice with static scalar range (start/end) and step=1 into a Gather with constant indices.
+
+    Notes:
+    - Handles only single-axis slices with scalar (or size-1) starts/ends/axis/step.
+    - Skips negative or decreasing ranges and non-unit steps.
+    - Prefer to run this BEFORE the single-element rewrite to catch ranges >= 2.
+    """
+    m = onnx.load(model_path)
+    g = m.graph
+    consts = {init.name: numpy_helper.to_array(init) for init in g.initializer}
+
+    def unique_name(base: str) -> str:
+        idx = 0
+        existing = {n.name for n in g.node}
+        existing.update({vi.name for vi in list(g.input) + list(g.output)})
+        existing.update({init.name for init in g.initializer})
+        name = f"{base}__{idx}"
+        while name in existing:
+            idx += 1
+            name = f"{base}__{idx}"
+        return name
+
+    def as_scalar_int(arr):
+        if arr is None:
+            return None
+        try:
+            a = np.array(arr).astype(np.int64)
+            if a.size != 1:
+                return None
+            return int(a.reshape(-1)[0])
+        except Exception:
+            return None
+
+    new_nodes: List[onnx.NodeProto] = []
+    nodes_to_remove: List[onnx.NodeProto] = []
+    changed = 0
+
+    for node in g.node:
+        if node.op_type != "Slice" or len(node.input) < 3:
+            continue
+
+        data, starts, ends = node.input[:3]
+        axes = node.input[3] if len(node.input) >= 4 else None
+        steps = node.input[4] if len(node.input) >= 5 else None
+
+        s_val = consts.get(starts)
+        e_val = consts.get(ends)
+        ax_val = consts.get(axes) if axes else None
+        st_val = consts.get(steps) if steps else None
+
+        s = as_scalar_int(s_val)
+        e = as_scalar_int(e_val)
+        ax = as_scalar_int(ax_val) if ax_val is not None else 0
+        st = as_scalar_int(st_val) if st_val is not None else 1
+
+        # Require scalar constants and step==1
+        if s is None or e is None:
+            continue
+        if st != 1:
+            continue
+        # Only handle forward, non-empty ranges with length >= 2
+        if e is None or s is None or e <= s:
+            continue
+        if (e - s) < 2:
+            # Let single-element handler manage this case
+            continue
+        # Avoid negative starts/ends (can't normalize without input shape)
+        if s < 0 or e < 0:
+            continue
+
+        # Build indices initializer for Gather
+        indices = np.arange(s, e, 1, dtype=np.int64)
+        idx_name = unique_name(node.name + "_gather_indices")
+        g.initializer.extend([numpy_helper.from_array(indices, name=idx_name)])
+
+        gather_node = helper.make_node(
+            "Gather",
+            inputs=[data, idx_name],
+            outputs=list(node.output),
+            name=unique_name(node.name + "_to_GatherRange"),
+            axis=int(ax) if ax is not None else 0,
+        )
+        new_nodes.append(gather_node)
+        nodes_to_remove.append(node)
+        changed += 1
+
+    if changed == 0:
+        onnx.save(m, out_path)
+        return out_path
+
+    kept = [n for n in g.node if n not in nodes_to_remove]
+    kept.extend(new_nodes)
+    del g.node[:]
+    g.node.extend(kept)
+    onnx.save(m, out_path)
+    print(f"Rewrote Slice (range, step=1) -> Gather: {changed} node(s)")
+    return out_path
+
+
 def rewrite_resize_to_static(model_path: str, out_path: str) -> str:
     """Rewrite Resize nodes to use static 'sizes' based on inferred output shapes.
 
@@ -1050,6 +1150,7 @@ def main():
     parser.add_argument("--rewrite-div", action="store_true", help="Rewrite Div to Mul with reciprocal")
     parser.add_argument("--rewrite-pow", action="store_true", help="Rewrite Pow patterns")
     parser.add_argument("--rewrite-hardsigmoid", action="store_true", help="Rewrite HardSigmoid to Mul+Add+Clip")
+    parser.add_argument("--rewrite-slice-range-to-gather", action="store_true", help="Rewrite range Slice (step=1) to Gather with indices")
     parser.add_argument("--rewrite-slice-to-gather", action="store_true", help="Rewrite Slice to Gather")
     parser.add_argument("--rewrite-resize-to-static", action="store_true", help="Replace dynamic Resize with static sizes")
     parser.add_argument("--rewrite-reduce-to-globalpool", action="store_true", help="Rewrite ReduceMean/ReduceMax over H,W to GlobalPool")
@@ -1067,6 +1168,7 @@ def main():
         args.rewrite_hardsigmoid = True
         args.rewrite_div = True
         args.rewrite_pow = True
+        args.rewrite_slice_range_to_gather = True
         args.rewrite_slice_to_gather = True
         args.rewrite_resize_to_static = True
         args.rewrite_reduce_to_globalpool = True
@@ -1150,6 +1252,11 @@ def main():
         print("[stage] Rewriting Pow patterns…")
         modW = os.path.join(args.outdir, os.path.basename(args.model).replace('.onnx', '_powrew.onnx'))
         work_path = rewrite_pow_patterns(work_path, modW)
+
+    if args.rewrite_slice_range_to_gather:
+        print("[stage] Rewriting range Slice -> Gather…")
+        modSGR = os.path.join(args.outdir, os.path.basename(args.model).replace('.onnx', '_slice2gather_range.onnx'))
+        work_path = rewrite_slice_range_to_gather(work_path, modSGR)
 
     if args.rewrite_slice_to_gather:
         print("[stage] Rewriting simple Slice -> Gather…")
