@@ -134,6 +134,86 @@ def cast_graph_to_fp16(model_path: str, out_path: str) -> str:
     return out_path
 
 
+def clean_unused_tensors(model_path: str, out_path: str, drop_unused_inputs: bool = False) -> str:
+    """Remove unused initializers, dead Constant nodes, and stray value_info entries.
+
+    This mirrors ORT's CleanUnusedInitializersAndNodeArgs so applying it here
+    prevents warnings and slightly reduces the model size.
+
+    - Conservative: does not traverse subgraphs (If/Loop/Scan).
+    - Keeps any tensors that are graph outputs.
+    - Optionally drops graph inputs that have no consumers.
+    """
+    m = onnx.load(model_path)
+    g = m.graph
+
+    # Build set of names consumed by nodes or required as graph outputs
+    consumers: Set[str] = set()
+    for n in g.node:
+        for i in n.input:
+            if i:
+                consumers.add(i)
+    graph_output_names = {o.name for o in g.output}
+    consumers |= graph_output_names
+
+    # Remove Constant nodes with outputs that no one consumes
+    kept_nodes: List[onnx.NodeProto] = []
+    removed_const = 0
+    for n in g.node:
+        if n.op_type == "Constant" and n.output and all((o not in consumers) for o in n.output):
+            removed_const += 1
+            continue
+        kept_nodes.append(n)
+
+    # Recompute consumers after removing some constants
+    consumers.clear()
+    for n in kept_nodes:
+        for i in n.input:
+            if i:
+                consumers.add(i)
+    consumers |= graph_output_names
+
+    # Keep only initializers that are consumed
+    kept_inits = [init for init in g.initializer if init.name in consumers]
+    removed_inits = len(g.initializer) - len(kept_inits)
+
+    # Live value names: consumed inputs and produced outputs from remaining nodes
+    live_names: Set[str] = set(consumers)
+    for n in kept_nodes:
+        for o in n.output:
+            if o:
+                live_names.add(o)
+
+    # Prune stray value_info entries
+    kept_vi = [vi for vi in g.value_info if vi.name in live_names]
+    removed_vi = len(g.value_info) - len(kept_vi)
+
+    # Optionally drop unused graph inputs
+    if drop_unused_inputs:
+        kept_inputs = [inp for inp in g.input if (inp.name in consumers or inp.name in graph_output_names)]
+        removed_inputs = len(g.input) - len(kept_inputs)
+    else:
+        kept_inputs = list(g.input)
+        removed_inputs = 0
+
+    # Write back pruned structures
+    del g.node[:]
+    g.node.extend(kept_nodes)
+    del g.initializer[:]
+    g.initializer.extend(kept_inits)
+    del g.value_info[:]
+    g.value_info.extend(kept_vi)
+    del g.input[:]
+    g.input.extend(kept_inputs)
+
+    onnx.save(m, out_path)
+    if removed_inits or removed_const or removed_vi or removed_inputs:
+        print(
+            f"Cleaned unused: initializers={removed_inits}, constants={removed_const}, value_info={removed_vi}, inputs={removed_inputs}"
+        )
+    return out_path
+
+
 def split_large_concats(model_path: str, out_path: str, max_inputs: int = 8) -> str:
     """Split Concat nodes with too many inputs into a tree of smaller Concat nodes."""
     assert max_inputs >= 2
@@ -1383,6 +1463,14 @@ def main():
         print("[stage] Attempting FP16 casting…")
         mod3 = os.path.join(args.outdir, os.path.basename(args.model).replace('.onnx', '_fp16.onnx'))
         work_path = cast_graph_to_fp16(work_path, mod3)
+
+    # Final cleanup to remove unused initializers/constants and silence ORT warnings
+    try:
+        print("[stage] Cleaning unused tensors…")
+        modClean = os.path.join(args.outdir, os.path.basename(args.model).replace('.onnx', '_clean.onnx'))
+        work_path = clean_unused_tensors(work_path, modClean, drop_unused_inputs=False)
+    except Exception as e:
+        print(f"[WARNING] Cleanup pass failed: {e}")
 
     # Copy to final artifact
     if args.output_model:
