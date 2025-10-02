@@ -787,6 +787,200 @@ def rewrite_resize_to_static(model_path: str, out_path: str) -> str:
     return out_path
 
 
+def rewrite_reduce_to_globalpool(model_path: str, out_path: str) -> str:
+    """Rewrite ReduceMean/ReduceMax over spatial dims [2,3] with keepdims=1 to GlobalAveragePool/GlobalMaxPool.
+
+    This typically improves CoreML EP partitioning as pooling is well supported, while some Reduce ops remain on CPU.
+    Safety: only for 4D inputs (N,C,H,W), axes exactly {2,3} (order-insensitive), keepdims=1.
+    """
+    m = onnx.load(model_path)
+    g = m.graph
+
+    # Build simple shape map to infer rank
+    shape_map: Dict[str, List[int]] = {}
+    def record_vi(vi):
+        try:
+            name = vi.name
+            tt = vi.type.tensor_type
+            dims = []
+            for d in tt.shape.dim:
+                dims.append(int(d.dim_value) if d.dim_value else None)
+            shape_map[name] = dims
+        except Exception:
+            pass
+    for vi in list(g.input) + list(g.value_info) + list(g.output):
+        record_vi(vi)
+
+    def get_attr_ints(node, name):
+        for a in node.attribute:
+            if a.name == name and a.type == onnx.AttributeProto.INTS:
+                return list(a.ints)
+        return None
+    def get_attr_int(node, name, default=None):
+        for a in node.attribute:
+            if a.name == name and a.type == onnx.AttributeProto.INT:
+                return int(a.i)
+        return default
+
+    kept: List[onnx.NodeProto] = []
+    changed = 0
+    for node in g.node:
+        if node.op_type not in ("ReduceMean", "ReduceMax"):
+            kept.append(node)
+            continue
+        if not node.input:
+            kept.append(node)
+            continue
+        x = node.input[0]
+        shp = shape_map.get(x)
+        if not shp or len(shp) != 4:
+            kept.append(node)
+            continue
+        axes = get_attr_ints(node, "axes")
+        keepdims = get_attr_int(node, "keepdims", 1)
+        if keepdims != 1:
+            kept.append(node)
+            continue
+        if axes is None:
+            kept.append(node)
+            continue
+        # Canonicalize negative axes
+        axes_c = []
+        for a in axes:
+            aa = a if a >= 0 else (len(shp) + a)
+            axes_c.append(int(aa))
+        if sorted(axes_c) != [2, 3]:
+            kept.append(node)
+            continue
+        # Build Global Pool node
+        op = "GlobalAveragePool" if node.op_type == "ReduceMean" else "GlobalMaxPool"
+        new_node = helper.make_node(op, [x], list(node.output), name=node.name + "_toGlobalPool")
+        kept.append(new_node)
+        changed += 1
+
+    if changed == 0:
+        onnx.save(m, out_path)
+        return out_path
+
+    del g.node[:]
+    g.node.extend(kept)
+    onnx.save(m, out_path)
+    print(f"Rewrote Reduce -> GlobalPool: {changed} node(s)")
+    return out_path
+
+
+def remove_noop_slice(model_path: str, out_path: str) -> str:
+    """Remove Slice that is effectively identity (full-range on specified axes with step=1).
+
+    Conditions per axis: start==0, step==1, end>=dim_size or very large sentinel, and dim_size known.
+    """
+    m = onnx.load(model_path)
+    g = m.graph
+
+    # Const maps
+    consts = {init.name: numpy_helper.to_array(init) for init in g.initializer}
+
+    # Shape map for input ranks and dims
+    shape_map: Dict[str, List[int]] = {}
+    def record_vi(vi):
+        try:
+            name = vi.name
+            tt = vi.type.tensor_type
+            dims = []
+            for d in tt.shape.dim:
+                dims.append(int(d.dim_value) if d.dim_value else None)
+            shape_map[name] = dims
+        except Exception:
+            pass
+    for vi in list(g.input) + list(g.value_info) + list(g.output):
+        record_vi(vi)
+
+    kept: List[onnx.NodeProto] = []
+    changed = 0
+
+    def read(name):
+        arr = consts.get(name)
+        if arr is None:
+            return None
+        return np.array(arr)
+
+    for node in g.node:
+        if node.op_type != "Slice" or len(node.input) < 3:
+            kept.append(node)
+            continue
+        data, starts, ends = node.input[:3]
+        axes = node.input[3] if len(node.input) >= 4 else None
+        steps = node.input[4] if len(node.input) >= 5 else None
+        s = read(starts)
+        e = read(ends)
+        ax = read(axes) if axes else None
+        st = read(steps) if steps else None
+        if s is None or e is None:
+            kept.append(node)
+            continue
+        try:
+            s = s.astype(np.int64).reshape(-1)
+            e = e.astype(np.int64).reshape(-1)
+            if ax is not None:
+                ax = ax.astype(np.int64).reshape(-1)
+            else:
+                ax = np.arange(len(s), dtype=np.int64)
+            if st is not None:
+                st = st.astype(np.int64).reshape(-1)
+            else:
+                st = np.ones_like(s, dtype=np.int64)
+        except Exception:
+            kept.append(node)
+            continue
+        if not (len(s) == len(e) == len(ax) == len(st)):
+            kept.append(node)
+            continue
+        in_shape = shape_map.get(data)
+        if not in_shape:
+            kept.append(node)
+            continue
+        noop = True
+        rank = len(in_shape)
+        for i in range(len(s)):
+            axis = int(ax[i]) if int(ax[i]) >= 0 else (rank + int(ax[i]))
+            dim = in_shape[axis]
+            if dim is None:
+                noop = False
+                break
+            start_i = int(s[i])
+            end_i = int(e[i])
+            step_i = int(st[i])
+            if step_i != 1:
+                noop = False
+                break
+            # Normalize negative end index to dim + end
+            if end_i < 0:
+                end_i = dim + end_i
+            # Treat very large end (common sentinel) as dim
+            if end_i > dim:
+                end_i = dim
+            if not (start_i == 0 and end_i == dim):
+                noop = False
+                break
+        if noop:
+            # Replace Slice with Identity
+            id_node = helper.make_node("Identity", [data], list(node.output), name=node.name + "_IdNoopSlice")
+            kept.append(id_node)
+            changed += 1
+        else:
+            kept.append(node)
+
+    if changed == 0:
+        onnx.save(m, out_path)
+        return out_path
+
+    del g.node[:]
+    g.node.extend(kept)
+    onnx.save(m, out_path)
+    print(f"Removed no-op Slice: {changed} node(s)")
+    return out_path
+
+
 def analyze_ane_compatibility(profile_summary: Dict) -> None:
     """Analyze and report ops most likely blocking ANE execution."""
     if not profile_summary:
@@ -858,6 +1052,8 @@ def main():
     parser.add_argument("--rewrite-hardsigmoid", action="store_true", help="Rewrite HardSigmoid to Mul+Add+Clip")
     parser.add_argument("--rewrite-slice-to-gather", action="store_true", help="Rewrite Slice to Gather")
     parser.add_argument("--rewrite-resize-to-static", action="store_true", help="Replace dynamic Resize with static sizes")
+    parser.add_argument("--rewrite-reduce-to-globalpool", action="store_true", help="Rewrite ReduceMean/ReduceMax over H,W to GlobalPool")
+    parser.add_argument("--remove-noop-slice", action="store_true", help="Remove Slice ops that are effectively identity")
 
     # NEW FLAGS
     parser.add_argument("--aggressive-mode", action="store_true", help="Enable all ANE optimizations")
@@ -873,6 +1069,8 @@ def main():
         args.rewrite_pow = True
         args.rewrite_slice_to_gather = True
         args.rewrite_resize_to_static = True
+        args.rewrite_reduce_to_globalpool = True
+        args.remove_noop_slice = True
         args.fold_static_shapes = True
         if not args.split_concat:
             args.split_concat = 4
@@ -962,6 +1160,16 @@ def main():
         print("[stage] Rewriting Resize to static sizes…")
         modRZ = os.path.join(args.outdir, os.path.basename(args.model).replace('.onnx', '_resize_static.onnx'))
         work_path = rewrite_resize_to_static(work_path, modRZ)
+
+    if args.remove_noop_slice:
+        print("[stage] Removing no-op Slice ops…")
+        modNS = os.path.join(args.outdir, os.path.basename(args.model).replace('.onnx', '_slice_noop.onnx'))
+        work_path = remove_noop_slice(work_path, modNS)
+
+    if args.rewrite_reduce_to_globalpool:
+        print("[stage] Rewriting Reduce -> GlobalPool…")
+        modGP = os.path.join(args.outdir, os.path.basename(args.model).replace('.onnx', '_globalpool.onnx'))
+        work_path = rewrite_reduce_to_globalpool(work_path, modGP)
 
     if args.keep_outputs:
         keep = [s.strip() for s in args.keep_outputs.split(",") if s.strip()]
