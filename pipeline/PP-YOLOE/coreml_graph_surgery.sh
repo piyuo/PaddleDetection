@@ -16,6 +16,7 @@ python3 pipeline/PP-YOLOE/coreml_graph_surgery.py \
 --rewrite-pow \
 --rewrite-hardsigmoid \
 --rewrite-slice-to-gather \
+--rewrite-resize-to-static \
 --fp16 \
 --output-model pipeline/PP-YOLOE/models/ppyoloe_crn_s_36e_pphuman_embed_ane.onnx
 

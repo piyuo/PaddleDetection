@@ -677,6 +677,116 @@ def rewrite_slice_to_gather(model_path: str, out_path: str) -> str:
 # NEW OPTIMIZATIONS FOR ANE
 
 
+def rewrite_resize_to_static(model_path: str, out_path: str) -> str:
+    """Rewrite Resize nodes to use static 'sizes' based on inferred output shapes.
+
+    Rationale: CoreML EP with RequireStaticInputShapes prefers static shapes.
+    If shape inference can determine the output shape of a Resize, we can
+    replace dynamic scales/sizes with a constant 'sizes' initializer.
+
+    Strategy:
+    - Collect value_info shapes for all tensors.
+    - For each Resize:
+        - If its first (and only) output has fully-known NCHW dims (>0),
+          inject a constant int64 sizes=[N,C,H,W] and rebuild inputs to use sizes.
+        - Preserve attributes and ROI input if provided.
+        - Leave scales empty (optional input) to ensure static behavior.
+    - Skip nodes whose output shape is not fully static.
+    """
+    m = onnx.load(model_path)
+    g = m.graph
+
+    # Build a map of tensor name -> static shape list (ints) if known
+    shape_map: Dict[str, List[int]] = {}
+
+    def record_vi(vi):
+        try:
+            name = vi.name
+            tt = vi.type.tensor_type
+            dims = []
+            for d in tt.shape.dim:
+                if d.dim_value and int(d.dim_value) > 0:
+                    dims.append(int(d.dim_value))
+                else:
+                    dims.append(None)
+            shape_map[name] = dims
+        except Exception:
+            pass
+
+    for vi in list(g.input) + list(g.value_info) + list(g.output):
+        record_vi(vi)
+
+    # Helper for unique names
+    def unique_name(base: str) -> str:
+        idx = 0
+        existing = {n.name for n in g.node}
+        existing.update({vi.name for vi in list(g.input) + list(g.output)})
+        existing.update({init.name for init in g.initializer})
+        name = f"{base}__{idx}"
+        while name in existing:
+            idx += 1
+            name = f"{base}__{idx}"
+        return name
+
+    kept: List[onnx.NodeProto] = []
+    new_inits = []
+    changed = 0
+
+    for node in g.node:
+        if node.op_type != "Resize" or len(node.output) == 0:
+            kept.append(node)
+            continue
+        out_name = node.output[0]
+        out_shape = shape_map.get(out_name)
+        # If output is not in value_info (rare), try to fall back to input shape with scales if constant
+        if not out_shape:
+            kept.append(node)
+            continue
+        # Need fully static 4D shape (NCHW)
+        if len(out_shape) != 4 or any(d is None for d in out_shape):
+            kept.append(node)
+            continue
+
+        # Create or reuse ROI input
+        inputs = list(node.input)
+        # Normalize to 4 inputs: [x, roi, scales, sizes]
+        while len(inputs) < 4:
+            inputs.append("")
+
+        # Build constant sizes initializer
+        sizes_arr = np.asarray(out_shape, dtype=np.int64)
+        sizes_name = unique_name(node.name + "_static_sizes")
+        new_inits.append(numpy_helper.from_array(sizes_arr, name=sizes_name))
+
+        # Construct new inputs: keep X, keep ROI if provided, blank scales, provide sizes
+        new_inputs = [inputs[0], inputs[1] if len(inputs) >= 2 else "", "", sizes_name]
+
+        # Recreate the node to ensure clean optional inputs, preserving attributes
+        new_node = helper.make_node(
+            "Resize",
+            inputs=new_inputs,
+            outputs=list(node.output),
+            name=node.name or unique_name("Resize"),
+        )
+        for a in node.attribute:
+            new_node.attribute.extend([a])
+
+        kept.append(new_node)
+        changed += 1
+
+    if changed == 0:
+        onnx.save(m, out_path)
+        return out_path
+
+    if new_inits:
+        g.initializer.extend(new_inits)
+    del g.node[:]
+    g.node.extend(kept)
+    onnx.save(m, out_path)
+    print(f"Rewrote Resize -> static sizes: {changed} node(s)")
+    return out_path
+
+
 def analyze_ane_compatibility(profile_summary: Dict) -> None:
     """Analyze and report ops most likely blocking ANE execution."""
     if not profile_summary:
@@ -747,6 +857,7 @@ def main():
     parser.add_argument("--rewrite-pow", action="store_true", help="Rewrite Pow patterns")
     parser.add_argument("--rewrite-hardsigmoid", action="store_true", help="Rewrite HardSigmoid to Mul+Add+Clip")
     parser.add_argument("--rewrite-slice-to-gather", action="store_true", help="Rewrite Slice to Gather")
+    parser.add_argument("--rewrite-resize-to-static", action="store_true", help="Replace dynamic Resize with static sizes")
 
     # NEW FLAGS
     parser.add_argument("--aggressive-mode", action="store_true", help="Enable all ANE optimizations")
@@ -761,6 +872,7 @@ def main():
         args.rewrite_div = True
         args.rewrite_pow = True
         args.rewrite_slice_to_gather = True
+        args.rewrite_resize_to_static = True
         args.fold_static_shapes = True
         if not args.split_concat:
             args.split_concat = 4
@@ -845,6 +957,11 @@ def main():
         print("[stage] Rewriting simple Slice -> Gather…")
         modSG = os.path.join(args.outdir, os.path.basename(args.model).replace('.onnx', '_slice2gather.onnx'))
         work_path = rewrite_slice_to_gather(work_path, modSG)
+
+    if args.rewrite_resize_to_static:
+        print("[stage] Rewriting Resize to static sizes…")
+        modRZ = os.path.join(args.outdir, os.path.basename(args.model).replace('.onnx', '_resize_static.onnx'))
+        work_path = rewrite_resize_to_static(work_path, modRZ)
 
     if args.keep_outputs:
         keep = [s.strip() for s in args.keep_outputs.split(",") if s.strip()]
