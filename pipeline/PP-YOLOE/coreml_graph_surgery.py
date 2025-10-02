@@ -519,6 +519,20 @@ def rewrite_pow_patterns(model_path: str, out_path: str) -> str:
             new_nodes.append(helper.make_node("Mul", [x, x], out, name=unique_name(node.name + "_MulPow2")))
             changed += 1
             continue
+        if abs(c - 3.0) < 1e-6:
+            t1 = unique_name(node.name + "_sq")
+            new_nodes.append(helper.make_node("Mul", [x, x], [t1], name=unique_name(node.name + "_MulSq")))
+            new_nodes.append(helper.make_node("Mul", [t1, x], out, name=unique_name(node.name + "_MulPow3")))
+            changed += 1
+            continue
+        if abs(c - 4.0) < 1e-6:
+            t1 = unique_name(node.name + "_sq")
+            t2 = unique_name(node.name + "_p4")
+            new_nodes.append(helper.make_node("Mul", [x, x], [t1], name=unique_name(node.name + "_MulSq")))
+            new_nodes.append(helper.make_node("Mul", [t1, t1], [t2], name=unique_name(node.name + "_MulSq2")))
+            new_nodes.append(helper.make_node("Identity", [t2], out, name=unique_name(node.name + "_IdPow4")))
+            changed += 1
+            continue
         if abs(c - 0.5) < 1e-6:
             new_nodes.append(helper.make_node("Sqrt", [x], out, name=unique_name(node.name + "_Sqrt")))
             changed += 1
@@ -533,8 +547,72 @@ def rewrite_pow_patterns(model_path: str, out_path: str) -> str:
             new_nodes.append(helper.make_node("Reciprocal", [x], out, name=unique_name(node.name + "_Recip")))
             changed += 1
             continue
+        if abs(c + 2.0) < 1e-6:
+            t1 = unique_name(node.name + "_sq")
+            new_nodes.append(helper.make_node("Mul", [x, x], [t1], name=unique_name(node.name + "_MulSq")))
+            new_nodes.append(helper.make_node("Reciprocal", [t1], out, name=unique_name(node.name + "_RecipPow2")))
+            changed += 1
+            continue
+        if abs(c + 3.0) < 1e-6:
+            t1 = unique_name(node.name + "_sq")
+            t2 = unique_name(node.name + "_p3")
+            new_nodes.append(helper.make_node("Mul", [x, x], [t1], name=unique_name(node.name + "_MulSq")))
+            new_nodes.append(helper.make_node("Mul", [t1, x], [t2], name=unique_name(node.name + "_MulPow3")))
+            new_nodes.append(helper.make_node("Reciprocal", [t2], out, name=unique_name(node.name + "_RecipPow3")))
+            changed += 1
+            continue
         if abs(c - 1.0) < 1e-6:
             new_nodes.append(helper.make_node("Identity", [x], out, name=unique_name(node.name + "_Id")))
+            changed += 1
+            continue
+
+        # Generic small integer exponents via exponentiation by squaring (abs(n) in [2..8])
+        try:
+            n = int(round(c))
+        except Exception:
+            n = None
+        if n is not None and abs(c - n) < 1e-6 and abs(n) >= 2 and abs(n) <= 8:
+            pos = abs(n)
+            # Build x^pos
+            nodes_chain: List[onnx.NodeProto] = []
+            result_name = x
+            base_name = x
+            cur_pow = 1
+            # Precompute powers of two using squaring
+            pow_name = base_name
+            bit = 1
+            target = pos
+            accum_name = None
+            while (1 << (bit - 1)) <= target:
+                if bit == 1:
+                    pow_name = base_name  # x^(1)
+                else:
+                    # square previous pow_name: x^(2^(bit-1)) -> x^(2^bit)
+                    next_pow = unique_name(node.name + f"_p2^{bit}")
+                    nodes_chain.append(helper.make_node("Mul", [pow_name, pow_name], [next_pow], name=unique_name(node.name + f"_MulSq_{bit}")))
+                    pow_name = next_pow
+                # If this bit is set in target, multiply into accumulator
+                if (target >> (bit - 1)) & 1:
+                    if accum_name is None:
+                        accum_name = pow_name
+                    else:
+                        new_accum = unique_name(node.name + f"_acc_{bit}")
+                        nodes_chain.append(helper.make_node("Mul", [accum_name, pow_name], [new_accum], name=unique_name(node.name + f"_MulAcc_{bit}")))
+                        accum_name = new_accum
+                bit += 1
+            if accum_name is None:
+                # Should not happen for pos>=2, but guard
+                kept.append(node)
+                continue
+            final_name = accum_name
+            if n < 0:
+                # Reciprocal for negative powers
+                recip_out = unique_name(node.name + "_RecipPow")
+                nodes_chain.append(helper.make_node("Reciprocal", [final_name], [recip_out], name=unique_name(node.name + "_RecipPow")))
+                final_name = recip_out
+            # Connect to original outputs
+            nodes_chain.append(helper.make_node("Identity", [final_name], out, name=unique_name(node.name + "_PowExpand")))
+            new_nodes.extend(nodes_chain)
             changed += 1
             continue
         kept.append(node)
