@@ -1678,7 +1678,7 @@ def main():
     parser.add_argument("--ort-profile-dir", type=str, help="Directory for ORT profiling (enables profiling automatically)")
     parser.add_argument("--fp16", action="store_true", help="Attempt FP16 casting")
     parser.add_argument("--fix-input-shapes", action="store_true", help="Rewrite graph inputs to static shapes")
-    parser.add_argument("--split-concat", type=int, default=0, help="Split large Concat nodes")
+    parser.add_argument("--split-concat", type=int, default=4, help="Split large Concat nodes")
     parser.add_argument("--fold-static-shapes", action="store_true", help="Fold shape computation chains")
     parser.add_argument("--fold-iterations", type=int, default=15, help="Iterations for constant folding (default: 15)")
     parser.add_argument("--rewrite-div", action="store_true", help="Rewrite Div to Mul with reciprocal")

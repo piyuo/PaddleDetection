@@ -20,6 +20,7 @@ python3 pipeline/PP-YOLOE/coreml_graph_surgery.py \
 --img pipeline/dataset/demo/demo.jpg \
 --outdir pipeline/PP-YOLOE/models/surgery \
 --fix-input-shapes \
+--fold-iterations 15 \
 --split-concat 4 \
 --fold-static-shapes \
 --rewrite-div \
@@ -32,8 +33,6 @@ python3 pipeline/PP-YOLOE/coreml_graph_surgery.py \
 --fp16 \
 --rewrite-slice-range-to-gather \
 --output-model pipeline/PP-YOLOE/models/ppyoloe_crn_s_36e_pphuman_ane.onnx
-
-# Output discovery is always automatic - no configuration needed!
 
 rm -rf pipeline/PP-YOLOE/models/surgery
 
