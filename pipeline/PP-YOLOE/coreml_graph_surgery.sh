@@ -33,9 +33,7 @@ python3 pipeline/PP-YOLOE/coreml_graph_surgery.py \
 --rewrite-slice-range-to-gather \
 --output-model pipeline/PP-YOLOE/models/ppyoloe_crn_s_36e_pphuman_ane.onnx
 
-# Note: --keep-outputs is now OPTIONAL and auto-discovered if not specified
-# To manually override discovered outputs, add: --keep-outputs "tensor1,tensor2,..."
-# To disable auto-discovery entirely, add: --no-auto-discover --keep-outputs "..."
+# Output discovery is always automatic - no configuration needed!
 
 rm -rf pipeline/PP-YOLOE/models/surgery
 

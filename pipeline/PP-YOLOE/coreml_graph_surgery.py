@@ -1558,7 +1558,6 @@ def print_output_guide(discovered: Dict[str, Any], keep_outputs: List[str]) -> N
 
         else:
             print("  Type: Unknown (custom output)")
-            print("  Note: This output was manually specified via --keep-outputs")
 
     # Print embedding info if both feature maps present
     if s8 and s16 and any(s8['name'] == o for o in keep_outputs) and any(s16['name'] == o for o in keep_outputs):
@@ -1685,8 +1684,6 @@ def main():
     parser.add_argument("--split-concat", type=int, default=0, help="Split large Concat nodes")
     parser.add_argument("--fold-static-shapes", action="store_true", help="Fold shape computation chains")
     parser.add_argument("--fold-iterations", type=int, default=15, help="Iterations for constant folding (default: 15)")
-    parser.add_argument("--keep-outputs", type=str, default="", help="Comma-separated outputs to keep (optional - will auto-discover if not provided)")
-    parser.add_argument("--no-auto-discover", action="store_true", help="Disable automatic output discovery (requires --keep-outputs)")
     parser.add_argument("--rewrite-div", action="store_true", help="Rewrite Div to Mul with reciprocal")
     parser.add_argument("--rewrite-pow", action="store_true", help="Rewrite Pow patterns")
     parser.add_argument("--rewrite-hardsigmoid", action="store_true", help="Rewrite HardSigmoid to Mul+Add+Clip")
@@ -1702,11 +1699,6 @@ def main():
     # Check required arguments for normal operation
     if not args.img:
         print("[ERROR] --img argument is required", file=sys.stderr)
-        return
-
-    # Check if auto-discovery is needed
-    if not args.keep_outputs and args.no_auto_discover:
-        print("[ERROR] --no-auto-discover requires --keep-outputs to be specified", file=sys.stderr)
         return
 
     os.makedirs(args.outdir, exist_ok=True)
@@ -1816,49 +1808,44 @@ def main():
     discovered_info = None
     keep = []
 
-    if args.keep_outputs:
-        # Manual mode: use provided outputs
-        keep = [s.strip() for s in args.keep_outputs.split(",") if s.strip()]
-        print(f"[info] Using manually specified outputs: {keep}")
-    elif not args.no_auto_discover:
-        # Automatic mode: discover optimal outputs
-        print("\n" + "="*70)
-        print("[stage] Automatic output discovery enabled")
-        print("="*70)
+    # Automatic mode: discover optimal outputs
+    print("\n" + "="*70)
+    print("[stage] Automatic output discovery enabled")
+    print("="*70)
 
-        # Parse input shape to get image dimensions
-        img_hw = (640, 640)  # Default
-        if args.input_shape:
-            try:
-                shape_parts = [int(x) for x in args.input_shape.split(',')]
-                if len(shape_parts) == 4:  # B,C,H,W
-                    img_hw = (shape_parts[2], shape_parts[3])
-            except:
-                pass
+    # Parse input shape to get image dimensions
+    img_hw = (640, 640)  # Default
+    if args.input_shape:
+        try:
+            shape_parts = [int(x) for x in args.input_shape.split(',')]
+            if len(shape_parts) == 4:  # B,C,H,W
+                img_hw = (shape_parts[2], shape_parts[3])
+        except:
+            pass
 
-        discovered_info = auto_discover_outputs(work_path, img_hw=img_hw, verbose=True)
+    discovered_info = auto_discover_outputs(work_path, img_hw=img_hw, verbose=True)
 
-        # Build keep_outputs list from discovered info
-        nms = discovered_info.get('nms', {})
-        if nms.get('boxes'):
-            keep.append(nms['boxes'])
-        if nms.get('scores'):
-            keep.append(nms['scores'])
+    # Build keep_outputs list from discovered info
+    nms = discovered_info.get('nms', {})
+    if nms.get('boxes'):
+        keep.append(nms['boxes'])
+    if nms.get('scores'):
+        keep.append(nms['scores'])
 
-        s8 = discovered_info.get('stride_8')
-        if s8:
-            keep.append(s8['name'])
+    s8 = discovered_info.get('stride_8')
+    if s8:
+        keep.append(s8['name'])
 
-        s16 = discovered_info.get('stride_16')
-        if s16:
-            keep.append(s16['name'])
+    s16 = discovered_info.get('stride_16')
+    if s16:
+        keep.append(s16['name'])
 
-        if keep:
-            print(f"\n✓ Auto-discovered outputs to keep: {len(keep)} tensors")
-            for i, name in enumerate(keep):
-                print(f"  {i+1}. {name}")
-        else:
-            print("\n⚠️  No outputs auto-discovered. Model will keep original outputs.")
+    if keep:
+        print(f"\n✓ Auto-discovered outputs to keep: {len(keep)} tensors")
+        for i, name in enumerate(keep):
+            print(f"  {i+1}. {name}")
+    else:
+        print("\n⚠️  No outputs auto-discovered. Model will keep original outputs.")
 
     # Prune if we have outputs to keep
     if keep:
