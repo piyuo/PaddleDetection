@@ -9,7 +9,7 @@ New optimizations targeting CoreML ANE acceleration:
 import argparse
 import os
 import shutil
-from typing import Tuple, List, Dict, Set
+from typing import Tuple, List, Dict, Set, Any
 import sys
 import subprocess
 
@@ -1336,60 +1336,290 @@ def remove_noop_slice(model_path: str, out_path: str) -> str:
     return out_path
 
 
-def find_nms_nodes(model_path: str) -> List[str]:
+def find_nms_nodes(model_path: str) -> Dict[str, Any]:
     """
-    Loads an ONNX model and prints information about NonMaxSuppression nodes.
-    Returns list of input tensor names that should be kept as outputs.
+    Loads an ONNX model and finds NonMaxSuppression nodes.
+    Returns dict with structured info about NMS inputs (boxes, scores).
     """
     try:
         m = onnx.load(model_path)
-        print(f"✅ Successfully loaded model: {model_path}")
     except Exception as e:
         print(f"❌ Error loading ONNX model: {e}", file=sys.stderr)
-        sys.exit(1)
+        return {}
 
     nms_nodes_found = []
-
-    # Iterate through all nodes in the model's graph
     for node in m.graph.node:
-        # Check if the node's operator type is 'NonMaxSuppression'
         if node.op_type == 'NonMaxSuppression':
             nms_nodes_found.append(node)
 
     if not nms_nodes_found:
-        print("\n[INFO] No 'NonMaxSuppression' nodes found in the model.")
-        return []
+        return {}
 
-    print(f"\n=== Found {len(nms_nodes_found)} 'NonMaxSuppression' node(s) ===")
-    input_tensors = []
-    for i, node in enumerate(nms_nodes_found):
-        print(f"\n--- NMS Node {i+1} ---")
-        print(f"  Node Name: {node.name}")
-        print(f"  Operator Type: {node.op_type}")
+    # Extract first NMS node's inputs (typically: boxes, scores, max_output_boxes, iou_threshold, score_threshold)
+    node = nms_nodes_found[0]
+    input_tensors = [inp for inp in node.input if inp]  # Skip empty strings
 
-        # The inputs are the most critical part for pruning
-        print("  Inputs (Tensor Names):")
-        for input_name in node.input:
-            print(f"    - {input_name}")
-            if input_name:  # Skip empty strings
-                input_tensors.append(input_name)
+    result = {}
+    if len(input_tensors) >= 2:
+        result['boxes'] = input_tensors[0]
+        result['scores'] = input_tensors[1]
 
-        print("  Outputs (Tensor Names):")
-        for output_name in node.output:
-            print(f"    - {output_name}")
+    return result
 
-    print("\n[ACTION REQUIRED]")
-    print("Use the 'Inputs (Tensor Names)' listed above for the `--keep-outputs` flag")
-    print("in your graph surgery script to remove the NMS node.")
-    if input_tensors:
-        # Also check if 'embed' output exists and suggest including it
-        embed_exists = any(o.name == 'embed' for o in m.graph.output)
-        suggestion = ",".join(input_tensors[:2])  # Usually boxes and scores are first 2 inputs
-        if embed_exists:
-            suggestion += ",embed"
-        print(f"Example: --keep-outputs \"{suggestion}\"")
 
-    return input_tensors
+def auto_discover_outputs(model_path: str, img_hw: Tuple[int, int] = (640, 640), verbose: bool = True) -> Dict[str, Any]:
+    """
+    Automatically discover optimal outputs for model surgery:
+    - NMS inputs (boxes, scores)
+    - Stride-8 feature map for fine-grained embeddings
+    - Stride-16 feature map for semantic embeddings
+
+    Returns dict with discovered outputs and their metadata.
+    """
+    if verbose:
+        print("\n=== Automatic Output Discovery ===")
+
+    # 1. Find NMS inputs (boxes, scores)
+    nms_info = find_nms_nodes(model_path)
+    if not nms_info:
+        print("⚠️  No NMS nodes found - will only discover feature maps")
+    elif verbose:
+        print(f"✓ Found NMS inputs:")
+        print(f"  Boxes:  {nms_info.get('boxes', 'N/A')}")
+        print(f"  Scores: {nms_info.get('scores', 'N/A')}")
+
+    # 2. Find stride-8 and stride-16 feature maps
+    if verbose:
+        print(f"\n✓ Probing feature maps (input size: {img_hw})...")
+
+    m = onnx.load(model_path)
+
+    # Find candidate feature nodes (Conv, BN outputs)
+    candidates = []
+    for node in m.graph.node:
+        if node.op_type in ['Conv', 'BatchNormalization']:
+            for out in node.output:
+                if not any(bad in out for bad in ['.w_', '.b_', 'constant', 'scale', 'bias']):
+                    candidates.append((out, node.op_type))
+
+    # Probe candidates with runtime inference
+    probed = []
+    H, W = img_hw
+
+    for i, (name, op_type) in enumerate(candidates[:80]):  # Limit to 80 probes
+        try:
+            # Create temp model with extra output
+            m_temp = onnx.load(model_path)
+            found = False
+            for vi in list(m_temp.graph.value_info) + list(m_temp.graph.output):
+                if vi.name == name:
+                    m_temp.graph.output.append(vi)
+                    found = True
+                    break
+
+            if not found:
+                vi = onnx.helper.make_tensor_value_info(name, onnx.TensorProto.FLOAT, [])
+                m_temp.graph.output.append(vi)
+
+            # Save and run
+            temp_path = f'/tmp/probe_{i}.onnx'
+            onnx.save(m_temp, temp_path)
+
+            sess = ort.InferenceSession(temp_path, providers=['CPUExecutionProvider'])
+
+            # Create dummy input
+            feed = {}
+            for inp in sess.get_inputs():
+                if 'image' in inp.name.lower():
+                    feed[inp.name] = np.random.randn(1, 3, H, W).astype(np.float32)
+                elif 'shape' in inp.name.lower():
+                    feed[inp.name] = np.array([[H, W]], dtype=np.float32)
+                elif 'scale' in inp.name.lower():
+                    feed[inp.name] = np.array([[1.0, 1.0]], dtype=np.float32)
+
+            # Run inference
+            outputs = sess.run(None, feed)
+
+            # Find the probed output
+            out_names = [o.name for o in sess.get_outputs()]
+            if name in out_names:
+                idx = out_names.index(name)
+                shape = list(outputs[idx].shape)
+
+                # Only keep 4D feature maps
+                if len(shape) == 4 and shape[0] == 1:
+                    _, C, Hf, Wf = shape
+                    if 10 <= Hf <= 80 and 10 <= Wf <= 80 and 64 <= C <= 512:
+                        stride_h = H / Hf
+                        stride_w = W / Wf
+                        stride_avg = (stride_h + stride_w) / 2
+                        probed.append({
+                            'name': name,
+                            'shape': shape,
+                            'channels': C,
+                            'spatial': (Hf, Wf),
+                            'stride': stride_avg,
+                            'op': op_type
+                        })
+        except:
+            pass
+
+    # Categorize by stride
+    stride8_candidates = [f for f in probed if 6 <= f['stride'] <= 10]
+    stride16_candidates = [f for f in probed if 12 <= f['stride'] <= 20]
+
+    if verbose:
+        print(f"  Found {len(probed)} suitable feature maps")
+        print(f"  Stride-8 candidates: {len(stride8_candidates)}")
+        print(f"  Stride-16 candidates: {len(stride16_candidates)}")
+
+    # Pick best candidates (prefer BatchNormalization outputs, higher channels)
+    def select_best(candidates):
+        if not candidates:
+            return None
+        # Prefer BN, then higher channels
+        bn_cands = [c for c in candidates if c['op'] == 'BatchNormalization']
+        pool = bn_cands if bn_cands else candidates
+        return max(pool, key=lambda c: c['channels'])
+
+    best_s8 = select_best(stride8_candidates)
+    best_s16 = select_best(stride16_candidates)
+
+    # Build result
+    result = {
+        'nms': nms_info,
+        'stride_8': best_s8,
+        'stride_16': best_s16,
+    }
+
+    if verbose:
+        print("\n✓ Selected feature maps:")
+        if best_s8:
+            print(f"  Stride-8:  {best_s8['name']}")
+            print(f"             Shape: {best_s8['shape']} ({best_s8['channels']} channels)")
+        else:
+            print(f"  Stride-8:  Not found")
+
+        if best_s16:
+            print(f"  Stride-16: {best_s16['name']}")
+            print(f"             Shape: {best_s16['shape']} ({best_s16['channels']} channels)")
+        else:
+            print(f"  Stride-16: Not found")
+
+    return result
+
+
+def print_output_guide(discovered: Dict[str, Any], keep_outputs: List[str]) -> None:
+    """Print comprehensive guide for using the pruned model outputs."""
+    print("\n" + "="*70)
+    print("=== Pruned Model Output Guide ===")
+    print("="*70)
+
+    nms = discovered.get('nms', {})
+    s8 = discovered.get('stride_8')
+    s16 = discovered.get('stride_16')
+
+    # Map output indices
+    for i, out_name in enumerate(keep_outputs):
+        print(f"\nOutput {i}: '{out_name}'")
+
+        # Identify what this output is
+        if nms.get('boxes') == out_name:
+            print("  Type: Detection boxes (raw)")
+            print("  Shape: (1, 8400, 4) or similar")
+            print("  Format: [x_center, y_center, width, height] in input coordinates")
+            print("  Usage: Apply NMS with scores to get final detections")
+            print("  Note: These are PRE-NMS boxes from all anchor points")
+
+        elif nms.get('scores') == out_name:
+            print("  Type: Detection scores (raw)")
+            print("  Shape: (1, 1, 8400) - may need squeeze to (8400,)")
+            print("  Format: Class probabilities (single class: person)")
+            print("  Usage: Threshold and apply NMS with boxes")
+            print("  Note: These are confidence scores for each anchor point")
+
+        elif s8 and s8['name'] == out_name:
+            print("  Type: Feature map (stride-8, fine-grained)")
+            print(f"  Shape: {s8['shape']}")
+            print(f"  Channels: {s8['channels']}")
+            print(f"  Spatial: {s8['spatial'][0]}×{s8['spatial'][1]} (stride≈{s8['stride']:.1f})")
+            print("  Usage: Pass as 'feat_s8' to roi_align_pool_multi_scale()")
+            print("  Purpose: Fine-grained spatial features for small person instances")
+            print("  Note: Higher resolution, good for precise localization")
+
+        elif s16 and s16['name'] == out_name:
+            print("  Type: Feature map (stride-16, semantic)")
+            print(f"  Shape: {s16['shape']}")
+            print(f"  Channels: {s16['channels']}")
+            print(f"  Spatial: {s16['spatial'][0]}×{s16['spatial'][1]} (stride≈{s16['stride']:.1f})")
+            print("  Usage: Pass as 'feat_s16' to roi_align_pool_multi_scale()")
+            print("  Purpose: Semantic features for appearance discrimination")
+            print("  Note: Lower resolution, stronger semantic information")
+
+        else:
+            print("  Type: Unknown (custom output)")
+            print("  Note: This output was manually specified via --keep-outputs")
+
+    # Print embedding info if both feature maps present
+    if s8 and s16 and any(s8['name'] == o for o in keep_outputs) and any(s16['name'] == o for o in keep_outputs):
+        total_dim = s8['channels'] + s16['channels']
+        print(f"\n" + "-"*70)
+        print("=== Multi-Scale Embedding Extraction ===")
+        print(f"Total embedding dimension: {total_dim} ({s8['channels']} from s8 + {s16['channels']} from s16)")
+        print("Recommended pooling config:")
+        print("  - Global pooling weight: 0.2 (mix avg/max)")
+        print("  - Part pooling weight: 0.8")
+        print("  - Horizontal parts: 9 divisions × 2 stripes")
+        print("  - Vertical parts: 2 divisions × 2 stripes")
+        print("Normalization: InstanceNorm → power-law (α=0.35) → L2")
+        print("Expected quality: median cosine < 0.15, p95 < 0.35")
+
+    # Print code template
+    print(f"\n" + "-"*70)
+    print("=== Python Inference Template ===")
+    print("-"*70)
+    print("import onnxruntime as ort")
+    print("import numpy as np")
+    print("")
+    print("# Load model")
+    print("sess = ort.InferenceSession('model.onnx', providers=['CoreMLExecutionProvider'])")
+    print("")
+    print("# Run inference")
+    print("outputs = sess.run(None, {'image': img_tensor, ...})")
+    print("")
+
+    # Generate specific code based on discovered outputs
+    for i, out_name in enumerate(keep_outputs):
+        if nms.get('boxes') == out_name:
+            print(f"boxes_raw = outputs[{i}]  # Shape: (1, N, 4)")
+        elif nms.get('scores') == out_name:
+            print(f"scores_raw = outputs[{i}].squeeze()  # Shape: (N,)")
+        elif s8 and s8['name'] == out_name:
+            print(f"feat_s8 = outputs[{i}]  # Shape: {s8['shape']}")
+        elif s16 and s16['name'] == out_name:
+            print(f"feat_s16 = outputs[{i}]  # Shape: {s16['shape']}")
+
+    print("")
+    print("# Apply NMS (if using raw boxes/scores)")
+    if nms.get('boxes') in keep_outputs and nms.get('scores') in keep_outputs:
+        print("import cv2")
+        print("indices = cv2.dnn.NMSBoxes(boxes_raw[0], scores_raw, score_threshold=0.3, nms_threshold=0.5)")
+        print("boxes_nms = boxes_raw[0][indices]")
+        print("scores_nms = scores_raw[indices]")
+
+    print("")
+    if s8 and s16 and any(s8['name'] == o for o in keep_outputs) and any(s16['name'] == o for o in keep_outputs):
+        print("# Extract embeddings")
+        print("embeddings = roi_align_pool_multi_scale(")
+        print("    feat_s8=feat_s8,")
+        print("    feat_s16=feat_s16,")
+        print("    boxes=boxes_nms,")
+        print("    img_hw=(640, 640),")
+        print("    gp_w=0.2, pp_w=0.8, pp_k=9, pp_stripe_h=2")
+        print(")")
+        print(f"# Result: embeddings.shape = (num_detections, {total_dim})")
+
+    print("\n" + "="*70 + "\n")
 
 
 def analyze_ane_compatibility(profile_summary: Dict) -> None:
@@ -1457,7 +1687,8 @@ def main():
     parser.add_argument("--split-concat", type=int, default=0, help="Split large Concat nodes")
     parser.add_argument("--fold-static-shapes", action="store_true", help="Fold shape computation chains")
     parser.add_argument("--fold-iterations", type=int, default=15, help="Iterations for constant folding (default: 15)")
-    parser.add_argument("--keep-outputs", type=str, default="", help="Comma-separated outputs to keep")
+    parser.add_argument("--keep-outputs", type=str, default="", help="Comma-separated outputs to keep (optional - will auto-discover if not provided)")
+    parser.add_argument("--no-auto-discover", action="store_true", help="Disable automatic output discovery (requires --keep-outputs)")
     parser.add_argument("--rewrite-div", action="store_true", help="Rewrite Div to Mul with reciprocal")
     parser.add_argument("--rewrite-pow", action="store_true", help="Rewrite Pow patterns")
     parser.add_argument("--rewrite-hardsigmoid", action="store_true", help="Rewrite HardSigmoid to Mul+Add+Clip")
@@ -1468,24 +1699,19 @@ def main():
     parser.add_argument("--remove-noop-slice", action="store_true", help="Remove Slice ops that are effectively identity")
 
     # NEW FLAGS
-    parser.add_argument("--find-nms", action="store_true", help="Find and report NonMaxSuppression nodes (diagnostic mode)")
     parser.add_argument("--aggressive-mode", action="store_true", help="Enable all ANE optimizations")
     parser.add_argument("--output-model", type=str, help="Path to copy final optimized model to")
 
     args = parser.parse_args()
 
-    # Diagnostic mode: find NMS nodes and exit
-    if args.find_nms:
-        print("=== NMS Node Discovery Mode ===")
-        find_nms_nodes(args.model)
-        print("\n[INFO] Use the tensor names above with --keep-outputs to prune the model.")
-        print("Example command:")
-        print(f"  python3 {sys.argv[0]} --model {args.model} --keep-outputs \"tensor1,tensor2,embed\" ...")
-        return
-
     # Check required arguments for normal operation
     if not args.img:
-        print("[ERROR] --img argument is required (not needed for --find-nms mode)", file=sys.stderr)
+        print("[ERROR] --img argument is required", file=sys.stderr)
+        return
+
+    # Check if auto-discovery is needed
+    if not args.keep_outputs and args.no_auto_discover:
+        print("[ERROR] --no-auto-discover requires --keep-outputs to be specified", file=sys.stderr)
         return
 
     # Aggressive mode enables all optimizations
@@ -1604,12 +1830,59 @@ def main():
         modGP = os.path.join(args.outdir, os.path.basename(args.model).replace('.onnx', '_globalpool.onnx'))
         work_path = rewrite_reduce_to_globalpool(work_path, modGP)
 
+    # Automatic output discovery and pruning
+    discovered_info = None
+    keep = []
+
     if args.keep_outputs:
+        # Manual mode: use provided outputs
         keep = [s.strip() for s in args.keep_outputs.split(",") if s.strip()]
+        print(f"[info] Using manually specified outputs: {keep}")
+    elif not args.no_auto_discover:
+        # Automatic mode: discover optimal outputs
+        print("\n" + "="*70)
+        print("[stage] Automatic output discovery enabled")
+        print("="*70)
+
+        # Parse input shape to get image dimensions
+        img_hw = (640, 640)  # Default
+        if args.input_shape:
+            try:
+                shape_parts = [int(x) for x in args.input_shape.split(',')]
+                if len(shape_parts) == 4:  # B,C,H,W
+                    img_hw = (shape_parts[2], shape_parts[3])
+            except:
+                pass
+
+        discovered_info = auto_discover_outputs(work_path, img_hw=img_hw, verbose=True)
+
+        # Build keep_outputs list from discovered info
+        nms = discovered_info.get('nms', {})
+        if nms.get('boxes'):
+            keep.append(nms['boxes'])
+        if nms.get('scores'):
+            keep.append(nms['scores'])
+
+        s8 = discovered_info.get('stride_8')
+        if s8:
+            keep.append(s8['name'])
+
+        s16 = discovered_info.get('stride_16')
+        if s16:
+            keep.append(s16['name'])
+
         if keep:
-            print("[stage] Pruning outputs; keeping:", keep)
-            modP = os.path.join(args.outdir, os.path.basename(args.model).replace('.onnx', '_pruned.onnx'))
-            work_path = prune_outputs(work_path, modP, keep)
+            print(f"\n✓ Auto-discovered outputs to keep: {len(keep)} tensors")
+            for i, name in enumerate(keep):
+                print(f"  {i+1}. {name}")
+        else:
+            print("\n⚠️  No outputs auto-discovered. Model will keep original outputs.")
+
+    # Prune if we have outputs to keep
+    if keep:
+        print(f"\n[stage] Pruning graph; keeping {len(keep)} outputs...")
+        modP = os.path.join(args.outdir, os.path.basename(args.model).replace('.onnx', '_pruned.onnx'))
+        work_path = prune_outputs(work_path, modP, keep)
 
     # Final shape inference
     if not args.no_shape_infer:
@@ -1723,6 +1996,10 @@ def main():
             print("\n=== CoreML Partition Changes ===")
             print(f"Partitions: {base_parts} → {mod_parts}")
             print(f"ANE-supported nodes: {base_nodes} → {mod_nodes} ({mod_nodes - base_nodes:+d})")
+
+    # Print comprehensive output guide if we did auto-discovery
+    if discovered_info and keep:
+        print_output_guide(discovered_info, keep)
 
 
 if __name__ == "__main__":
