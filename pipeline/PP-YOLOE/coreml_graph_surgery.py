@@ -1672,7 +1672,6 @@ def main():
         help="Path to source ONNX model",
     )
     parser.add_argument("--input-shape", type=str, default="1,3,640,640")
-    parser.add_argument("--ep", type=str, default="coreml")
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--runs", type=int, default=50)
     parser.add_argument("--img", type=str, help="Path to image for realistic preprocessing (not needed for --find-nms)")
@@ -1697,8 +1696,6 @@ def main():
     parser.add_argument("--rewrite-resize-to-static", action="store_true", help="Replace dynamic Resize with static sizes")
     parser.add_argument("--rewrite-reduce-to-globalpool", action="store_true", help="Rewrite ReduceMean/ReduceMax over H,W to GlobalPool")
     parser.add_argument("--remove-noop-slice", action="store_true", help="Remove Slice ops that are effectively identity")
-
-    # Output control
     parser.add_argument("--output-model", type=str, help="Path to copy final optimized model to")
 
     args = parser.parse_args()
@@ -1725,7 +1722,7 @@ def main():
         print("onnxruntime not available; install 'onnxruntime' or 'onnxruntime-silicon'.")
         return
 
-    base = run_benchmark(args.model, ishape, args.ep, args.warmup, args.runs,
+    base = run_benchmark(args.model, ishape, "coreml", args.warmup, args.runs,
                         enable_profile=args.ort_profile, profile_dir=args.ort_profile_dir, img_path=img_path)
     b = base["benchmark"]
     print("Providers (baseline):", b.get("providers"))
@@ -1928,7 +1925,7 @@ def main():
     print(f"Path: {final_abs}")
 
     print("\n=== Modified Benchmark ===")
-    mod = run_benchmark(work_path, ishape, args.ep, args.warmup, args.runs,
+    mod = run_benchmark(work_path, ishape, "coreml", args.warmup, args.runs,
                        enable_profile=args.ort_profile, profile_dir=args.ort_profile_dir, img_path=img_path)
     m = mod["benchmark"]
     print("Providers (modified):", m.get("providers"))
