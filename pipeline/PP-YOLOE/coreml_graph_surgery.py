@@ -1698,8 +1698,7 @@ def main():
     parser.add_argument("--rewrite-reduce-to-globalpool", action="store_true", help="Rewrite ReduceMean/ReduceMax over H,W to GlobalPool")
     parser.add_argument("--remove-noop-slice", action="store_true", help="Remove Slice ops that are effectively identity")
 
-    # NEW FLAGS
-    parser.add_argument("--aggressive-mode", action="store_true", help="Enable all ANE optimizations")
+    # Output control
     parser.add_argument("--output-model", type=str, help="Path to copy final optimized model to")
 
     args = parser.parse_args()
@@ -1713,22 +1712,6 @@ def main():
     if not args.keep_outputs and args.no_auto_discover:
         print("[ERROR] --no-auto-discover requires --keep-outputs to be specified", file=sys.stderr)
         return
-
-    # Aggressive mode enables all optimizations
-    if args.aggressive_mode:
-        args.fix_input_shapes = True
-        args.rewrite_hardsigmoid = True
-        args.rewrite_div = True
-        args.rewrite_pow = True
-        args.rewrite_slice_range_to_gather = True
-        args.rewrite_slice_to_gather = True
-        args.rewrite_resize_to_static = True
-        args.rewrite_reduce_to_globalpool = True
-        args.remove_noop_slice = True
-        args.fold_static_shapes = True
-        if not args.split_concat:
-            args.split_concat = 4
-        print("[Aggressive mode enabled - all ANE optimizations active]")
 
     os.makedirs(args.outdir, exist_ok=True)
     ishape = parse_shape(args.input_shape)

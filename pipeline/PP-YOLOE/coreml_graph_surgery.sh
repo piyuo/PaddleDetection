@@ -16,7 +16,7 @@
 
 python3 pipeline/PP-YOLOE/coreml_graph_surgery.py \
 --model pipeline/PP-YOLOE/models/ppyoloe_crn_s_36e_pphuman.onnx \
---input-shape 1,3,640,640 --ep coreml --warmup 20 --runs 100 \
+--input-shape 1,3,640,640 --ep coreml --warmup 20 --runs 80 \
 --img pipeline/dataset/demo/demo.jpg \
 --outdir pipeline/PP-YOLOE/models/surgery \
 --fix-input-shapes \
