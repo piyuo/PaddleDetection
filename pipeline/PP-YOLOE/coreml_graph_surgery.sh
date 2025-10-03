@@ -27,11 +27,11 @@ python3 pipeline/PP-YOLOE/coreml_graph_surgery.py \
 --rewrite-pow \
 --rewrite-hardsigmoid \
 --rewrite-slice-to-gather \
+--rewrite-slice-range-to-gather \
 --rewrite-resize-to-static \
 --remove-noop-slice \
 --rewrite-reduce-to-globalpool \
 --fp16 \
---rewrite-slice-range-to-gather \
 --output-model pipeline/PP-YOLOE/models/ppyoloe_crn_s_36e_pphuman_ane.onnx
 
 rm -rf pipeline/PP-YOLOE/models/surgery
