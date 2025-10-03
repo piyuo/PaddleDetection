@@ -1676,8 +1676,7 @@ def main():
     parser.add_argument("--runs", type=int, default=50)
     parser.add_argument("--img", type=str, help="Path to image for realistic preprocessing (not needed for --find-nms)")
     parser.add_argument("--outdir", type=str, default="pipeline/PP-YOLOE/models/surgery")
-    parser.add_argument("--ort-profile", action="store_true", help="Enable ORT timeline profiling")
-    parser.add_argument("--ort-profile-dir", type=str, default="pipeline/PP-YOLOE/output")
+    parser.add_argument("--ort-profile-dir", type=str, help="Directory for ORT profiling (enables profiling automatically)")
     parser.add_argument("--no-simplify", action="store_true")
     parser.add_argument("--no-shape-infer", action="store_true")
     parser.add_argument("--fp16", action="store_true", help="Attempt FP16 casting")
@@ -1717,13 +1716,16 @@ def main():
         print(f"[ERROR] Image not found: {img_path}")
         return
 
+    # Enable profiling automatically if profile directory is specified
+    enable_profiling = bool(args.ort_profile_dir)
+
     print("=== Baseline ===")
     if ort is None:
         print("onnxruntime not available; install 'onnxruntime' or 'onnxruntime-silicon'.")
         return
 
     base = run_benchmark(args.model, ishape, "coreml", args.warmup, args.runs,
-                        enable_profile=args.ort_profile, profile_dir=args.ort_profile_dir, img_path=img_path)
+                        enable_profile=enable_profiling, profile_dir=args.ort_profile_dir, img_path=img_path)
     b = base["benchmark"]
     print("Providers (baseline):", b.get("providers"))
     if base.get("coreml_capability"):
@@ -1926,7 +1928,7 @@ def main():
 
     print("\n=== Modified Benchmark ===")
     mod = run_benchmark(work_path, ishape, "coreml", args.warmup, args.runs,
-                       enable_profile=args.ort_profile, profile_dir=args.ort_profile_dir, img_path=img_path)
+                       enable_profile=enable_profiling, profile_dir=args.ort_profile_dir, img_path=img_path)
     m = mod["benchmark"]
     print("Providers (modified):", m.get("providers"))
     if mod.get("coreml_capability"):

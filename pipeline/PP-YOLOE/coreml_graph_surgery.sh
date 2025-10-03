@@ -40,5 +40,5 @@ python3 pipeline/PP-YOLOE/coreml_graph_surgery.py \
 rm -rf pipeline/PP-YOLOE/models/surgery
 
 
-# for profile
-# --ort-profile --ort-profile-dir pipeline/PP-YOLOE/models/profile \
+# To enable profiling, add this flag (profiling is automatic when specified):
+# --ort-profile-dir pipeline/PP-YOLOE/models/profile \
