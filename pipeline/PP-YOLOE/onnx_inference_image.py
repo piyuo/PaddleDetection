@@ -5,19 +5,28 @@ Run inference on a single image using ONNX Runtime with the exported PP-YOLOE Hu
 Usage:
     python pipeline/PP-YOLOE/onnx_inference_image.py \
         [--img pipeline/dataset/demo/demo.jpg] \
-        [--onnx pipeline/PP-YOLOE/models/ppyoloe_crn_s_36e_pphuman_embed.onnx] \
+        [--onnx pipeline/PP-YOLOE/models/ppyoloe_crn_s_36e_pphuman_ane.onnx] \
         [--out pipeline/output/onnx_vis] \
         [--thresh 0.5]
 
-Requirement:
-    - The ONNX model must expose per-detection embeddings named "embed" with shape (N, D),
-        where N matches the number of rows in the detection output (top-K). This script will error out
-        if "embed" is not present.
+Model Support:
+    - ANE-optimized model (automatic surgery): 4 outputs
+      * outputs[0]: raw boxes (8400×4) [x_center, y_center, w, h]
+      * outputs[1]: raw scores (1×1×8400) - needs squeeze and NMS
+      * outputs[2]: stride-8 features (1×C8×80×80) - fine-grained features
+      * outputs[3]: stride-16 features (1×C16×40×40) - semantic features
+      → Multi-scale embeddings extracted via roi_align_pool_multi_scale()
+
+    - Original model (with NMS): 2-3 outputs
+      * outputs[0]: detections (N×6) [class_id, score, x0, y0, x1, y1]
+      * outputs[1]: count
+      * outputs[2]: embed (optional, N×D) - per-detection embeddings
 
 Notes:
     - This script implements standalone preprocessing (no PaddleDetection dependency required).
     - Preprocessing matches the original PaddleDetection ONNX pipeline: resize to 640x640, normalize, permute.
     - Outputs are printed to stdout, with optional visualization and .npy files in --out.
+    - For ANE-optimized models, NMS is applied in Python and embeddings are extracted from feature maps.
 """
 
 import argparse
@@ -551,11 +560,32 @@ def main():
 
     # Combined model outputs summary (names + shapes) and expectations
     print('\nModel outputs:', out_names)
-    print(" - outputs[0]: detections (N,6) [class_id, score, x0, y0, x1, y1] - float32")
-    if 'embed' in out_names:
-        print(" - 'embed': per-detection embeddings (N, D) - float32, requires L2-normalization")
+
+    # Detect model type and explain outputs
+    has_nms = 'fetch_name_0' in out_names or (len(outputs) > 0 and isinstance(outputs[0], np.ndarray) and outputs[0].ndim == 2 and outputs[0].shape[1] == 6)
+    has_raw_boxes = any('divide' in n or 'box' in n.lower() for n in out_names)
+    has_features = len(out_names) >= 4 or any('batch_norm' in n or 'conv2d' in n for n in out_names)
+
+    if has_nms:
+        print(" - outputs[0]: detections (N,6) [class_id, score, x0, y0, x1, y1] - float32")
+        if 'embed' in out_names:
+            print(" - 'embed': per-detection embeddings (N, D) - float32, requires L2-normalization")
+        else:
+            print(" - Original model with NMS (no embeddings)")
+    elif has_raw_boxes and has_features:
+        print(" ✓ ANE-optimized model (automatic surgery)")
+        print(f" - outputs[0]: raw boxes ({outputs[0].shape}) [x_center, y_center, w, h]")
+        print(f" - outputs[1]: raw scores ({outputs[1].shape}) - needs squeeze and NMS")
+        if len(out_names) >= 3:
+            print(f" - outputs[2]: stride-8 features ({outputs[2].shape}) - fine-grained")
+        if len(out_names) >= 4:
+            s8_ch = outputs[2].shape[1] if len(out_names) >= 3 else 0
+            s16_ch = outputs[3].shape[1] if len(out_names) >= 4 else 0
+            total_dim = s8_ch + s16_ch
+            print(f" - outputs[3]: stride-16 features ({outputs[3].shape}) - semantic")
+            print(f" ✓ Multi-scale embeddings: {total_dim}D ({s8_ch} + {s16_ch})")
     else:
-        print(" - 'embed' not present: run insert_embedding_head.py to add embeddings or use *_embed.onnx")
+        print(" - Unknown model structure, see output details below")
     print('\n[Debug] Model outputs (names, shapes, and quick notes):')
     for i, n in enumerate(out_names):
         arr = outputs[i]
@@ -608,8 +638,15 @@ def main():
     name_to_out = {name: arr for name, arr in zip(out_names, outputs)}
 
     # Check if this is a pruned model (without NMS) or original model (with NMS)
-    # Pruned model outputs: p2o.pd_op.divide.0.0 (boxes), p2o.pd_op.concat.14.0 (scores), embed
-    # Original model outputs: fetch_name_0 (detections), fetch_name_1 (count), embed
+    # ANE-optimized model (automatic surgery):
+    #   - outputs[0]: p2o.pd_op.divide.0.0 (raw boxes, 8400×4)
+    #   - outputs[1]: p2o.pd_op.concat.14.0 (raw scores, 1×1×8400)
+    #   - outputs[2]: p2o.pd_op.batch_norm_.13.0 (stride-8 features, 1×128×80×80)
+    #   - outputs[3]: p2o.pd_op.batch_norm_.19.0 (stride-16 features, 1×256×40×40)
+    # Original model (with NMS):
+    #   - outputs[0]: fetch_name_0 (detections, N×6)
+    #   - outputs[1]: fetch_name_1 (count)
+    #   - outputs[2]: embed (optional, N×D)
     has_nms = 'fetch_name_0' in name_to_out or (len(outputs) > 0 and isinstance(outputs[0], np.ndarray) and outputs[0].ndim == 2 and outputs[0].shape[1] == 6)
 
     if has_nms:
@@ -721,12 +758,30 @@ def main():
             bboxes = np.column_stack([class_ids, scores_nms, boxes_nms])
 
             # Extract real embeddings from multi-scale feature maps
-            feat_s8_key = 'p2o.pd_op.batch_norm_.13.0'  # 128-channel @ 80x80 (stride-8)
-            feat_s16_key = 'p2o.pd_op.conv2d.45.0'      # 96-channel @ 40x40 (stride-16)
+            # Automatically detect stride-8 and stride-16 feature maps from model outputs
+            # Expected patterns:
+            #  - Stride-8: ~80x80 spatial size (640/8=80)
+            #  - Stride-16: ~40x40 spatial size (640/16=40)
+            feat_s8_key = None
+            feat_s16_key = None
+            feat_s8 = None
+            feat_s16 = None
 
-            if feat_s8_key in name_to_out and feat_s16_key in name_to_out:
-                feat_s8 = name_to_out[feat_s8_key]
-                feat_s16 = name_to_out[feat_s16_key]
+            for name, arr in name_to_out.items():
+                if isinstance(arr, np.ndarray) and arr.ndim == 4 and arr.shape[0] == 1:
+                    _, C, H, W = arr.shape
+                    # Detect stride-8 (spatial ~80x80, channels >= 64)
+                    if 70 <= H <= 90 and 70 <= W <= 90 and C >= 64:
+                        if feat_s8_key is None or C > name_to_out[feat_s8_key].shape[1]:
+                            feat_s8_key = name
+                            feat_s8 = arr
+                    # Detect stride-16 (spatial ~40x40, channels >= 64)
+                    elif 30 <= H <= 50 and 30 <= W <= 50 and C >= 64:
+                        if feat_s16_key is None or C > name_to_out[feat_s16_key].shape[1]:
+                            feat_s16_key = name
+                            feat_s16 = arr
+
+            if feat_s8 is not None and feat_s16 is not None:
                 print(f'  [INFO] Multi-scale embedding extraction:')
                 print(f'         Stride-8:  {feat_s8_key} (shape={feat_s8.shape})')
                 print(f'         Stride-16: {feat_s16_key} (shape={feat_s16.shape})')
@@ -749,20 +804,28 @@ def main():
                     )
                     emb_dim = embs_nms.shape[1]
                     print(f'  [INFO] Extracted multi-scale embeddings (shape={embs_nms.shape}, dim={emb_dim})')
-                    print(f'         Expected quality: median cosine 0.05-0.10, p95 < 0.35')
+                    print(f'         Expected quality: median cosine < 0.15, p95 < 0.35')
                 else:
                     print(f'  [WARN] Could not load image to get original size, using placeholder embeddings')
-                    embs_nms = np.zeros((len(bboxes), 224), dtype=np.float32)  # 128+96
+                    s8_ch = feat_s8.shape[1]
+                    s16_ch = feat_s16.shape[1]
+                    embs_nms = np.zeros((len(bboxes), s8_ch + s16_ch), dtype=np.float32)
             else:
-                missing = []
-                if feat_s8_key not in name_to_out:
-                    missing.append(feat_s8_key)
-                if feat_s16_key not in name_to_out:
-                    missing.append(feat_s16_key)
-                print(f'  [WARN] Feature maps not found: {missing}')
+                # Feature maps not found - determine expected embedding dimension from outputs
+                expected_dim = 224  # Default fallback
+                if len(out_names) >= 4:
+                    # Try to get actual dimension from feature map shapes
+                    for name, arr in name_to_out.items():
+                        if isinstance(arr, np.ndarray) and arr.ndim == 4 and arr.shape[0] == 1:
+                            if 70 <= arr.shape[2] <= 90:  # stride-8
+                                expected_dim = arr.shape[1]
+                            elif 30 <= arr.shape[2] <= 50:  # stride-16
+                                expected_dim += arr.shape[1]
+
+                print(f'  [WARN] Could not auto-detect stride-8 and stride-16 feature maps')
                 print(f'         Available outputs: {list(name_to_out.keys())}')
-                print(f'         Using placeholder embeddings (all zeros)')
-                embs_nms = np.zeros((len(bboxes), 224), dtype=np.float32)
+                print(f'         Using placeholder embeddings (all zeros, dim={expected_dim})')
+                embs_nms = np.zeros((len(bboxes), expected_dim), dtype=np.float32)
         else:
             print(f'  NMS found no boxes above threshold {score_threshold:.2f}')
             bboxes = np.zeros((0, 6), dtype=np.float32)
