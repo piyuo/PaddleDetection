@@ -1893,19 +1893,31 @@ def main():
         print(f"[WARNING] Failed to copy to final path: {e}")
         final_path = work_path
 
+    final_abs = os.path.abspath(final_path)
+    final_name = os.path.basename(final_path)
+
+    # Print comprehensive output guide if we did auto-discovery
+    if discovered_info and keep:
+        print_output_guide(discovered_info, keep)
+
+    # Model info and benchmarking at the end
     mod_info = load_model_info(work_path)
-    print("\n=== Modified Model Info ===")
+    print("\n" + "="*70)
+    print("=== Modified Model Info ===")
+    print("="*70)
     print("Nodes:", mod_info["node_count"], "Unique ops:", mod_info["unique_ops"])
     print("Modified model:", work_path)
     print("Final model:", final_path)
 
-    final_abs = os.path.abspath(final_path)
-    final_name = os.path.basename(final_path)
-    print("\n=== Final Artifact ===")
+    print("\n" + "="*70)
+    print("=== Final Artifact ===")
+    print("="*70)
     print(f"Filename: {final_name}")
     print(f"Path: {final_abs}")
 
-    print("\n=== Modified Benchmark ===")
+    print("\n" + "="*70)
+    print("=== Modified Benchmark ===")
+    print("="*70)
     mod = run_benchmark(work_path, ishape, "coreml", args.warmup, args.runs,
                        enable_profile=enable_profiling, profile_dir=args.ort_profile_dir, img_path=img_path)
     m = mod["benchmark"]
@@ -1926,7 +1938,9 @@ def main():
     def pct_delta(a, b):
         return 100.0 * (b - a) / a if a and np.isfinite(a) else float('nan')
 
-    print("\n=== Performance Comparison (Modified vs Baseline) ===")
+    print("\n" + "="*70)
+    print("=== Performance Comparison (Modified vs Baseline) ===")
+    print("="*70)
     avg_delta = pct_delta(b["latency_ms_avg"], m["latency_ms_avg"])
     p50_delta = pct_delta(b["latency_ms_p50"], m["latency_ms_p50"])
     p90_delta = pct_delta(b["latency_ms_p90"], m["latency_ms_p90"])
@@ -1958,10 +1972,7 @@ def main():
             print(f"Partitions: {base_parts} → {mod_parts}")
             print(f"ANE-supported nodes: {base_nodes} → {mod_nodes} ({mod_nodes - base_nodes:+d})")
 
-    # Print comprehensive output guide if we did auto-discovery
-    if discovered_info and keep:
-        print_output_guide(discovered_info, keep)
-
 
 if __name__ == "__main__":
+
     main()
