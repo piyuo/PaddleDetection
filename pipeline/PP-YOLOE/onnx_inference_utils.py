@@ -7,7 +7,7 @@ import os
 import plistlib
 import platform
 import time
-from typing import Iterable, List, Sequence, Tuple
+from typing import Iterable, List, Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
@@ -74,7 +74,13 @@ def preprocess_image(
     }
 
 
-def draw_and_save(img_path: str, boxes: np.ndarray, thresh: float, out_path: str, labels):
+def draw_and_save(
+    img_path: str,
+    boxes: np.ndarray,
+    thresh: float,
+    out_path: str,
+    label: Optional[str] = "object",
+):
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     im = cv2.imread(img_path)
     if im is None:
@@ -88,11 +94,11 @@ def draw_and_save(img_path: str, boxes: np.ndarray, thresh: float, out_path: str
         p2 = (int(x1), int(y1))
         color = (0, 255, 0)
         cv2.rectangle(im, p1, p2, color, 2)
-        if isinstance(labels, (list, tuple)) and int(cls_id) < len(labels):
-            label = labels[int(cls_id)]
+        if label:
+            label_text = label
         else:
-            label = f"cls{int(cls_id)}"
-        text = f"{label}:{score:.2f}"
+            label_text = f"cls{int(cls_id)}"
+        text = f"{label_text}:{score:.2f}"
         cv2.putText(
             im,
             text,
@@ -112,7 +118,7 @@ def draw_and_save_with_ids(
     ids: np.ndarray,
     thresh: float,
     out_path: str,
-    labels,
+    label: Optional[str] = "object",
 ):
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     im = cv2.imread(img_path)
@@ -127,11 +133,11 @@ def draw_and_save_with_ids(
         p2 = (int(x1), int(y1))
         color = (0, 200, 255)
         cv2.rectangle(im, p1, p2, color, 2)
-        if isinstance(labels, (list, tuple)) and int(cls_id) < len(labels):
-            label = labels[int(cls_id)]
+        if label:
+            label_text = label
         else:
-            label = f"cls{int(cls_id)}"
-        text = f"id{int(ids[k])}:{label}:{score:.2f}"
+            label_text = f"cls{int(cls_id)}"
+        text = f"id{int(ids[k])}:{label_text}:{score:.2f}"
         cv2.putText(
             im,
             text,
@@ -201,92 +207,11 @@ def default_paths() -> Tuple[str, str, str]:
     return onnx_path, img_path, out_dir
 
 
-def get_hardcoded_preprocess() -> Tuple[float, str, list]:
+def get_hardcoded_preprocess() -> Tuple[float, str, str]:
     draw_threshold = 0.5
     arch = "YOLO"
-    label_list = [
-        "person",
-        "bicycle",
-        "car",
-        "motorcycle",
-        "airplane",
-        "bus",
-        "train",
-        "truck",
-        "boat",
-        "traffic light",
-        "fire hydrant",
-        "stop sign",
-        "parking meter",
-        "bench",
-        "bird",
-        "cat",
-        "dog",
-        "horse",
-        "sheep",
-        "cow",
-        "elephant",
-        "bear",
-        "zebra",
-        "giraffe",
-        "backpack",
-        "umbrella",
-        "handbag",
-        "tie",
-        "suitcase",
-        "frisbee",
-        "skis",
-        "snowboard",
-        "sports ball",
-        "kite",
-        "baseball bat",
-        "baseball glove",
-        "skateboard",
-        "surfboard",
-        "tennis racket",
-        "bottle",
-        "wine glass",
-        "cup",
-        "fork",
-        "knife",
-        "spoon",
-        "bowl",
-        "banana",
-        "apple",
-        "sandwich",
-        "orange",
-        "broccoli",
-        "carrot",
-        "hot dog",
-        "pizza",
-        "donut",
-        "cake",
-        "chair",
-        "couch",
-        "potted plant",
-        "bed",
-        "dining table",
-        "toilet",
-        "tv",
-        "laptop",
-        "mouse",
-        "remote",
-        "keyboard",
-        "cell phone",
-        "microwave",
-        "oven",
-        "toaster",
-        "sink",
-        "refrigerator",
-        "book",
-        "clock",
-        "vase",
-        "scissors",
-        "teddy bear",
-        "hair drier",
-        "toothbrush",
-    ]
-    return draw_threshold, arch, label_list
+    label_name = "object"
+    return draw_threshold, arch, label_name
 
 
 def run_session_with_warmup(sess, feed: dict, warmup_runs: int = 3, verbose: bool = True):

@@ -128,7 +128,7 @@ def main():
             print(f"[ERROR] {label} not found: {path}", file=sys.stderr)
             sys.exit(1)
 
-    draw_threshold, _, label_list = get_hardcoded_preprocess()
+    draw_threshold, _, label_name = get_hardcoded_preprocess()
     if args.thresh is not None:
         draw_threshold = args.thresh
 
@@ -185,7 +185,14 @@ def main():
     vis_path = os.path.join(args.out, f"{base}.jpg")
     try:
         ids_valid = np.arange(boxes_valid.shape[0])
-        draw_and_save_with_ids(args.img, boxes_valid, ids_valid, float(draw_threshold), vis_path, label_list)
+        draw_and_save_with_ids(
+            args.img,
+            boxes_valid,
+            ids_valid,
+            float(draw_threshold),
+            vis_path,
+            label=label_name,
+        )
         print("Saved visualization to:", vis_path)
     except Exception as exc:  # pragma: no cover - visualization best effort
         print("[WARN] Failed to save visualization:", exc)
