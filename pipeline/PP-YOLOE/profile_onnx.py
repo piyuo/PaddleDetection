@@ -238,7 +238,6 @@ def run_benchmark(model_path: str, input_shape: Tuple[int, ...], ep: str, warmup
             prof_file = sess.end_profiling()
             if profile_dir:
                 os.makedirs(profile_dir, exist_ok=True)
-                # Move or copy profile
                 dest = os.path.join(profile_dir, os.path.basename(prof_file))
                 try:
                     import shutil
