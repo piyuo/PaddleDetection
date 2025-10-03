@@ -100,33 +100,189 @@ def preprocess_image(img_path: str, target_size: Tuple[int, int] = (640, 640),
         'im_shape': np.array(im.shape[1:], dtype=np.float32),  # (H, W)
         'scale_factor': np.array([im_scale_y, im_scale_x], dtype=np.float32)
     }
-    """
-    Simple ROI average pooling on a feature map.
-    - feat_map: (1, C, Hf, Wf)
-    - boxes_xyxy: (N, 4) in original image coordinates
-    - img_hw: (Himg, Wimg)
-    Returns:
-      embeddings: (N, C)
-    """
-    assert feat_map.ndim == 4 and feat_map.shape[0] == 1
-    _, C, Hf, Wf = feat_map.shape
-    Himg, Wimg = img_hw
-    scale_x = Wf / float(Wimg)
-    scale_y = Hf / float(Himg)
 
-    embs = []
-    for x0, y0, x1, y1 in boxes_xyxy:
+
+def roi_align_pool_multi_scale(
+    feat_s8: np.ndarray,
+    feat_s16: np.ndarray,
+    boxes_xyxy: np.ndarray,
+    img_hw: tuple,
+    input_size_hw: tuple = (640, 640),
+    # Global pooling params (recommended: gp_w=0.2)
+    gp_w: float = 0.2,
+    avg_w: float = 1.0,
+    max_w: float = 0.0,
+    # Part pooling params (recommended: pp_w=0.8, pp_k=9, pp_stripe_h=2)
+    pp_w: float = 0.8,
+    pp_k: int = 9,
+    pp_stripe_h: int = 2,
+    pp_vertical_k: int = 2,
+    pp_vertical_stripe_w: int = 2,
+    # Normalization params
+    use_inst_norm: bool = True,
+    pl_alpha: float = 0.35,
+) -> np.ndarray:
+    """
+    Multi-scale ROI pooling with global and part-based pooling (sophisticated embedding extraction).
+
+    Based on insert_embedding_head.py production-grade implementation:
+    - Multi-scale: Combines stride-8 and stride-16 features
+    - Global pooling: Weighted mix of avg/max pooling
+    - Part pooling: Horizontal/vertical stripes for body part discrimination
+    - Normalization: InstanceNorm → power-law → L2
+
+    Args:
+        feat_s8: (1, C_s8, H_s8, W_s8) - stride-8 feature map (~80×80)
+        feat_s16: (1, C_s16, H_s16, W_s16) - stride-16 feature map (~40×40)
+        boxes_xyxy: (N, 4) - boxes in original image coordinates [x0, y0, x1, y1]
+        img_hw: (Himg, Wimg) - original image size
+        input_size_hw: (H_input, W_input) - model input size (default 640x640)
+        gp_w: Global pooling weight (0.2 recommended)
+        avg_w: Average pooling weight (1.0 recommended)
+        max_w: Max pooling weight (0.0 recommended)
+        pp_w: Part pooling weight (0.8 recommended)
+        pp_k: Number of horizontal part divisions (9 recommended)
+        pp_stripe_h: Height of horizontal stripes (2 recommended)
+        pp_vertical_k: Number of vertical part divisions (2 recommended)
+        pp_vertical_stripe_w: Width of vertical stripes (2 recommended)
+        use_inst_norm: Apply instance normalization (True recommended)
+        pl_alpha: Power-law normalization exponent (0.35 recommended)
+
+    Returns:
+        embeddings: (N, C_s8 + C_s16) - L2-normalized embeddings
+
+    Expected quality metrics (from insert_embedding_head.py):
+        - Median cosine: 0.05-0.10
+        - P95 cosine: < 0.35
+    """
+    assert feat_s8.ndim == 4 and feat_s8.shape[0] == 1
+    assert feat_s16.ndim == 4 and feat_s16.shape[0] == 1
+
+    _, C_s8, H_s8, W_s8 = feat_s8.shape
+    _, C_s16, H_s16, W_s16 = feat_s16.shape
+    Himg, Wimg = img_hw
+    H_input, W_input = input_size_hw
+
+    # Coordinate scaling for each feature map
+    def compute_scales(Hf, Wf):
+        scale_y = (H_input / float(Himg)) * (Hf / float(H_input))
+        scale_x = (W_input / float(Wimg)) * (Wf / float(W_input))
+        return scale_x, scale_y
+
+    scale_x_s8, scale_y_s8 = compute_scales(H_s8, W_s8)
+    scale_x_s16, scale_y_s16 = compute_scales(H_s16, W_s16)
+
+    def extract_roi_advanced(feat_map, x0, y0, x1, y1, scale_x, scale_y, Hf, Wf, C):
+        """Extract and process ROI with global and part pooling."""
+        # Map to feature coordinates
         fx0 = int(max(0, np.floor(x0 * scale_x)))
         fy0 = int(max(0, np.floor(y0 * scale_y)))
         fx1 = int(min(Wf, np.ceil(x1 * scale_x)))
         fy1 = int(min(Hf, np.ceil(y1 * scale_y)))
+
         if fx1 <= fx0 or fy1 <= fy0:
-            embs.append(np.zeros((C,), dtype=np.float32))
-            continue
-        region = feat_map[0, :, fy0:fy1, fx0:fx1]
-        vec = region.reshape(C, -1).mean(axis=1) if region.size > 0 else np.zeros((C,), dtype=np.float32)
-        embs.append(vec)
-    return np.stack(embs, axis=0) if embs else np.zeros((0, C), dtype=np.float32)
+            return np.zeros((C,), dtype=np.float32)
+
+        # Extract ROI
+        roi = feat_map[0, :, fy0:fy1, fx0:fx1]  # (C, h, w)
+        _, h, w = roi.shape
+
+        features = []
+
+        # 1. Global pooling (weighted avg + max)
+        if gp_w > 0:
+            global_feat = np.zeros((C,), dtype=np.float32)
+            if avg_w > 0:
+                global_feat += avg_w * roi.mean(axis=(1, 2))
+            if max_w > 0:
+                global_feat += max_w * roi.max(axis=(1, 2))
+            features.append(global_feat * gp_w)
+
+        # 2. Horizontal part pooling (body parts: head, torso, legs, etc.)
+        if pp_w > 0 and pp_k > 0 and pp_stripe_h > 0:
+            stripe_size = max(1, h // pp_k)
+            for i in range(pp_k):
+                y_start = i * stripe_size
+                y_end = min(h, (i + 1) * stripe_size)
+                if y_end <= y_start:
+                    continue
+
+                # Each stripe has pp_stripe_h sub-divisions
+                sub_stripe_size = max(1, (y_end - y_start) // pp_stripe_h)
+                for j in range(pp_stripe_h):
+                    sub_y_start = y_start + j * sub_stripe_size
+                    sub_y_end = min(y_end, y_start + (j + 1) * sub_stripe_size)
+                    if sub_y_end <= sub_y_start:
+                        continue
+
+                    stripe = roi[:, sub_y_start:sub_y_end, :]  # (C, sub_h, w)
+                    stripe_feat = stripe.mean(axis=(1, 2))
+                    features.append(stripe_feat * pp_w / (pp_k * pp_stripe_h))
+
+        # 3. Vertical part pooling (left/right symmetry)
+        if pp_w > 0 and pp_vertical_k > 0 and pp_vertical_stripe_w > 0:
+            stripe_size = max(1, w // pp_vertical_k)
+            for i in range(pp_vertical_k):
+                x_start = i * stripe_size
+                x_end = min(w, (i + 1) * stripe_size)
+                if x_end <= x_start:
+                    continue
+
+                sub_stripe_size = max(1, (x_end - x_start) // pp_vertical_stripe_w)
+                for j in range(pp_vertical_stripe_w):
+                    sub_x_start = x_start + j * sub_stripe_size
+                    sub_x_end = min(x_end, x_start + (j + 1) * sub_stripe_size)
+                    if sub_x_end <= sub_x_start:
+                        continue
+
+                    stripe = roi[:, :, sub_x_start:sub_x_end]  # (C, h, sub_w)
+                    stripe_feat = stripe.mean(axis=(1, 2))
+                    features.append(stripe_feat * pp_w / (pp_vertical_k * pp_vertical_stripe_w))
+
+        # Combine all features
+        if not features:
+            return np.zeros((C,), dtype=np.float32)
+
+        combined = np.sum(features, axis=0)
+
+        # Instance normalization (channel-wise standardization)
+        if use_inst_norm:
+            mean = combined.mean()
+            std = combined.std()
+            if std > 1e-6:
+                combined = (combined - mean) / std
+
+        # Power-law normalization: sign(x) * |x|^alpha
+        if pl_alpha != 1.0:
+            sign = np.sign(combined)
+            combined = sign * np.power(np.abs(combined), pl_alpha)
+
+        return combined
+
+    # Process each box on both feature maps
+    embs = []
+    for x0, y0, x1, y1 in boxes_xyxy:
+        # Extract from stride-8 feature
+        feat_s8_vec = extract_roi_advanced(
+            feat_s8, x0, y0, x1, y1, scale_x_s8, scale_y_s8, H_s8, W_s8, C_s8
+        )
+
+        # Extract from stride-16 feature
+        feat_s16_vec = extract_roi_advanced(
+            feat_s16, x0, y0, x1, y1, scale_x_s16, scale_y_s16, H_s16, W_s16, C_s16
+        )
+
+        # Concatenate multi-scale features
+        combined = np.concatenate([feat_s8_vec, feat_s16_vec])
+
+        # Final L2 normalization
+        norm = np.linalg.norm(combined)
+        if norm > 1e-6:
+            combined = combined / norm
+
+        embs.append(combined)
+
+    return np.stack(embs, axis=0) if embs else np.zeros((0, C_s8 + C_s16), dtype=np.float32)
 
 
 def repo_root() -> str:
@@ -445,50 +601,192 @@ def main():
             # best-effort only
             pass
 
-    # Post-process for PP-YOLOE: first output is [N,6] -> [class_id, score, x0, y0, x1, y1]
-    bboxes = np.array(outputs[0])
+    # =========================================================================
+    # Post-process for PP-YOLOE with custom NMS
+    # =========================================================================
+    # Map output names to the output tensors for clarity
+    name_to_out = {name: arr for name, arr in zip(out_names, outputs)}
 
-    print('Detections (class score x0 y0 x1 y1):')
-    kept = 0
-    for b in bboxes:
-        if int(b[0]) > -1 and float(b[1]) >= float(draw_threshold):
-            kept += 1
-            print(f'{int(b[0])} {b[1]:.4f} {b[2]:.1f} {b[3]:.1f} {b[4]:.1f} {b[5]:.1f}')
-    if kept == 0:
-        print(f'No boxes above threshold {draw_threshold}. Try lowering --thresh.')
+    # Check if this is a pruned model (without NMS) or original model (with NMS)
+    # Pruned model outputs: p2o.pd_op.divide.0.0 (boxes), p2o.pd_op.concat.14.0 (scores), embed
+    # Original model outputs: fetch_name_0 (detections), fetch_name_1 (count), embed
+    has_nms = 'fetch_name_0' in name_to_out or (len(outputs) > 0 and isinstance(outputs[0], np.ndarray) and outputs[0].ndim == 2 and outputs[0].shape[1] == 6)
+
+    if has_nms:
+        # Original model with NMS already applied
+        print('\n[INFO] Model has NMS built-in (using existing detections)')
+        bboxes = np.array(outputs[0])
+
+        print('Detections (class score x0 y0 x1 y1):')
+        kept = 0
+        for b in bboxes:
+            if int(b[0]) > -1 and float(b[1]) >= float(draw_threshold):
+                kept += 1
+                print(f'{int(b[0])} {b[1]:.4f} {b[2]:.1f} {b[3]:.1f} {b[4]:.1f} {b[5]:.1f}')
+        if kept == 0:
+            print(f'No boxes above threshold {draw_threshold}. Try lowering --thresh.')
+
+        # --- Require per-detection embeddings for BoT-SORT ---
+        # Enforce presence of per-detection embeddings
+        if 'embed' not in name_to_out or not isinstance(name_to_out['embed'], np.ndarray):
+            print('\n[ERROR] Model does not expose per-detection embeddings "embed".', file=sys.stderr)
+            print('        Use pipeline/PP-YOLOE/insert_embedding_head.py to augment your model, or load the *_embed.onnx.', file=sys.stderr)
+            sys.exit(2)
+
+        det_embs = name_to_out['embed']
+        if det_embs.ndim != 2 or det_embs.shape[0] == 0:
+            print('\n[ERROR] "embed" must be a 2D array shaped (N, D) with N>0. Got:', det_embs.shape, file=sys.stderr)
+            sys.exit(2)
+
+        if det_embs.shape[0] != bboxes.shape[0]:
+            print('\n[ERROR] Row count mismatch between detections and embeddings:', file=sys.stderr)
+            print('        detections:', bboxes.shape, ' embed:', det_embs.shape, file=sys.stderr)
+            print('        Ensure your model outputs align. Regenerate with insert_embedding_head.py if needed.', file=sys.stderr)
+            sys.exit(2)
+
+        # Normalize per-detection embeddings
+        det_embs = det_embs.astype(np.float32)
+        det_embs = det_embs / (np.linalg.norm(det_embs, axis=1, keepdims=True) + 1e-8)
+
+        # Filter by threshold to match drawn/kept detections
+        valid_mask = (bboxes[:, 0] > -1) & (bboxes[:, 1] >= float(draw_threshold))
+        boxes_valid = bboxes[valid_mask]
+        embs_valid = det_embs[valid_mask]
+
+    else:
+        # Pruned model without NMS - we need to apply custom NMS
+        print('\n[INFO] Applying custom NMS post-processing (pruned model detected)...')
+
+        # Get raw model outputs (adjust names based on your pruned model)
+        # Expected outputs: boxes (N, 4), scores (N, num_classes or N,1)
+        raw_boxes_key = 'p2o.pd_op.divide.0.0'
+        raw_scores_key = 'p2o.pd_op.concat.14.0'
+
+        if raw_boxes_key not in name_to_out or raw_scores_key not in name_to_out:
+            print(f'\n[ERROR] Pruned model expected outputs not found!', file=sys.stderr)
+            print(f'        Expected: {raw_boxes_key}, {raw_scores_key}', file=sys.stderr)
+            print(f'        Found: {list(name_to_out.keys())}', file=sys.stderr)
+            sys.exit(2)
+
+        raw_boxes = np.squeeze(name_to_out[raw_boxes_key], axis=0) if name_to_out[raw_boxes_key].ndim > 2 else name_to_out[raw_boxes_key]
+        raw_scores = np.squeeze(name_to_out[raw_scores_key])  # Squeeze all batch dimensions
+
+        # Ensure boxes are 2D (N, 4)
+        if raw_boxes.ndim == 3:
+            raw_boxes = raw_boxes.squeeze(0)
+
+        print(f'  Raw boxes shape: {raw_boxes.shape}')
+        print(f'  Raw scores shape: {raw_scores.shape}')        # PP-YOLOE outputs boxes in [x0, y0, x1, y1] format and scores for each class
+        # Scores shape is typically (num_proposals, num_classes)
+        # For single-class (person), we use class 0
+        if raw_scores.ndim == 1:
+            person_scores = raw_scores
+        elif raw_scores.ndim == 2 and raw_scores.shape[1] == 1:
+            person_scores = raw_scores[:, 0]
+        elif raw_scores.ndim == 2:
+            # Multi-class: use class 0 (person)
+            person_scores = raw_scores[:, 0]
+        else:
+            print(f'\n[ERROR] Unexpected scores shape: {raw_scores.shape}', file=sys.stderr)
+            sys.exit(2)
+
+        # Boxes are already in [x0, y0, x1, y1] format from PP-YOLOE
+        # Convert to [x, y, w, h] for cv2.dnn.NMSBoxes
+        x0, y0, x1, y1 = raw_boxes[:, 0], raw_boxes[:, 1], raw_boxes[:, 2], raw_boxes[:, 3]
+        w = x1 - x0
+        h = y1 - y0
+        nms_boxes = np.column_stack([x0, y0, w, h]).tolist()
+
+        # Run NMS
+        score_threshold = float(draw_threshold)
+        nms_threshold = 0.5  # IoU threshold for NMS
+        print(f'  Applying NMS with score_threshold={score_threshold:.2f}, nms_threshold={nms_threshold:.2f}')
+        selected_indices = cv2.dnn.NMSBoxes(nms_boxes, person_scores.tolist(), score_threshold, nms_threshold)
+
+        # Assemble the final filtered outputs
+        if len(selected_indices) > 0:
+            # Flatten the indices array if it's nested
+            selected_indices = selected_indices.flatten()
+            print(f'  NMS kept {len(selected_indices)} detections from {len(person_scores)} proposals')
+
+            # Gather the final boxes and scores using the selected indices
+            boxes_nms = raw_boxes[selected_indices]
+            scores_nms = person_scores[selected_indices]
+
+            # Reconstruct the final (N, 6) bboxes array: [class_id, score, x0, y0, x1, y1]
+            # Class ID is 0 for "person"
+            class_ids = np.zeros_like(scores_nms)
+
+            # Boxes are already in (x0, y0, x1, y1) format
+            bboxes = np.column_stack([class_ids, scores_nms, boxes_nms])
+
+            # Extract real embeddings from multi-scale feature maps
+            feat_s8_key = 'p2o.pd_op.batch_norm_.13.0'  # 128-channel @ 80x80 (stride-8)
+            feat_s16_key = 'p2o.pd_op.conv2d.45.0'      # 96-channel @ 40x40 (stride-16)
+
+            if feat_s8_key in name_to_out and feat_s16_key in name_to_out:
+                feat_s8 = name_to_out[feat_s8_key]
+                feat_s16 = name_to_out[feat_s16_key]
+                print(f'  [INFO] Multi-scale embedding extraction:')
+                print(f'         Stride-8:  {feat_s8_key} (shape={feat_s8.shape})')
+                print(f'         Stride-16: {feat_s16_key} (shape={feat_s16.shape})')
+
+                # Get original image size from the loaded image
+                orig_img = cv2.imread(args.img)
+                if orig_img is not None:
+                    orig_h, orig_w = orig_img.shape[:2]
+                    img_hw = (orig_h, orig_w)
+
+                    # Extract embeddings using multi-scale ROI pooling with sophisticated features
+                    # Recommended settings from insert_embedding_head.py:
+                    # gp_w=0.2, pp_w=0.8, pp_k=9, pp_stripe_h=2
+                    embs_nms = roi_align_pool_multi_scale(
+                        feat_s8, feat_s16, boxes_nms, img_hw,
+                        input_size_hw=(640, 640),
+                        gp_w=0.2, pp_w=0.8, pp_k=9, pp_stripe_h=2,
+                        pp_vertical_k=2, pp_vertical_stripe_w=2,
+                        use_inst_norm=True, pl_alpha=0.35
+                    )
+                    emb_dim = embs_nms.shape[1]
+                    print(f'  [INFO] Extracted multi-scale embeddings (shape={embs_nms.shape}, dim={emb_dim})')
+                    print(f'         Expected quality: median cosine 0.05-0.10, p95 < 0.35')
+                else:
+                    print(f'  [WARN] Could not load image to get original size, using placeholder embeddings')
+                    embs_nms = np.zeros((len(bboxes), 224), dtype=np.float32)  # 128+96
+            else:
+                missing = []
+                if feat_s8_key not in name_to_out:
+                    missing.append(feat_s8_key)
+                if feat_s16_key not in name_to_out:
+                    missing.append(feat_s16_key)
+                print(f'  [WARN] Feature maps not found: {missing}')
+                print(f'         Available outputs: {list(name_to_out.keys())}')
+                print(f'         Using placeholder embeddings (all zeros)')
+                embs_nms = np.zeros((len(bboxes), 224), dtype=np.float32)
+        else:
+            print(f'  NMS found no boxes above threshold {score_threshold:.2f}')
+            bboxes = np.zeros((0, 6), dtype=np.float32)
+            embs_nms = np.zeros((0, 224), dtype=np.float32)  # 128+96 multi-scale
+
+        # Print detections
+        print('\nDetections after NMS (class score x0 y0 x1 y1):')
+        if len(bboxes) > 0:
+            for b in bboxes:
+                print(f'{int(b[0])} {b[1]:.4f} {b[2]:.1f} {b[3]:.1f} {b[4]:.1f} {b[5]:.1f}')
+        else:
+            print(f'No boxes above threshold {draw_threshold} after NMS.')
+
+        # Set final variables for downstream use
+        det_embs = embs_nms
+        boxes_valid = bboxes
+        embs_valid = embs_nms
+
+    # =========================================================================
+    # Common code for both paths (continues from here)
+    # =========================================================================
 
     base = os.path.splitext(os.path.basename(args.img))[0]
     vis_path = os.path.join(args.out, f'{base}.jpg')
-
-    # --- Require per-detection embeddings for BoT-SORT ---
-    name_to_out = {out_names[i]: outputs[i] for i in range(len(out_names))}
-    # Enforce presence of per-detection embeddings
-    if 'embed' not in name_to_out or not isinstance(name_to_out['embed'], np.ndarray):
-        print('\n[ERROR] Model does not expose per-detection embeddings "embed".', file=sys.stderr)
-        print('        Use pipeline/PP-YOLOE/insert_embedding_head.py to augment your model, or load the *_embed.onnx.', file=sys.stderr)
-        sys.exit(2)
-
-    det_embs = name_to_out['embed']
-    if det_embs.ndim != 2 or det_embs.shape[0] == 0:
-        print('\n[ERROR] "embed" must be a 2D array shaped (N, D) with N>0. Got:', det_embs.shape, file=sys.stderr)
-        sys.exit(2)
-
-    if det_embs.shape[0] != bboxes.shape[0]:
-        print('\n[ERROR] Row count mismatch between detections and embeddings:', file=sys.stderr)
-        print('        detections:', bboxes.shape, ' embed:', det_embs.shape, file=sys.stderr)
-        print('        Ensure your model outputs align. Regenerate with insert_embedding_head.py if needed.', file=sys.stderr)
-        sys.exit(2)
-
-    # Normalize per-detection embeddings
-    det_embs = det_embs.astype(np.float32)
-    det_embs = det_embs / (np.linalg.norm(det_embs, axis=1, keepdims=True) + 1e-8)
-
-    # Filter by threshold to match drawn/kept detections
-    valid_mask = (bboxes[:, 0] > -1) & (bboxes[:, 1] >= float(draw_threshold))
-    boxes_valid = bboxes[valid_mask]
-    embs_valid = det_embs[valid_mask]
-
-    base = os.path.splitext(os.path.basename(args.img))[0]
     os.makedirs(args.out, exist_ok=True)
 
     # Save a single visualization with valid detection ids

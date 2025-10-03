@@ -138,7 +138,7 @@ else
 	exit 1
 fi
 
-#./pipeline/PP-YOLOE/export_backbone_features.sh
-python3 pipeline/PP-YOLOE/insert_embedding_head.py \
-    --onnx_in pipeline/PP-YOLOE/models/ppyoloe_crn_s_36e_pphuman.onnx \
-	--onnx_out pipeline/PP-YOLOE/models/ppyoloe_crn_s_36e_pphuman_embed.onnx
+
+# print the final model is in pipeline/PP-YOLOE/models/ppyoloe_crn_s_36e_pphuman.onnx
+# and the inference model is in pipeline/PP-YOLOE/inference_model/ppyoloe_crn_s_36e_pphuman/
+echo "Final model is in ${ONNX_FILE}"

@@ -454,20 +454,117 @@ def fold_static_shape_chains(model_path: str, out_path: str, iterations: int = 4
 
 
 def prune_outputs(model_path: str, out_path: str, keep_outputs: List[str]) -> str:
-    """Keep only a subset of outputs and prune unreachable nodes."""
+    """Keep only a subset of outputs and prune unreachable nodes using custom DFS traversal."""
     if not keep_outputs:
         shutil.copyfile(model_path, out_path)
         return out_path
+
     m = onnx.load(model_path)
-    input_names = [vi.name for vi in m.graph.input]
-    try:
-        onnx.utils.extract_model(model_path, out_path, input_names, keep_outputs)
-        return out_path
-    except Exception:
-        shutil.copyfile(model_path, out_path)
-        return out_path
+    g = m.graph
+    print(f"  Pruning to keep outputs: {keep_outputs}")
 
+    # Build a map of tensor -> producing node (use node index for identity)
+    tensor_producers: Dict[str, int] = {}  # tensor_name -> node index
+    for idx, node in enumerate(g.node):
+        for out in node.output:
+            tensor_producers[out] = idx
 
+    # DFS from desired outputs to find all reachable node indices
+    reachable_node_indices: Set[int] = set()
+    visited_tensors: Set[str] = set()
+
+    def visit(tensor_name: str):
+        if tensor_name in visited_tensors:
+            return
+        visited_tensors.add(tensor_name)
+
+        # If this tensor is produced by a node, visit that node
+        if tensor_name in tensor_producers:
+            node_idx = tensor_producers[tensor_name]
+            if node_idx not in reachable_node_indices:
+                reachable_node_indices.add(node_idx)
+                node = g.node[node_idx]
+                # Recursively visit all inputs of this node
+                for inp in node.input:
+                    if inp:  # Skip empty strings
+                        visit(inp)
+
+    # Start DFS from each kept output
+    for out_name in keep_outputs:
+        visit(out_name)
+
+    print(f"  Reachable nodes: {len(reachable_node_indices)} / {len(g.node)}")
+
+    # Keep only reachable nodes (maintain order)
+    kept_nodes = [g.node[i] for i in sorted(reachable_node_indices)]
+
+    # Collect all tensor names that are either:
+    # - produced by kept nodes
+    # - consumed by kept nodes
+    # - are graph inputs
+    # - are in initializers
+    live_tensors: Set[str] = set()
+    for node in kept_nodes:
+        live_tensors.update(node.input)
+        live_tensors.update(node.output)
+
+    graph_input_names = {vi.name for vi in g.input}
+    live_tensors |= graph_input_names
+
+    init_names = {init.name for init in g.initializer}
+    live_tensors |= init_names
+
+    # Keep only initializers that are live
+    kept_inits = [init for init in g.initializer if init.name in live_tensors]
+
+    # Keep only value_info for live tensors
+    kept_vi = [vi for vi in g.value_info if vi.name in live_tensors]
+
+    # Create new outputs (find or create ValueInfoProto for each output)
+    new_outputs = []
+    for out_name in keep_outputs:
+        # Try to find existing value_info or output
+        found = False
+        for vi in list(g.output) + list(g.value_info):
+            if vi.name == out_name:
+                new_outputs.append(vi)
+                found = True
+                break
+
+        if not found:
+            # Create a minimal ValueInfoProto
+            vi = onnx.ValueInfoProto()
+            vi.name = out_name
+            # Set a generic tensor type (ONNX will infer shapes later)
+            vi.type.tensor_type.elem_type = onnx.TensorProto.FLOAT
+            new_outputs.append(vi)
+            print(f"  [WARNING] Created minimal ValueInfo for output '{out_name}'")
+
+    # Rebuild graph
+    del g.node[:]
+    g.node.extend(kept_nodes)
+
+    del g.initializer[:]
+    g.initializer.extend(kept_inits)
+
+    del g.value_info[:]
+    g.value_info.extend(kept_vi)
+
+    del g.output[:]
+    g.output.extend(new_outputs)
+
+    onnx.save(m, out_path)
+
+    # Verify pruning worked
+    m_pruned = onnx.load(out_path)
+    actual_outputs = [o.name for o in m_pruned.graph.output]
+    print(f"  Pruned model outputs: {actual_outputs}")
+    has_nms = any(n.op_type == 'NonMaxSuppression' for n in m_pruned.graph.node)
+    print(f"  Has NMS nodes: {has_nms}")
+    if has_nms:
+        print("  [WARNING] NMS nodes still present - they may be reachable from kept outputs!")
+
+    return out_path
 def rewrite_div_by_const(model_path: str, out_path: str) -> str:
     """Replace Div(x, c) where c is constant with Mul(x, 1/c)."""
     m = onnx.load(model_path)
@@ -1239,6 +1336,62 @@ def remove_noop_slice(model_path: str, out_path: str) -> str:
     return out_path
 
 
+def find_nms_nodes(model_path: str) -> List[str]:
+    """
+    Loads an ONNX model and prints information about NonMaxSuppression nodes.
+    Returns list of input tensor names that should be kept as outputs.
+    """
+    try:
+        m = onnx.load(model_path)
+        print(f"✅ Successfully loaded model: {model_path}")
+    except Exception as e:
+        print(f"❌ Error loading ONNX model: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    nms_nodes_found = []
+
+    # Iterate through all nodes in the model's graph
+    for node in m.graph.node:
+        # Check if the node's operator type is 'NonMaxSuppression'
+        if node.op_type == 'NonMaxSuppression':
+            nms_nodes_found.append(node)
+
+    if not nms_nodes_found:
+        print("\n[INFO] No 'NonMaxSuppression' nodes found in the model.")
+        return []
+
+    print(f"\n=== Found {len(nms_nodes_found)} 'NonMaxSuppression' node(s) ===")
+    input_tensors = []
+    for i, node in enumerate(nms_nodes_found):
+        print(f"\n--- NMS Node {i+1} ---")
+        print(f"  Node Name: {node.name}")
+        print(f"  Operator Type: {node.op_type}")
+
+        # The inputs are the most critical part for pruning
+        print("  Inputs (Tensor Names):")
+        for input_name in node.input:
+            print(f"    - {input_name}")
+            if input_name:  # Skip empty strings
+                input_tensors.append(input_name)
+
+        print("  Outputs (Tensor Names):")
+        for output_name in node.output:
+            print(f"    - {output_name}")
+
+    print("\n[ACTION REQUIRED]")
+    print("Use the 'Inputs (Tensor Names)' listed above for the `--keep-outputs` flag")
+    print("in your graph surgery script to remove the NMS node.")
+    if input_tensors:
+        # Also check if 'embed' output exists and suggest including it
+        embed_exists = any(o.name == 'embed' for o in m.graph.output)
+        suggestion = ",".join(input_tensors[:2])  # Usually boxes and scores are first 2 inputs
+        if embed_exists:
+            suggestion += ",embed"
+        print(f"Example: --keep-outputs \"{suggestion}\"")
+
+    return input_tensors
+
+
 def analyze_ane_compatibility(profile_summary: Dict) -> None:
     """Analyze and report ops most likely blocking ANE execution."""
     if not profile_summary:
@@ -1292,7 +1445,7 @@ def main():
     parser.add_argument("--ep", type=str, default="coreml")
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--runs", type=int, default=50)
-    parser.add_argument("--img", type=str, required=True, help="Path to image for realistic preprocessing")
+    parser.add_argument("--img", type=str, help="Path to image for realistic preprocessing (not needed for --find-nms)")
     parser.add_argument("--outdir", type=str, default="pipeline/PP-YOLOE/models/surgery")
     parser.add_argument("--ort-profile", action="store_true", help="Enable ORT timeline profiling")
     parser.add_argument("--ort-profile-dir", type=str, default="pipeline/PP-YOLOE/output")
@@ -1315,10 +1468,25 @@ def main():
     parser.add_argument("--remove-noop-slice", action="store_true", help="Remove Slice ops that are effectively identity")
 
     # NEW FLAGS
+    parser.add_argument("--find-nms", action="store_true", help="Find and report NonMaxSuppression nodes (diagnostic mode)")
     parser.add_argument("--aggressive-mode", action="store_true", help="Enable all ANE optimizations")
     parser.add_argument("--output-model", type=str, help="Path to copy final optimized model to")
 
     args = parser.parse_args()
+
+    # Diagnostic mode: find NMS nodes and exit
+    if args.find_nms:
+        print("=== NMS Node Discovery Mode ===")
+        find_nms_nodes(args.model)
+        print("\n[INFO] Use the tensor names above with --keep-outputs to prune the model.")
+        print("Example command:")
+        print(f"  python3 {sys.argv[0]} --model {args.model} --keep-outputs \"tensor1,tensor2,embed\" ...")
+        return
+
+    # Check required arguments for normal operation
+    if not args.img:
+        print("[ERROR] --img argument is required (not needed for --find-nms mode)", file=sys.stderr)
+        return
 
     # Aggressive mode enables all optimizations
     if args.aggressive_mode:
