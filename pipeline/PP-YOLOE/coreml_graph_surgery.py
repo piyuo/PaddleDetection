@@ -1676,11 +1676,8 @@ def main():
     parser.add_argument("--img", type=str, help="Path to image for realistic preprocessing (not needed for --find-nms)")
     parser.add_argument("--outdir", type=str, default="pipeline/PP-YOLOE/models/surgery")
     parser.add_argument("--ort-profile-dir", type=str, help="Directory for ORT profiling (enables profiling automatically)")
-    parser.add_argument("--no-simplify", action="store_true")
-    parser.add_argument("--no-shape-infer", action="store_true")
     parser.add_argument("--fp16", action="store_true", help="Attempt FP16 casting")
     parser.add_argument("--fix-input-shapes", action="store_true", help="Rewrite graph inputs to static shapes")
-    parser.add_argument("--no-optimizer", action="store_true", help="Disable onnxoptimizer passes")
     parser.add_argument("--split-concat", type=int, default=0, help="Split large Concat nodes")
     parser.add_argument("--fold-static-shapes", action="store_true", help="Fold shape computation chains")
     parser.add_argument("--fold-iterations", type=int, default=15, help="Iterations for constant folding (default: 15)")
@@ -1741,10 +1738,9 @@ def main():
         mod_fix = os.path.join(args.outdir, os.path.basename(args.model).replace('.onnx', '_fixed.onnx'))
         work_path = fix_input_shapes(work_path, mod_fix, ishape if len(ishape) == 4 else (1, 3, 640, 640))
 
-    if not args.no_shape_infer:
-        print("[stage] Shape inference…")
-        mod2 = mod_path.replace("_mod.onnx", "_shape.onnx")
-        work_path = shape_infer_model(work_path, mod2)
+    print("[stage] Shape inference…")
+    mod2 = mod_path.replace("_mod.onnx", "_shape.onnx")
+    work_path = shape_infer_model(work_path, mod2)
 
 
 
@@ -1754,10 +1750,9 @@ def main():
         work_path = split_large_concats(work_path, modC, max_inputs=int(args.split_concat))
 
     # Re-run shape inference after structural rewrites
-    if not args.no_shape_infer:
-        print("[stage] Running shape inference (post-rewrite)…")
-        mod2b = mod_path.replace("_mod.onnx", "_shape2.onnx")
-        work_path = shape_infer_model(work_path, mod2b)
+    print("[stage] Running shape inference (post-rewrite)…")
+    mod2b = mod_path.replace("_mod.onnx", "_shape2.onnx")
+    work_path = shape_infer_model(work_path, mod2b)
 
     if args.fold_static_shapes:
         print(f"[stage] Folding static shape chains ({args.fold_iterations} iterations)…")
@@ -1854,20 +1849,17 @@ def main():
         work_path = prune_outputs(work_path, modP, keep)
 
     # Final shape inference
-    if not args.no_shape_infer:
-        print("[stage] Running shape inference (final)…")
-        mod2c = mod_path.replace("_mod.onnx", "_shape3.onnx")
-        work_path = shape_infer_model(work_path, mod2c)
+    print("[stage] Running shape inference (final)…")
+    mod2c = mod_path.replace("_mod.onnx", "_shape3.onnx")
+    work_path = shape_infer_model(work_path, mod2c)
 
-    if not args.no_optimizer:
-        print("[stage] Applying onnxoptimizer passes…")
-        modO = os.path.join(args.outdir, os.path.basename(args.model).replace('.onnx', '_opt.onnx'))
-        work_path = run_onnxoptimizer(work_path, modO)
+    print("[stage] Applying onnxoptimizer passes…")
+    modO = os.path.join(args.outdir, os.path.basename(args.model).replace('.onnx', '_opt.onnx'))
+    work_path = run_onnxoptimizer(work_path, modO)
 
-    if not args.no_simplify:
-        print("[stage] Applying onnx-simplifier…")
-        modS = os.path.join(args.outdir, os.path.basename(args.model).replace('.onnx', '_simp.onnx'))
-        work_path = simplify_model(work_path, modS)
+    print("[stage] Applying onnx-simplifier…")
+    modS = os.path.join(args.outdir, os.path.basename(args.model).replace('.onnx', '_simp.onnx'))
+    work_path = simplify_model(work_path, modS)
 
     if args.fp16:
         print("[stage] Attempting FP16 casting…")
