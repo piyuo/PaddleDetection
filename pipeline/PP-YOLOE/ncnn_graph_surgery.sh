@@ -11,29 +11,12 @@ python3 pipeline/PP-YOLOE/coreml_graph_surgery.py \
 --input-shape 1,3,640,640 --warmup 20 --runs 80 \
 --img pipeline/dataset/demo/demo.jpg \
 --outdir pipeline/PP-YOLOE/models/surgery \
---fix-input-shapes \
---fold-iterations 15 \
---split-concat 4 \
---fold-static-shapes \
---rewrite-div \
---rewrite-pow \
---rewrite-hardsigmoid \
---rewrite-slice-to-gather \
---rewrite-slice-range-to-gather \
---rewrite-resize-to-static \
---remove-noop-slice \
---rewrite-reduce-to-globalpool \
---fp16 \
---output-model pipeline/PP-YOLOE/models/ppyoloe_crn_s_36e_pphuman_ncnn.onnx
+--output-model pipeline/PP-YOLOE/models/ncnn/ppyoloe_crn_s_36e_pphuman_ncnn.onnx
 
 
 mkdir -p pipeline/PP-YOLOE/models/ncnn
 
-cp pipeline/PP-YOLOE/models/ppyoloe_crn_s_36e_pphuman.onnx pipeline/PP-YOLOE/models/ncnn/
+pnnx pipeline/PP-YOLOE/models/ncnn/ppyoloe_crn_s_36e_pphuman_ncnn.onnx
 
-cd pipeline/PP-YOLOE/models/ncnn
-
-pnnx ppyoloe_crn_s_36e_pphuman.onnx
-
-cp ppyoloe_crn_s_36e_pphuman.ncnn.bin ../
-cp ppyoloe_crn_s_36e_pphuman.ncnn.param ../
+cp pipeline/PP-YOLOE/models/ncnn/ppyoloe_crn_s_36e_pphuman.ncnn.bin pipeline/PP-YOLOE/models/
+cp pipeline/PP-YOLOE/models/ncnn/ppyoloe_crn_s_36e_pphuman.ncnn.param pipeline/PP-YOLOE/models/
