@@ -5,6 +5,8 @@ from __future__ import annotations
 
 from typing import Dict
 
+import time
+
 import numpy as np
 
 from onnx_inference_utils import print_outputs_header, run_session_with_warmup
@@ -17,6 +19,7 @@ def run_original_inference(
     warmup_runs: int = 3,
 ):
     outputs, out_names, inference_ms = run_session_with_warmup(sess, feed, warmup_runs)
+    post_start = time.perf_counter()
     print_outputs_header("original", out_names, outputs, draw_threshold)
 
     if not outputs:
@@ -39,12 +42,16 @@ def run_original_inference(
     if boxes_valid.size:
         print("[INFO] Original model does not provide embeddings; returning empty features.")
 
+    post_ms = (time.perf_counter() - post_start) * 1000.0
+
     benchmark = {
         "model_type": "original",
         "warmup_runs": warmup_runs,
         "inference_ms": inference_ms,
         "num_detections": int(boxes_valid.shape[0]),
         "output_names": list(out_names),
+        "post_ms": post_ms,
+        "total_ms": inference_ms + post_ms,
     }
 
     return boxes_valid, embs_valid, benchmark

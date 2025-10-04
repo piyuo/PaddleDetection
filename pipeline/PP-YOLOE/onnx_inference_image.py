@@ -198,12 +198,21 @@ def main():
         print("[WARN] Failed to save visualization:", exc)
 
     print(f"\n[Summary] detections kept: {boxes_valid.shape[0]} (threshold {draw_threshold})")
-    print(f"[Summary] embeddings shape: {embs_valid.shape}")
+    if embs_valid.size == 0:
+        print("[Summary] embeddings: none (model does not output features)")
+    else:
+        print(f"[Summary] embeddings shape: {embs_valid.shape}")
     print(f"[Summary] model type: {model_type}")
     if benchmark:
         inference_ms = benchmark.get("inference_ms")
+        post_ms = benchmark.get("post_ms")
+        total_ms = benchmark.get("total_ms")
         if inference_ms is not None:
             print(f"[Timing] onnxruntime sess.run (after warmup): {inference_ms:.2f} ms")
+        if post_ms is not None:
+            print(f"[Timing] post-processing: {post_ms:.2f} ms")
+        if total_ms is not None:
+            print(f"[Timing] total pipeline (session + post): {total_ms:.2f} ms")
 
     print(f"\n✅ ONNX inference completed! Generated visualization: {vis_path}")
 

@@ -5,6 +5,8 @@ from __future__ import annotations
 
 from typing import Dict, Tuple
 
+import time
+
 import cv2
 import numpy as np
 
@@ -139,6 +141,7 @@ def run_ane_inference(
     warmup_runs: int = 3,
 ):
     outputs, out_names, inference_ms = run_session_with_warmup(sess, feed, warmup_runs)
+    post_start = time.perf_counter()
     print_outputs_header("ane", out_names, outputs, draw_threshold)
 
     name_to_out = {name: arr for name, arr in zip(out_names, outputs)}
@@ -277,12 +280,16 @@ def run_ane_inference(
 
     print_embedding_diagnostics(det_embs, embs_valid, boxes_valid)
 
+    post_ms = (time.perf_counter() - post_start) * 1000.0
+
     benchmark = {
         "model_type": "ane",
         "warmup_runs": warmup_runs,
         "inference_ms": inference_ms,
         "num_detections": int(boxes_valid.shape[0]),
         "output_names": list(out_names),
+        "post_ms": post_ms,
+        "total_ms": inference_ms + post_ms,
     }
 
     return boxes_valid, embs_valid, benchmark
