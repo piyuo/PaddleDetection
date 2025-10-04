@@ -17,6 +17,7 @@
 		"pdiparams",
 		"pdmodel",
 		"pdparams",
+		"pnnx",
 		"pphuman",
 		"ppyoloe",
 		"provs",
