@@ -10,4 +10,5 @@ python3 pipeline/PP-YOLOE/ncnn_inference_image.py \
     --ncnn_bin pipeline/PP-YOLOE/models/ppyoloe_crn_s_36e_pphuman_ncnn.ncnn.bin \
     --out pipeline/output \
     --thresh 0.5 \
+    --save-embeddings \
     --nms-thresh 0.5
