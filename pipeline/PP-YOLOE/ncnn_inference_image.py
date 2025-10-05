@@ -301,10 +301,11 @@ def main():
     # Load model
     print("\n[1/6] Loading NCNN model...")
     net = ncnn.Net()
-    net.opt.use_vulkan_compute = False
+    net.opt.use_vulkan_compute = True
     net.opt.use_fp16_arithmetic = True
     net.opt.use_fp16_storage = True
     net.opt.use_fp16_packed = True
+
 
     if net.load_param(args.ncnn_param) != 0:
         print(f"[ERROR] Failed to load param file", file=sys.stderr)
