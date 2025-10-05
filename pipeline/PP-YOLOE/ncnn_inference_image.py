@@ -337,9 +337,6 @@ def main():
     import time
     t0 = time.perf_counter()
     outputs = run_inference(net, img_mat)
-    t1 = time.perf_counter()
-    inference_ms = (t1 - t0) * 1000.0
-    print(f"  ✓ Inference time: {inference_ms:.2f}ms")
 
     if len(outputs) == 0:
         print("[ERROR] No outputs extracted from model", file=sys.stderr)
@@ -414,6 +411,10 @@ def main():
             print(f"  {i+1}. {int(cls_id)} {score:.4f} {x0:.1f} {y0:.1f} {x1:.1f} {y1:.1f}")
         if len(boxes_nms) > 10:
             print(f"  ... and {len(boxes_nms)-10} more")
+
+    t1 = time.perf_counter()
+    inference_ms = (t1 - t0) * 1000.0
+    print(f"  ✓ Inference time: {inference_ms:.2f}ms")
 
     # Save visualization
     print("\n[6/6] Saving outputs...")
