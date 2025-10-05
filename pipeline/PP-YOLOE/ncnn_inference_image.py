@@ -5,10 +5,6 @@ This script mirrors (conceptually) the orchestration style of the ONNX inference
 scripts (`onnx_inference_image.py`) but uses the NCNN runtime. It attempts to be
 robust to two common PP-YOLOE export patterns:
 
-  1. Model already contains NMS and returns a (N,6) array: (class, score, x0, y0, x1, y1)
-  2. Model returns separate raw boxes (N,4) and scores (N,) or (N,1) requiring
-	 custom NMS (simple IoU-based using OpenCV's `cv2.dnn.NMSBoxes`).
-
 Surgery / pruned NCNN models (post automatic graph surgery) remove the NMS node
 and expose raw outputs plus feature maps for embedding:
 
