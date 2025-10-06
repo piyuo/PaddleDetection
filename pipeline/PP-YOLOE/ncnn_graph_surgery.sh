@@ -60,5 +60,5 @@ ncnnoptimize pipeline/PP-YOLOE/models/ncnn/ppyoloe_crn_s_36e_pphuman_ncnn.ncnn.p
 ./pipeline/PP-YOLOE/ncnn_inference_image.sh
 
 
-cp pipeline/PP-YOLOE/models/ncnn/ppyoloe_crn_s_36e_pphuman_ncnn.ncnn.bin pipeline/PP-YOLOE/models/ppyoloe_crn_s_36e_pphuman_ncnn.bin
-cp pipeline/PP-YOLOE/models/ncnn/ppyoloe_crn_s_36e_pphuman_ncnn.ncnn.param pipeline/PP-YOLOE/models/ppyoloe_crn_s_36e_pphuman_ncnn.param
+#cp pipeline/PP-YOLOE/models/ncnn/ppyoloe_crn_s_36e_pphuman_ncnn.ncnn.bin pipeline/PP-YOLOE/models/ppyoloe_crn_s_36e_pphuman_ncnn.bin
+#cp pipeline/PP-YOLOE/models/ncnn/ppyoloe_crn_s_36e_pphuman_ncnn.ncnn.param pipeline/PP-YOLOE/models/ppyoloe_crn_s_36e_pphuman_ncnn.param
