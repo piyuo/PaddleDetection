@@ -1,7 +1,7 @@
-# pipeline/PP-YOLOE/coreml_graph_surgery.sh
+# pipeline/PP-YOLOE/ane_graph_surgery.sh
 #!/usr/bin/env bash
 
-# Pipeline PP-YOLOE CoreML Graph Surgery
+# Pipeline PP-YOLOE Apple Neural Engine Graph Surgery
 # This script automatically discovers and removes NMS (NonMaxSuppression) from the model
 # to enable full ANE acceleration. It also identifies optimal stride-8 and stride-16
 # feature maps for multi-scale embedding extraction.
@@ -14,7 +14,7 @@
 #
 # NMS and embedding extraction will be performed in the inference script.
 
-python3 pipeline/PP-YOLOE/coreml_graph_surgery.py \
+python3 pipeline/PP-YOLOE/ane_graph_surgery.py \
 --model pipeline/PP-YOLOE/models/ppyoloe_crn_s_36e_pphuman.onnx \
 --input-shape 1,3,640,640 --warmup 20 --runs 80 \
 --img pipeline/dataset/demo/demo.jpg \
@@ -31,12 +31,11 @@ python3 pipeline/PP-YOLOE/coreml_graph_surgery.py \
 --rewrite-resize-to-static \
 --remove-noop-slice \
 --rewrite-reduce-to-globalpool \
---fp16 \
 --output-model pipeline/PP-YOLOE/models/ppyoloe_crn_s_36e_pphuman_ane.onnx
 
 rm -rf pipeline/PP-YOLOE/models/surgery
 
-
+# --fp16 \
 # To enable profiling, add this flag (profiling is automatic when specified):
 # --ort-profile-dir pipeline/PP-YOLOE/models/profile \
 
