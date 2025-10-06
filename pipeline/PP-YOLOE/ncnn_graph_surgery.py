@@ -60,29 +60,6 @@ def shape_infer_model(model_path: str, out_path: str) -> str:
     return out_path
 
 
-def fix_input_shapes(model_path: str, out_path: str, nchw: Tuple[int, int, int, int], extra_2d: int = 2) -> str:
-    m = onnx.load(model_path)
-    n, c, h, w = nchw
-    for vi in m.graph.input:
-        tt = vi.type.tensor_type
-        rank = len(tt.shape.dim)
-        if rank == 4 and ("image" in vi.name.lower() or "input" in vi.name.lower()):
-            dims = [n, c, h, w]
-            for i, d in enumerate(tt.shape.dim):
-                d.dim_param = ""
-                d.dim_value = int(dims[i])
-        elif rank == 2 and ("scale" in vi.name.lower() or "shape" in vi.name.lower()):
-            dims = [n, extra_2d]
-            for i, d in enumerate(tt.shape.dim):
-                d.dim_param = ""
-                d.dim_value = int(dims[i])
-        elif rank == 1:
-            tt.shape.dim[0].dim_param = ""
-            tt.shape.dim[0].dim_value = int(n)
-    onnx.save(m, out_path)
-    return out_path
-
-
 def run_onnxoptimizer(model_path: str, out_path: str) -> str:
     try:
         import onnxoptimizer
@@ -116,22 +93,6 @@ def run_onnxoptimizer(model_path: str, out_path: str) -> str:
     except Exception:
         shutil.copyfile(model_path, out_path)
         return out_path
-
-
-def cast_graph_to_fp16(model_path: str, out_path: str) -> str:
-    """Best-effort FP16 casting while preserving I/O dtypes."""
-    try:
-        import importlib
-        mod = importlib.import_module('onnxmltools.utils.float16_converter')
-        convert_float_to_float16 = getattr(mod, 'convert_float_to_float16')
-    except Exception:
-        shutil.copyfile(model_path, out_path)
-        return out_path
-    m = onnx.load(model_path)
-    keep_io_types = {vi.name for vi in list(m.graph.input) + list(m.graph.output)}
-    m_fp16 = convert_float_to_float16(m, keep_io_types=keep_io_types)
-    onnx.save(m_fp16, out_path)
-    return out_path
 
 
 def clean_unused_tensors(model_path: str, out_path: str, drop_unused_inputs: bool = False) -> str:
@@ -211,245 +172,6 @@ def clean_unused_tensors(model_path: str, out_path: str, drop_unused_inputs: boo
         print(
             f"Cleaned unused: initializers={removed_inits}, constants={removed_const}, value_info={removed_vi}, inputs={removed_inputs}"
         )
-    return out_path
-
-
-def split_large_concats(model_path: str, out_path: str, max_inputs: int = 8) -> str:
-    """Split Concat nodes with too many inputs into a tree of smaller Concat nodes."""
-    assert max_inputs >= 2
-    m = onnx.load(model_path)
-    g = m.graph
-    total_splits = 0
-
-    def unique_name(base: str) -> str:
-        idx = 0
-        existing = {n.name for n in g.node}
-        existing.update({vi.name for vi in list(g.input) + list(g.output)})
-        existing.update({init.name for init in g.initializer})
-        name = f"{base}__{idx}"
-        while name in existing:
-            idx += 1
-            name = f"{base}__{idx}"
-        return name
-
-    new_nodes: List[onnx.NodeProto] = []
-    nodes_to_remove: List[onnx.NodeProto] = []
-
-    for node in g.node:
-        if node.op_type != "Concat":
-            continue
-        inputs = list(node.input)
-        if len(inputs) <= max_inputs:
-            continue
-        axis = None
-        for a in node.attribute:
-            if a.name == "axis":
-                axis = a.i
-                break
-        if axis is None:
-            axis = 1
-
-        current = inputs
-        while len(current) > 1:
-            next_level: List[str] = []
-            for i in range(0, len(current), max_inputs):
-                chunk = current[i : i + max_inputs]
-                if len(chunk) == 1:
-                    next_level.append(chunk[0])
-                else:
-                    out_name = unique_name(node.name + "_splitcat")
-                    cnode = helper.make_node(
-                        "Concat",
-                        inputs=chunk,
-                        outputs=[out_name],
-                        name=unique_name(node.name + "_Concat"),
-                        axis=axis,
-                    )
-                    new_nodes.append(cnode)
-                    next_level.append(out_name)
-            current = next_level
-
-        final_out = current[0]
-        if final_out != node.output[0]:
-            id_node = helper.make_node(
-                "Identity", inputs=[final_out], outputs=list(node.output), name=unique_name(node.name + "_Id")
-            )
-            new_nodes.append(id_node)
-        nodes_to_remove.append(node)
-        total_splits += 1
-
-    if total_splits == 0:
-        onnx.save(m, out_path)
-        return out_path
-
-    rebuilt: List[onnx.NodeProto] = []
-    for node in g.node:
-        if node in nodes_to_remove:
-            continue
-        rebuilt.append(node)
-    rebuilt.extend(new_nodes)
-    del g.node[:]
-    g.node.extend(rebuilt)
-
-    onnx.save(m, out_path)
-    print(f"Split large Concat nodes: {total_splits} node(s) processed (max_inputs={max_inputs})")
-    return out_path
-
-
-def fold_static_shape_chains(model_path: str, out_path: str, iterations: int = 4) -> str:
-    """Constant-fold common shape computation chains with configurable iterations."""
-    m = onnx.load(model_path)
-    g = m.graph
-
-    value_shapes = {}
-    def record_shape(vi):
-        try:
-            shp = []
-            tt = vi.type.tensor_type
-            for d in tt.shape.dim:
-                if d.dim_value:
-                    shp.append(int(d.dim_value))
-                else:
-                    shp.append(None)
-            value_shapes[vi.name] = shp
-        except Exception:
-            pass
-    for vi in list(g.input) + list(g.value_info) + list(g.output):
-        record_shape(vi)
-
-    const_vals = {}
-    for init in g.initializer:
-        const_vals[init.name] = numpy_helper.to_array(init)
-
-    def get_const(name: str):
-        return const_vals.get(name)
-
-    def set_const(target_name: str, arr: np.ndarray):
-        for i, init in enumerate(list(g.initializer)):
-            if init.name == target_name:
-                del g.initializer[i]
-                break
-        g.initializer.extend([numpy_helper.from_array(arr, name=target_name)])
-        const_vals[target_name] = arr
-
-    nodes_to_remove: List[onnx.NodeProto] = []
-
-    def try_fold(node: onnx.NodeProto) -> bool:
-        op = node.op_type
-        def get_attr(name, default=None):
-            for a in node.attribute:
-                if a.name == name:
-                    if a.type == onnx.AttributeProto.INT:
-                        return a.i
-                    if a.type == onnx.AttributeProto.INTS:
-                        return list(a.ints)
-                    if a.type == onnx.AttributeProto.FLOAT:
-                        return a.f
-                    if a.type == onnx.AttributeProto.FLOATS:
-                        return list(a.floats)
-                    if a.type == onnx.AttributeProto.STRING:
-                        return a.s
-            return default
-
-        if op == "Shape" and len(node.input) == 1:
-            x = node.input[0]
-            out = node.output[0]
-            shp = value_shapes.get(x)
-            if shp and all(d is not None for d in shp):
-                arr = np.asarray(shp, dtype=np.int64)
-                set_const(out, arr)
-                nodes_to_remove.append(node)
-                return True
-            return False
-
-        if op == "Gather" and len(node.input) >= 2:
-            data = get_const(node.input[0])
-            indices = get_const(node.input[1])
-            if data is None or indices is None:
-                return False
-            axis = get_attr("axis", 0)
-            try:
-                out_arr = np.take(data, indices.astype(np.int64), axis=axis)
-            except Exception:
-                return False
-            set_const(node.output[0], out_arr.astype(np.int64))
-            nodes_to_remove.append(node)
-            return True
-
-        if op == "Unsqueeze" and len(node.input) == 1:
-            x = get_const(node.input[0])
-            if x is None:
-                return False
-            axes = get_attr("axes")
-            if axes is None:
-                return False
-            arr = x
-            for ax in sorted([int(a) for a in axes]):
-                arr = np.expand_dims(arr, axis=ax)
-            set_const(node.output[0], arr.astype(np.int64))
-            nodes_to_remove.append(node)
-            return True
-
-        if op == "Concat" and len(node.input) >= 2:
-            axis = get_attr("axis", 0)
-            vals = [get_const(nm) for nm in node.input]
-            if any(v is None for v in vals):
-                return False
-            try:
-                out_arr = np.concatenate(vals, axis=axis)
-            except Exception:
-                return False
-            set_const(node.output[0], out_arr.astype(vals[0].dtype))
-            nodes_to_remove.append(node)
-            return True
-
-        if op == "Cast" and len(node.input) == 1:
-            x = get_const(node.input[0])
-            to = get_attr("to", None)
-            if x is None or to is None:
-                return False
-            type_map = {
-                onnx.TensorProto.FLOAT: np.float32,
-                onnx.TensorProto.FLOAT16: np.float16,
-                onnx.TensorProto.DOUBLE: np.float64,
-                onnx.TensorProto.INT64: np.int64,
-                onnx.TensorProto.INT32: np.int32,
-                onnx.TensorProto.INT16: np.int16,
-                onnx.TensorProto.INT8: np.int8,
-                onnx.TensorProto.UINT8: np.uint8,
-                onnx.TensorProto.BOOL: np.bool_,
-            }
-            dtype = type_map.get(int(to))
-            if dtype is None:
-                return False
-            set_const(node.output[0], x.astype(dtype))
-            nodes_to_remove.append(node)
-            return True
-
-        return False
-
-    changed = True
-    any_change = False
-    for _ in range(iterations):
-        if not changed:
-            break
-        changed = False
-        for node in list(g.node):
-            if node in nodes_to_remove:
-                continue
-            if try_fold(node):
-                changed = True
-                any_change = True
-
-    if not any_change:
-        onnx.save(m, out_path)
-        return out_path
-
-    kept = [n for n in g.node if n not in nodes_to_remove]
-    del g.node[:]
-    g.node.extend(kept)
-    onnx.save(m, out_path)
-    print(f"Folded static shape chains: {len(nodes_to_remove)} node(s) replaced by constants ({iterations} iterations)")
     return out_path
 
 
@@ -803,69 +525,6 @@ def rewrite_pow_patterns(model_path: str, out_path: str) -> str:
     g.node.extend(kept)
     onnx.save(m, out_path)
     print(f"Rewrote Pow patterns: {changed} node(s)")
-    return out_path
-
-
-def rewrite_hardsigmoid_linear(model_path: str, out_path: str) -> str:
-    """Rewrite HardSigmoid to a mul+add+clip linear form using min/max inputs for Clip."""
-    m = onnx.load(model_path)
-    g = m.graph
-    new_nodes: List[onnx.NodeProto] = []
-    nodes_to_remove: List[onnx.NodeProto] = []
-    changed = 0
-
-    def unique_name(base: str) -> str:
-        idx = 0
-        existing = {n.name for n in g.node}
-        existing.update({vi.name for vi in list(g.input) + list(g.output)})
-        existing.update({init.name for init in g.initializer})
-        name = f"{base}__{idx}"
-        while name in existing:
-            idx += 1
-            name = f"{base}__{idx}"
-        return name
-
-    for node in g.node:
-        if node.op_type != "HardSigmoid":
-            continue
-        x = node.input[0]
-        y = node.output[0]
-        alpha = 0.2
-        beta = 0.5
-        for a in node.attribute:
-            if a.name == "alpha":
-                alpha = float(a.f)
-            if a.name == "beta":
-                beta = float(a.f)
-
-        a_name = unique_name("hsig_alpha")
-        b_name = unique_name("hsig_beta")
-        z_name = unique_name("zero")
-        o_name = unique_name("one")
-        for nm, val in [
-            (a_name, alpha), (b_name, beta), (z_name, 0.0), (o_name, 1.0)
-        ]:
-            g.initializer.extend([numpy_helper.from_array(np.array(val, dtype=np.float32), name=nm)])
-
-        mul_out = unique_name(node.name + "_mul")
-        mul_node = helper.make_node("Mul", [x, a_name], [mul_out], name=unique_name(node.name + "_Mul"))
-        add_out = unique_name(node.name + "_add")
-        add_node = helper.make_node("Add", [mul_out, b_name], [add_out], name=unique_name(node.name + "_Add"))
-        clip_node = helper.make_node("Clip", [add_out, z_name, o_name], [y], name=unique_name(node.name + "_Clip"))
-        new_nodes.extend([mul_node, add_node, clip_node])
-        nodes_to_remove.append(node)
-        changed += 1
-
-    if changed == 0:
-        onnx.save(m, out_path)
-        return out_path
-
-    kept = [n for n in g.node if n not in nodes_to_remove]
-    kept.extend(new_nodes)
-    del g.node[:]
-    g.node.extend(kept)
-    onnx.save(m, out_path)
-    print(f"Rewrote HardSigmoid -> Mul+Add+Clip: {changed} node(s)")
     return out_path
 
 
@@ -1675,15 +1334,8 @@ def main():
     parser.add_argument("--runs", type=int, default=50)
     parser.add_argument("--img", type=str, help="Path to image for realistic preprocessing (not needed for --find-nms)")
     parser.add_argument("--outdir", type=str, default="pipeline/PP-YOLOE/models/surgery")
-    parser.add_argument("--ort-profile-dir", type=str, help="Directory for ORT profiling (enables profiling automatically)")
-    parser.add_argument("--fp16", action="store_true", help="Attempt FP16 casting")
-    parser.add_argument("--fix-input-shapes", action="store_true", help="Rewrite graph inputs to static shapes")
-    parser.add_argument("--split-concat", type=int, default=4, help="Split large Concat nodes")
-    parser.add_argument("--fold-static-shapes", action="store_true", help="Fold shape computation chains")
-    parser.add_argument("--fold-iterations", type=int, default=15, help="Iterations for constant folding (default: 15)")
     parser.add_argument("--rewrite-div", action="store_true", help="Rewrite Div to Mul with reciprocal")
     parser.add_argument("--rewrite-pow", action="store_true", help="Rewrite Pow patterns")
-    parser.add_argument("--rewrite-hardsigmoid", action="store_true", help="Rewrite HardSigmoid to Mul+Add+Clip")
     parser.add_argument("--rewrite-slice-range-to-gather", action="store_true", help="Rewrite range Slice (step=1) to Gather with indices")
     parser.add_argument("--rewrite-slice-to-gather", action="store_true", help="Rewrite Slice to Gather")
     parser.add_argument("--rewrite-resize-to-static", action="store_true", help="Replace dynamic Resize with static sizes")
@@ -1705,16 +1357,13 @@ def main():
         print(f"[ERROR] Image not found: {img_path}")
         return
 
-    # Enable profiling automatically if profile directory is specified
-    enable_profiling = bool(args.ort_profile_dir)
-
     print("=== Baseline ===")
     if ort is None:
         print("onnxruntime not available; install 'onnxruntime' or 'onnxruntime-silicon'.")
         return
 
     base = run_benchmark(args.model, ishape, "coreml", args.warmup, args.runs,
-                        enable_profile=enable_profiling, profile_dir=args.ort_profile_dir, img_path=img_path)
+                        enable_profile=False, profile_dir=None, img_path=img_path)
     b = base["benchmark"]
     print("Providers (baseline):", b.get("providers"))
     if base.get("coreml_capability"):
@@ -1733,36 +1382,14 @@ def main():
     mod_path = os.path.join(args.outdir, os.path.basename(args.model).replace('.onnx', '_mod.onnx'))
     work_path = args.model
 
-    if args.fix_input_shapes:
-        print("[stage] Fix input shapes to static…")
-        mod_fix = os.path.join(args.outdir, os.path.basename(args.model).replace('.onnx', '_fixed.onnx'))
-        work_path = fix_input_shapes(work_path, mod_fix, ishape if len(ishape) == 4 else (1, 3, 640, 640))
-
     print("[stage] Shape inference…")
     mod2 = mod_path.replace("_mod.onnx", "_shape.onnx")
     work_path = shape_infer_model(work_path, mod2)
-
-
-
-    if args.split_concat and args.split_concat > 0:
-        print(f"[stage] Splitting large Concat nodes (max_inputs={args.split_concat})…")
-        modC = os.path.join(args.outdir, os.path.basename(args.model).replace('.onnx', '_splitconcat.onnx'))
-        work_path = split_large_concats(work_path, modC, max_inputs=int(args.split_concat))
 
     # Re-run shape inference after structural rewrites
     print("[stage] Running shape inference (post-rewrite)…")
     mod2b = mod_path.replace("_mod.onnx", "_shape2.onnx")
     work_path = shape_infer_model(work_path, mod2b)
-
-    if args.fold_static_shapes:
-        print(f"[stage] Folding static shape chains ({args.fold_iterations} iterations)…")
-        modF = os.path.join(args.outdir, os.path.basename(args.model).replace('.onnx', '_foldshape.onnx'))
-        work_path = fold_static_shape_chains(work_path, modF, iterations=args.fold_iterations)
-
-    if args.rewrite_hardsigmoid:
-        print("[stage] Rewriting HardSigmoid to Mul+Add+Clip…")
-        modHSig = os.path.join(args.outdir, os.path.basename(args.model).replace('.onnx', '_hardsig.onnx'))
-        work_path = rewrite_hardsigmoid_linear(work_path, modHSig)
 
     if args.rewrite_div:
         print("[stage] Rewriting Div by constant…")
@@ -1861,11 +1488,6 @@ def main():
     modS = os.path.join(args.outdir, os.path.basename(args.model).replace('.onnx', '_simp.onnx'))
     work_path = simplify_model(work_path, modS)
 
-    if args.fp16:
-        print("[stage] Attempting FP16 casting…")
-        mod3 = os.path.join(args.outdir, os.path.basename(args.model).replace('.onnx', '_fp16.onnx'))
-        work_path = cast_graph_to_fp16(work_path, mod3)
-
     # Final cleanup to remove unused initializers/constants and silence ORT warnings
     try:
         print("[stage] Cleaning unused tensors…")
@@ -1919,7 +1541,7 @@ def main():
     print("=== Modified Benchmark ===")
     print("="*70)
     mod = run_benchmark(work_path, ishape, "coreml", args.warmup, args.runs,
-                       enable_profile=enable_profiling, profile_dir=args.ort_profile_dir, img_path=img_path)
+                       enable_profile=False, profile_dir=None, img_path=img_path)
     m = mod["benchmark"]
     print("Providers (modified):", m.get("providers"))
     if mod.get("coreml_capability"):
