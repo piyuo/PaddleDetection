@@ -15,7 +15,7 @@ fi
 
 # Default paths
 IMG="${1:-pipeline/dataset/demo/demo.jpg}"
-ONNX="${2:-pipeline/PP-YOLOE/models/ppyoloe_crn_s_36e_pphuman.onnx}"
+ONNX="${2:-pipeline/PP-YOLOE/models/ppyoloe_crn_s_36e_pphuman_embed.onnx}"
 OUT="${3:-pipeline/output}"
 THRESH="${4:-0.5}"
 
