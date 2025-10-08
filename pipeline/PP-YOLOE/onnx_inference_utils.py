@@ -70,6 +70,9 @@ def preprocess_image(
     return {
         "image": im,
         "im_shape": np.array(im.shape[1:], dtype=np.float32),
+        # scale_factor: [scale_y, scale_x] = [resized_h/orig_h, resized_w/orig_w]
+        # Used by PP-YOLOE post-process to convert boxes: network_coords → original_coords
+        # For embedding ROI alignment: multiply boxes by scale_factor to get back to network coords
         "scale_factor": np.array([im_scale_y, im_scale_x], dtype=np.float32),
     }
 

@@ -141,7 +141,15 @@ def list_rank4_candidates(onnx, model) -> List[Tuple[str, Optional[List[int]]]]:
     return uniq
 
 
-def pick_stride(cands: List[Tuple[str, List[int]]], Himg: int, Wimg: int, stride: int, exclude: Optional[set] = None) -> Optional[str]:
+def pick_stride(
+    cands: List[Tuple[str, List[int]]],
+    Himg: int,
+    Wimg: int,
+    stride: int,
+    exclude: Optional[set] = None,
+    min_channels: Optional[int] = None,
+    prefer_channels: Optional[List[int]] = None,
+) -> Optional[str]:
     """
     Select a feature map close to target stride with additional heuristics:
     - Prefer spatial sizes close to Himg/stride, Wimg/stride
@@ -165,6 +173,8 @@ def pick_stride(cands: List[Tuple[str, List[int]]], Himg: int, Wimg: int, stride
             return float('inf')
         if Hf <= 2 or Wf <= 2:
             return float('inf')
+        if min_channels is not None and C < int(min_channels):
+            return float('inf')
 
         # Channel sanity: prefer mid/high channels
         ch_pen = 0.0
@@ -174,6 +184,14 @@ def pick_stride(cands: List[Tuple[str, List[int]]], Himg: int, Wimg: int, stride
             ch_pen += 10.0
         elif C > 1536:
             ch_pen += 20.0
+
+        if prefer_channels:
+            # Favor channel counts close to any preferred value
+            closest = min(abs(C - pc) for pc in prefer_channels)
+            ch_pen += closest * 0.1
+        else:
+            # Default slight preference toward larger channel counts
+            ch_pen += -min(C, 1024) / 2048.0
 
         # Name-based penalties and bonuses
         lname = name.lower()
@@ -255,23 +273,36 @@ def probe_rank4_candidates(onnx, helper, TensorProto, model, max_probe: int = 15
     probed: List[Tuple[str, List[int]]] = []
     # We'll probe in small batches by creating temp models with a single extra output
     for name in names[:max_probe]:
+        tmp_path = None
         try:
             tmp_model = onnx.load_from_string(model.SerializeToString())
             tmp_model = add_output_to_model(tmp_model, name, onnx, helper, TensorProto)
             with tempfile.NamedTemporaryFile(suffix='.onnx', delete=False) as tf:
+                tmp_path = tf.name
                 onnx.save(tmp_model, tf.name)
-                import onnxruntime as ort  # type: ignore
-                sess = ort.InferenceSession(tf.name)
-                feed = guess_feed_from_inputs(sess)
-                outs = sess.run(None, feed)
-                out_names = [o.name for o in sess.get_outputs()]
-                m = {out_names[i]: outs[i] for i in range(len(out_names))}
-                if name in m:
-                    arr = m[name]
-                    if isinstance(arr, np.ndarray) and arr.ndim == 4 and arr.shape[0] in (1,):
-                        probed.append((name, list(arr.shape)))
+            import onnxruntime as ort  # type: ignore
+            sess_options = ort.SessionOptions()
+            try:
+                sess_options.log_severity_level = int(os.environ.get('ORT_LOG_SEVERITY_LEVEL', '3'))
+            except Exception:
+                sess_options.log_severity_level = 3
+            sess = ort.InferenceSession(tmp_path, sess_options)
+            feed = guess_feed_from_inputs(sess)
+            outs = sess.run(None, feed)
+            out_names = [o.name for o in sess.get_outputs()]
+            m = {out_names[i]: outs[i] for i in range(len(out_names))}
+            if name in m:
+                arr = m[name]
+                if isinstance(arr, np.ndarray) and arr.ndim == 4 and arr.shape[0] in (1,):
+                    probed.append((name, list(arr.shape)))
         except Exception:
             continue
+        finally:
+            if tmp_path and os.path.exists(tmp_path):
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
     return probed
 
 
@@ -339,8 +370,11 @@ def add_roi_head(onnx, helper, TensorProto, model, feat_name: str, det_out_name:
         helper.make_node('Slice', inputs=[det_out_name, 'roi_slice_starts', 'roi_slice_ends', 'roi_slice_axes', 'roi_slice_steps'], outputs=[boxes], name=make_name('Slice'))
     ])
 
-    # Attempt to rescale boxes from original image coords -> network input coords using scale_factor
-    # scale_factor is typically a model input of shape [1,2] = [scale_y, scale_x]
+    # Rescale boxes from original image coords -> network input coords using scale_factor
+    # PP-YOLOE exported models with NMS output boxes in ORIGINAL image coordinates (after dividing by scale_factor).
+    # For ROI alignment to work correctly, we must convert back to NETWORK coordinates (0-640 range).
+    # scale_factor is a model input of shape [1,2] or [2] = [scale_y, scale_x] where scale = resized/original.
+    # This multiplication converts: boxes_original * scale_factor = boxes_network (0-640 range).
     scale_inp = None
     for inp in g.input:
         n = inp.name.lower()
@@ -348,6 +382,8 @@ def add_roi_head(onnx, helper, TensorProto, model, feat_name: str, det_out_name:
             scale_inp = inp.name
             break
     if scale_inp is not None:
+        # Validation note: During inference, verify box ranges are in network coords (typically 0-640) after this scaling.
+        # If boxes still exceed network size, the model may not be using scale_factor as expected.
         # reshape to (2,), then gather sx, sy and build [sx, sy, sx, sy]
         shape2 = 'roi_scale_shape2'
         if not any(init.name == shape2 for init in g.initializer):
@@ -479,6 +515,7 @@ def add_roi_head_multi_scale(
     feat8: str,
     feat16: str,
     det_out_name: str,
+    max_detections: int = 16,
     stride8: int = 8,
     stride16: int = 16,
     out_name: str = 'embed',
@@ -509,6 +546,47 @@ def add_roi_head_multi_scale(
         while any(n.name == f'{base}_{idx}' for n in g.node):
             idx += 1
         return f'{base}_{idx}'
+
+    # Optionally cap detections to max_detections before building ROI head
+    det_src = det_out_name
+    max_keep = int(max_detections)
+    if max_keep > 0:
+        det_shape = det_out_name + '_shape'
+        g.node.extend([helper.make_node('Shape', inputs=[det_out_name], outputs=[det_shape], name=make_name('Shape'))])
+        idx0 = 'const_idx0'
+        if not any(init.name == idx0 for init in g.initializer):
+            g.initializer.extend([helper.make_tensor(name=idx0, data_type=TensorProto.INT64, dims=[1], vals=[0])])
+        det_rows = det_out_name + '_rows'
+        g.node.extend([helper.make_node('Gather', inputs=[det_shape, idx0], outputs=[det_rows], name=make_name('Gather'), axis=0)])
+        max_keep_name = 'embed_max_keep'
+        if not any(init.name == max_keep_name for init in g.initializer):
+            g.initializer.extend([helper.make_tensor(name=max_keep_name, data_type=TensorProto.INT64, dims=[1], vals=[max_keep])])
+        keep_rows = det_out_name + '_keep_rows'
+        g.node.extend([helper.make_node('Min', inputs=[det_rows, max_keep_name], outputs=[keep_rows], name=make_name('Min'))])
+        det_cols_const = 'embed_det_cols'
+        if not any(init.name == det_cols_const for init in g.initializer):
+            g.initializer.extend([helper.make_tensor(name=det_cols_const, data_type=TensorProto.INT64, dims=[1], vals=[6])])
+        row_slice_starts = 'embed_row_slice_starts'
+        if not any(init.name == row_slice_starts for init in g.initializer):
+            g.initializer.extend([helper.make_tensor(name=row_slice_starts, data_type=TensorProto.INT64, dims=[2], vals=[0, 0])])
+        row_slice_axes = 'embed_row_slice_axes'
+        if not any(init.name == row_slice_axes for init in g.initializer):
+            g.initializer.extend([helper.make_tensor(name=row_slice_axes, data_type=TensorProto.INT64, dims=[2], vals=[0, 1])])
+        row_slice_steps = 'embed_row_slice_steps'
+        if not any(init.name == row_slice_steps for init in g.initializer):
+            g.initializer.extend([helper.make_tensor(name=row_slice_steps, data_type=TensorProto.INT64, dims=[2], vals=[1, 1])])
+        rowslice_ends = det_out_name + '_rowslice_ends'
+        g.node.extend([helper.make_node('Concat', inputs=[keep_rows, det_cols_const], outputs=[rowslice_ends], name=make_name('Concat'), axis=0)])
+        det_capped = det_out_name + '_topk'
+        g.node.extend([
+            helper.make_node(
+                'Slice',
+                inputs=[det_out_name, row_slice_starts, rowslice_ends, row_slice_axes, row_slice_steps],
+                outputs=[det_capped],
+                name=make_name('Slice'),
+            )
+        ])
+        det_src = det_capped
 
     # Helper: part-based horizontal stripe pooling over H dimension
     # Splits H into K stripes and averages per stripe (ReduceMax), then averages stripes -> (N, C)
@@ -628,12 +706,13 @@ def add_roi_head_multi_scale(
     for t in (starts, ends, axes, steps):
         if t.name not in init_names:
             g.initializer.extend([t])
-    boxes = det_out_name + '_boxes_ms'
+    boxes = det_src + '_boxes_ms'
     g.node.extend([
-        helper.make_node('Slice', inputs=[det_out_name, 'roi_ms_slice_starts', 'roi_ms_slice_ends', 'roi_ms_slice_axes', 'roi_ms_slice_steps'], outputs=[boxes], name=make_name('Slice'))
+        helper.make_node('Slice', inputs=[det_src, 'roi_ms_slice_starts', 'roi_ms_slice_ends', 'roi_ms_slice_axes', 'roi_ms_slice_steps'], outputs=[boxes], name=make_name('Slice'))
     ])
 
     # Rescale boxes from original image coords -> network input coords using scale_factor if available
+    # See detailed explanation in add_roi_head() above for coordinate space conventions.
     scale_inp = None
     for inp in g.input:
         n = inp.name.lower()
@@ -1000,6 +1079,7 @@ def main():
     ap.add_argument('--s8_node', default=None, help='Override tensor name for s8 feature')
     ap.add_argument('--s16_node', default=None, help='Override tensor name for s16 feature')
     ap.add_argument('--det_out', default=None, help='Detection output (Nx6) tensor name (auto if omitted)')
+    ap.add_argument('--embed_topk', type=int, default=16, help='Max detections to embed (default: 16)')
     ap.add_argument('--max_probe', type=int, default=20, help='Max runtime outputs to probe when auto-picking feature tensors (default: 20)')
     # Tuning knobs for part/global pooling and color features
     ap.add_argument('--gp_w', type=float, default=0.2, help='Weight for global pooled features (default: 0.2)')
@@ -1031,17 +1111,162 @@ def main():
     Himg, Wimg = get_input_hw(model)
 
     s8_name, s16_name = args.s8_node, args.s16_node
-    if not s8_name or not s16_name:
-        cands = [(n, s) for n, s in list_rank4_candidates(onnx, model) if s is not None]
-        if not cands:
-            print('[INFO] Static shape inference did not yield candidates; probing runtime shapes ...')
-            cands = probe_rank4_candidates(onnx, helper, TensorProto, model, max_probe=args.max_probe)
-        if not s8_name:
-            s8_name = pick_stride(cands, Himg, Wimg, 8)
-        if not s16_name:
-            # Avoid selecting the same tensor as s8 when possible
-            excl = {s8_name} if s8_name else set()
-            s16_name = pick_stride(cands, Himg, Wimg, 16, exclude=excl)
+    cands = [(n, s) for n, s in list_rank4_candidates(onnx, model) if s is not None]
+    cand_dict: Dict[str, List[int]] = {n: s for n, s in cands}
+
+    need_autopick = (not s8_name) or (not s16_name)
+    fallback_limits = [limit for limit in (80, 120, 160, 200) if limit > args.max_probe]
+    probed_limits_done: set[int] = set()
+
+    def candidate_list() -> List[Tuple[str, List[int]]]:
+        return list(cand_dict.items())
+
+    def run_probe(limit: int, *, initial: bool = False) -> None:
+        if limit is None or limit <= 0 or limit in probed_limits_done:
+            return
+        probed_limits_done.add(limit)
+        if initial:
+            print(f'[INFO] Probing runtime shapes (max_probe={limit}) ...')
+        else:
+            print(f'[INFO] Re-probing runtime shapes with max_probe={limit} to locate stride features ...')
+        new_cands = probe_rank4_candidates(onnx, helper, TensorProto, model, max_probe=limit)
+        for name, shape in new_cands:
+            cand_dict[name] = shape
+
+    def try_auto_pick() -> bool:
+        nonlocal s8_name, s16_name
+        cand_list = candidate_list()
+        if not cand_list:
+            return False
+        local_s8 = s8_name if s8_name else pick_stride(
+            cand_list,
+            Himg,
+            Wimg,
+            8,
+            min_channels=96,
+            prefer_channels=[128, 160, 192],
+        )
+        if not local_s8:
+            return False
+        local_s16 = s16_name
+        if not local_s16:
+            excl = {local_s8}
+            local_s16 = pick_stride(
+                cand_list,
+                Himg,
+                Wimg,
+                16,
+                exclude=excl,
+                min_channels=192,
+                prefer_channels=[256, 224, 320],
+            )
+        if not local_s16:
+            return False
+        s8_name = local_s8
+        s16_name = local_s16
+        return True
+
+    if need_autopick and not cand_dict:
+        run_probe(args.max_probe, initial=True)
+
+    success = True
+    if need_autopick:
+        if args.max_probe > 0:
+            run_probe(args.max_probe, initial=(not cand_dict))
+        success = try_auto_pick()
+        if not success:
+            for limit in fallback_limits:
+                run_probe(limit)
+                if try_auto_pick():
+                    success = True
+                    break
+
+    cand_shapes = dict(cand_dict)
+
+    target_dim = 384
+    target_stride_hw = {
+        8: (max(1, Himg // 8), max(1, Wimg // 8)),
+        16: (max(1, Himg // 16), max(1, Wimg // 16)),
+    }
+
+    if need_autopick and not cand_shapes:
+        for limit in fallback_limits:
+            run_probe(limit)
+        cand_shapes = dict(cand_dict)
+
+    if need_autopick:
+        def has_target_combo(shapes: Dict[str, List[int]]) -> bool:
+            stride8_dims = set()
+            stride16_dims = set()
+            th8, tw8 = target_stride_hw[8]
+            th16, tw16 = target_stride_hw[16]
+            for shape in shapes.values():
+                if not shape or len(shape) != 4:
+                    continue
+                _, c, hf, wf = shape
+                if abs(hf - th8) <= 4 and abs(wf - tw8) <= 4:
+                    stride8_dims.add(c)
+                if abs(hf - th16) <= 4 and abs(wf - tw16) <= 4:
+                    stride16_dims.add(c)
+            return any((c8 + c16) == target_dim for c8 in stride8_dims for c16 in stride16_dims)
+
+        if not has_target_combo(cand_shapes):
+            for limit in fallback_limits:
+                run_probe(limit)
+                cand_shapes = dict(cand_dict)
+                if has_target_combo(cand_shapes):
+                    break
+
+    def matches_stride(shape: Optional[List[int]], stride: int) -> bool:
+        if shape is None or len(shape) != 4:
+            return False
+        _, _, Hf, Wf = shape
+        th, tw = target_stride_hw[stride]
+        return abs(Hf - th) <= 4 and abs(Wf - tw) <= 4
+
+    def best_pair_for_target() -> Optional[Tuple[str, str]]:
+        best_score = float('inf')
+        best_pair: Optional[Tuple[str, str]] = None
+        for name8, shape8 in cand_shapes.items():
+            if not matches_stride(shape8, 8):
+                continue
+            for name16, shape16 in cand_shapes.items():
+                if name16 == name8 or not matches_stride(shape16, 16):
+                    continue
+                c8 = shape8[1]
+                c16 = shape16[1]
+                stride_pen = (
+                    abs(shape8[2] - target_stride_hw[8][0])
+                    + abs(shape8[3] - target_stride_hw[8][1])
+                    + abs(shape16[2] - target_stride_hw[16][0])
+                    + abs(shape16[3] - target_stride_hw[16][1])
+                )
+                channel_pen = abs(c8 - 128) + abs(c16 - 256)
+                total_pen = abs((c8 + c16) - target_dim)
+                score = stride_pen + 0.5 * channel_pen + 2.0 * total_pen
+                if score < best_score:
+                    best_score = score
+                    best_pair = (name8, name16)
+        return best_pair
+
+    shape_s8 = cand_shapes.get(s8_name) if s8_name else None
+    shape_s16 = cand_shapes.get(s16_name) if s16_name else None
+    if shape_s8 and shape_s16:
+        if shape_s8[1] + shape_s16[1] != target_dim:
+            pair = best_pair_for_target()
+            if pair is not None:
+                if pair[0] != s8_name or pair[1] != s16_name:
+                    print('[INFO] Adjusted feature selection to satisfy 384-D embedding target.')
+                s8_name, s16_name = pair
+                shape_s8 = cand_shapes.get(s8_name)
+                shape_s16 = cand_shapes.get(s16_name)
+    elif cand_shapes:
+        pair = best_pair_for_target()
+        if pair is not None:
+            s8_name, s16_name = pair
+            shape_s8 = cand_shapes.get(s8_name)
+            shape_s16 = cand_shapes.get(s16_name)
+
     if not s8_name or not s16_name:
         print('[ERROR] Failed to auto-pick s8/s16 tensors. Consider passing --s8_node/--s16_node.', file=sys.stderr)
         sys.exit(2)
@@ -1049,6 +1274,20 @@ def main():
     print('Picked features:')
     print(' - s8 :', s8_name)
     print(' - s16:', s16_name)
+    if args.embed_topk and args.embed_topk > 0:
+        print(f'   embedding top-K limit: {args.embed_topk}')
+
+    if not shape_s8:
+        shape_s8 = cand_shapes.get(s8_name)
+    if not shape_s16:
+        shape_s16 = cand_shapes.get(s16_name)
+    if shape_s8 and shape_s16:
+        total_dim = shape_s8[1] + shape_s16[1]
+        print(f'   channel summary -> s8: {shape_s8[1]}, s16: {shape_s16[1]}, total: {total_dim}')
+        if total_dim != target_dim:
+            print(f'[WARN] Embedding channels sum to {total_dim}, expected {target_dim}.')
+    else:
+        print('[WARN] Unable to resolve channel counts for selected features; embedding dim may differ from expected.')
 
     # Always add multi-scale per-detection ROIAlign head
     det_out = args.det_out or find_detection_output(onnx, model)
@@ -1067,6 +1306,7 @@ def main():
         s8_name,
         s16_name,
         det_out,
+        max_detections=int(getattr(args, 'embed_topk', 16) or 0),
         stride8=8,
         stride16=16,
         out_name='embed',
@@ -1083,7 +1323,7 @@ def main():
         use_inst_norm=use_inst,
         center_ch=(False if getattr(args, 'no_center_ch', False) else True),
         pl_alpha=args.pl_alpha,
-    pre_norm_scales=bool(getattr(args, 'pre_norm_scales', True)),
+        pre_norm_scales=bool(getattr(args, 'pre_norm_scales', True)),
         sampling_ratio=int(getattr(args, 'sampling_ratio', 0)),
     )
 
