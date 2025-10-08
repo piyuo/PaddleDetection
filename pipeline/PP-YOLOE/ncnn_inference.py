@@ -188,8 +188,18 @@ def load_and_preprocess(img_path, target_size=DEFAULT_SIZE):
     return mat, (orig_w, orig_h)
 
 
-def run_inference(net, img_mat, input_names=["in0", "in1"], output_names=["out0", "out1", "out2", "out3"]):
-    """Run NCNN inference and extract outputs."""
+def run_inference(net, img_mat, input_names=["in0", "in1"], output_names=["out0", "out1", "out2", "out3"],
+                  backbone_layers=None):
+    """Run NCNN inference and extract outputs.
+
+    Args:
+        net: NCNN network
+        img_mat: Input image matrix
+        input_names: Names of input layers
+        output_names: Names of standard output layers (detections)
+        backbone_layers: Dict mapping output names to backbone layer names for manual extraction
+                        e.g., {"out2": "conv_147", "out3": "conv_159"}
+    """
     # Create scale_factor input (required by PP-YOLOE)
     scale_factor = ncnn.Mat(np.array([1.0, 1.0], dtype=np.float32))
 
@@ -203,12 +213,25 @@ def run_inference(net, img_mat, input_names=["in0", "in1"], output_names=["out0"
         # Fallback: use the image input name
         ex.input(input_names[0], img_mat)
 
-    # Extract outputs
+    # Extract standard outputs (detections)
     outputs = {}
     for name in output_names:
         ret, out_mat = ex.extract(name)
         if ret == 0:
             outputs[name] = out_mat.numpy()
+
+    # Extract backbone feature maps manually (for optimized models)
+    if backbone_layers:
+        print(f"\n[Manual Feature Extraction] Attempting to extract from backbone layers...")
+        for out_name, layer_name in backbone_layers.items():
+            if out_name in outputs:
+                continue
+            ret, out_mat = ex.extract(layer_name)
+            if ret == 0:
+                outputs[out_name] = out_mat.numpy()
+                print(f"  ✓ Extracted {out_name} from layer '{layer_name}': shape={out_mat.numpy().shape}")
+            else:
+                print(f"  ✗ Failed to extract {out_name} from layer '{layer_name}' (error code: {ret})")
 
     return outputs
 
@@ -337,7 +360,20 @@ def main():
     print("\n[4/6] Running inference...")
     import time
     t0 = time.perf_counter()
-    outputs = run_inference(net, img_mat)
+
+    # PP-YOLOE backbone layer mappings for feature extraction
+    # These layers correspond to stride-8 and stride-16 outputs in typical PP-YOLOE architecture
+    # Adjust these layer names based on your specific model architecture
+    backbone_feature_layers = {
+        "out2": "conv_147",  # Stride-8 feature map (96 channels @ 80x80)
+        "out3": "conv_159",  # Stride-16 feature map (192 channels @ 40x40)
+    }
+
+    t_forward_start = time.perf_counter()
+    outputs = run_inference(net, img_mat, backbone_layers=backbone_feature_layers)
+    t_forward_end = time.perf_counter()
+
+    forward_ms = (t_forward_end - t_forward_start) * 1000.0
 
     if len(outputs) == 0:
         print("[ERROR] No outputs extracted from model", file=sys.stderr)
@@ -362,6 +398,7 @@ def main():
 
     # Extract embeddings (matching onnx_inference_ane_model.py)
     embeddings = None
+    embed_ms = None
     feat_s8 = outputs.get("out2")  # Stride-8 feature map
     feat_s16 = outputs.get("out3")  # Stride-16 feature map
 
@@ -379,6 +416,7 @@ def main():
         # Extract boxes in xyxy format for embedding extraction
         boxes_xyxy = boxes_nms[:, 2:6]  # Skip class_id and score
 
+        t_embed_start = time.perf_counter()
         embeddings = roi_align_pool_multi_scale(
             feat_s8,
             feat_s16,
@@ -400,9 +438,13 @@ def main():
         if embeddings.shape[0] > 0:
             emb_norms = np.linalg.norm(embeddings, axis=1)
             print(f"  ✓ Embedding norms: min={emb_norms.min():.4f}, max={emb_norms.max():.4f}, mean={emb_norms.mean():.4f}")
+
+        t_embed_end = time.perf_counter()
+        embed_ms = (t_embed_end - t_embed_start) * 1000.0
     elif len(boxes_nms) > 0:
         print(f"\n[WARN] Feature maps not available for embedding extraction")
         print(f"       Available outputs: {list(outputs.keys())}")
+    # No detections keeps embed_ms as None
 
     # Print detections
     if len(boxes_nms) > 0:
@@ -414,8 +456,11 @@ def main():
             print(f"  ... and {len(boxes_nms)-10} more")
 
     t1 = time.perf_counter()
-    inference_ms = (t1 - t0) * 1000.0
-    print(f"  ✓ Inference time: {inference_ms:.2f}ms")
+    total_ms = (t1 - t0) * 1000.0
+    print(f"  ✓ Forward pass: {forward_ms:.2f}ms")
+    if embed_ms is not None:
+        print(f"  ✓ Embedding extraction: {embed_ms:.2f}ms")
+    print(f"  ✓ End-to-end latency: {total_ms:.2f}ms")
 
     # Save visualization
     print("\n[6/6] Saving outputs...")
@@ -432,7 +477,10 @@ def main():
 
     print("\n" + "="*60)
     print("✅ NCNN Inference Complete!")
-    print(f"   Inference: {inference_ms:.2f}ms")
+    print(f"   Forward: {forward_ms:.2f}ms")
+    if embed_ms is not None:
+        print(f"   Embedding: {embed_ms:.2f}ms")
+    print(f"   End-to-end: {total_ms:.2f}ms")
     print(f"   Detections: {len(boxes_nms)}")
     if embeddings is not None:
         print(f"   Embeddings: {embeddings.shape}")
