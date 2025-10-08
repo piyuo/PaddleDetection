@@ -12,11 +12,13 @@ source pipeline/PP-YOLOE/venv/bin/activate
 
 
 # export to onnx will create base onnx model from PP-YOLOE Paddle model weights
+# output: pipeline/PP-YOLOE/models/ppyoloe_crn_s_36e_pphuman.onnx
 pipeline/PP-YOLOE/export_to_onnx.sh \
     --config configs/pphuman/ppyoloe_crn_s_36e_pphuman.yml \
 	--weights pipeline/PP-YOLOE/weights/ppyoloe_crn_s_36e_pphuman.pdparams
 
 # create embeded onnx model for BOT-SORT
+# output: pipeline/PP-YOLOE/models/ppyoloe_crn_s_36e_pphuman_embed.onnx
 python pipeline/PP-YOLOE/insert_embedding_head.py \
                 --onnx_in pipeline/PP-YOLOE/models/ppyoloe_crn_s_36e_pphuman.onnx \
                 --onnx_out pipeline/PP-YOLOE/models/ppyoloe_crn_s_36e_pphuman_embed.onnx
