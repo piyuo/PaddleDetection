@@ -1238,13 +1238,6 @@ def print_output_guide(discovered: Dict[str, Any], keep_outputs: List[str]) -> N
         elif s16 and s16['name'] == out_name:
             print(f"feat_s16 = outputs[{i}]  # Shape: {s16['shape']}")
 
-    print("")
-    print("# Apply NMS (if using raw boxes/scores)")
-    if nms.get('boxes') in keep_outputs and nms.get('scores') in keep_outputs:
-        print("import cv2")
-        print("indices = cv2.dnn.NMSBoxes(boxes_raw[0], scores_raw, score_threshold=0.3, nms_threshold=0.5)")
-        print("boxes_nms = boxes_raw[0][indices]")
-        print("scores_nms = scores_raw[indices]")
 
     print("")
     if s8 and s16 and any(s8['name'] == o for o in keep_outputs) and any(s16['name'] == o for o in keep_outputs):
@@ -1257,8 +1250,6 @@ def print_output_guide(discovered: Dict[str, Any], keep_outputs: List[str]) -> N
         print("    gp_w=0.2, pp_w=0.8, pp_k=9, pp_stripe_h=2")
         print(")")
         print(f"# Result: embeddings.shape = (num_detections, {total_dim})")
-
-    print("\n" + "="*70 + "\n")
 
 
 def main():
@@ -1435,19 +1426,10 @@ def main():
 
     # Model info and benchmarking at the end
     mod_info = load_model_info(work_path)
-    print("\n" + "="*70)
-    print("=== Modified Model Info ===")
-    print("="*70)
     print("Nodes:", mod_info["node_count"], "Unique ops:", mod_info["unique_ops"])
     print("Modified model:", work_path)
     print("Final model:", final_path)
-
-    print("\n" + "="*70)
-    print("=== Final Artifact ===")
-    print("="*70)
-    print(f"Filename: {final_name}")
-    print(f"Path: {final_abs}")
-    print("\n✓ ONNX graph surgery complete. Ready for NCNN conversion.")
+    print("✓ ONNX graph surgery complete. Ready for NCNN conversion.")
 
 
 if __name__ == "__main__":
