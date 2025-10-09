@@ -11,4 +11,6 @@ python3 pipeline/PP-YOLOE/ncnn_inference.py \
     --out pipeline/output \
     --thresh 0.5 \
     --save-embeddings \
-    --nms-thresh 0.5
+    --nms-thresh 0.5 \
+    --threads 4 \
+    --warmup 3

@@ -16,6 +16,7 @@ Usage:
 import argparse
 import os
 import sys
+import time
 import numpy as np
 import cv2
 
@@ -188,13 +189,14 @@ def load_and_preprocess(img_path, target_size=DEFAULT_SIZE):
     return mat, (orig_w, orig_h)
 
 
-def run_inference(net, img_mat, input_names=["in0", "in1"], output_names=["out0", "out1", "out2", "out3"],
+def run_inference(net, img_mat, num_threads=4, input_names=["in0", "in1"], output_names=["out0", "out1", "out2", "out3"],
                   backbone_layers=None):
     """Run NCNN inference and extract outputs.
 
     Args:
         net: NCNN network
         img_mat: Input image matrix
+        num_threads: Number of threads to use for inference
         input_names: Names of input layers
         output_names: Names of standard output layers (detections)
         backbone_layers: Dict mapping output names to backbone layer names for manual extraction
@@ -203,8 +205,14 @@ def run_inference(net, img_mat, input_names=["in0", "in1"], output_names=["out0"
     # Create scale_factor input (required by PP-YOLOE)
     scale_factor = ncnn.Mat(np.array([1.0, 1.0], dtype=np.float32))
 
-    # Create extractor and set inputs
+    # CRITICAL FIX: Create a fresh extractor for each inference
+    # NCNN extractors can only be used once and must be recreated
     ex = net.create_extractor()
+
+    # Set extractor options for better performance
+    # Note: In Python bindings, num_threads is set on Net.opt, not on Extractor
+    ex.set_light_mode(True)  # Reduce memory usage
+
     if "in0" in input_names:
         ex.input("in0", scale_factor)
     if "in1" in input_names:
@@ -309,6 +317,7 @@ def main():
     parser.add_argument("--nms-thresh", type=float, default=0.5, help="NMS IoU threshold")
     parser.add_argument("--warmup", type=int, default=3, help="Warmup runs")
     parser.add_argument("--save-embeddings", action="store_true", help="Save embeddings to .npy file")
+    parser.add_argument("--threads", type=int, default=4, help="Number of threads for inference (default: 4)")
     args = parser.parse_args()
 
     # Check files exist
@@ -324,11 +333,19 @@ def main():
     # Load model
     print("\n[1/6] Loading NCNN model...")
     net = ncnn.Net()
-    net.opt.use_vulkan_compute = True
-    net.opt.use_fp16_arithmetic = True
-    net.opt.use_fp16_storage = True
-    net.opt.use_fp16_packed = True
 
+    # Core optimizations that work with Python bindings
+    net.opt.use_vulkan_compute = True      # Enable Vulkan GPU acceleration
+    net.opt.use_fp16_packed = True         # Enable FP16 packed storage
+    net.opt.use_fp16_storage = True        # Enable FP16 storage
+    net.opt.use_fp16_arithmetic = True     # Enable FP16 arithmetic
+    net.opt.use_packing_layout = True      # Use packed tensor layout
+    net.opt.use_bf16_storage = False       # Disable BF16 (not widely supported)
+    net.opt.num_threads = args.threads     # Set number of threads for inference
+
+    # Note: Some advanced options like use_shader_pack8, use_image_storage,
+    # use_winograd_convolution, use_sgemm_convolution are not exposed in
+    # the Python bindings but are automatically used by NCNN when beneficial
 
     if net.load_param(args.ncnn_param) != 0:
         print(f"[ERROR] Failed to load param file", file=sys.stderr)
@@ -353,14 +370,13 @@ def main():
     if args.warmup > 0:
         print(f"\n[3/6] Warming up ({args.warmup} runs)...")
         for _ in range(args.warmup):
-            run_inference(net, img_mat, output_names=["out0", "out1"])
+            # Warmup with full pipeline including backbone features for accurate performance
+            run_inference(net, img_mat, num_threads=args.threads)
         print(f"  ✓ Warmup complete")
 
     # Inference
     print("\n[4/6] Running inference...")
-    import time
     t0 = time.perf_counter()
-
     # PP-YOLOE backbone layer mappings for feature extraction
     # These layers correspond to stride-8 and stride-16 outputs in typical PP-YOLOE architecture
     # Adjust these layer names based on your specific model architecture
@@ -369,8 +385,10 @@ def main():
         "out3": "conv_159",  # Stride-16 feature map (192 channels @ 40x40)
     }
 
+
     t_forward_start = time.perf_counter()
-    outputs = run_inference(net, img_mat, backbone_layers=backbone_feature_layers)
+    # Extract all outputs: out0 (boxes), out1 (scores), out2 (stride-8 features), out3 (stride-16 features)
+    outputs = run_inference(net, img_mat, num_threads=args.threads, backbone_layers=backbone_feature_layers)
     t_forward_end = time.perf_counter()
 
     forward_ms = (t_forward_end - t_forward_start) * 1000.0
