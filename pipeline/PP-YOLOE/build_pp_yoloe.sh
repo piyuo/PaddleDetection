@@ -17,8 +17,9 @@ pipeline/PP-YOLOE/export_to_onnx.sh \
     --config configs/pphuman/ppyoloe_crn_s_36e_pphuman.yml \
 	--weights pipeline/PP-YOLOE/weights/ppyoloe_crn_s_36e_pphuman.pdparams
 
-
-
+# build ncnn model
+# output: pipeline/PP-YOLOE/models/ppyoloe_crn_s_36e_pphuman_ncnn.param + .bin
+./pipeline/PP-YOLOE/build_ncnn_model.sh
 
 # create embedding head on onnx model may slow down the model inference on edge device, cause RoIAlign operator is not well supported on Edge devices,
 # event onnx with tensorrt backend may well support RoIAlign operator, we decide not to include embedding head into the base onnx model for now.
