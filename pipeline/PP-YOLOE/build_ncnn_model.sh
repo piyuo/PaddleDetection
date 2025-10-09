@@ -9,8 +9,7 @@ mkdir -p pipeline/PP-YOLOE/models/ncnn
 
 python3 pipeline/PP-YOLOE/build_ncnn_model.py \
 --model pipeline/PP-YOLOE/models/ppyoloe_crn_s_36e_pphuman.onnx \
---input-shape 1,3,640,640 --warmup 20 --runs 80 \
---img pipeline/dataset/demo/demo.jpg \
+--input-shape 1,3,640,640 \
 --outdir pipeline/PP-YOLOE/models/surgery \
 --rewrite-div \
 --rewrite-pow \

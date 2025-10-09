@@ -22,7 +22,6 @@ except Exception:
 from profile_onnx import (
     load_model_info,
     parse_shape,
-    run_benchmark,
 )
 
 
@@ -1228,20 +1227,6 @@ def print_output_guide(discovered: Dict[str, Any], keep_outputs: List[str]) -> N
         print("Normalization: InstanceNorm → power-law (α=0.35) → L2")
         print("Expected quality: median cosine < 0.15, p95 < 0.35")
 
-    # Print code template
-    print(f"\n" + "-"*70)
-    print("=== Python Inference Template ===")
-    print("-"*70)
-    print("import onnxruntime as ort")
-    print("import numpy as np")
-    print("")
-    print("# Load model")
-    print("sess = ort.InferenceSession('model.onnx', providers=['CoreMLExecutionProvider'])")
-    print("")
-    print("# Run inference")
-    print("outputs = sess.run(None, {'image': img_tensor, ...})")
-    print("")
-
     # Generate specific code based on discovered outputs
     for i, out_name in enumerate(keep_outputs):
         if nms.get('boxes') == out_name:
@@ -1276,49 +1261,8 @@ def print_output_guide(discovered: Dict[str, Any], keep_outputs: List[str]) -> N
     print("\n" + "="*70 + "\n")
 
 
-def analyze_ane_compatibility(profile_summary: Dict) -> None:
-    """Analyze and report ops most likely blocking ANE execution."""
-    if not profile_summary:
-        return
-
-    cpu_ops = profile_summary.get("top_ops_by_time", {}).get("CPUExecutionProvider", [])
-    if not cpu_ops:
-        return
-
-    known_ane_unfriendly = {
-        "NonMaxSuppression", "RoiAlign", "TopK", "Where", "IsNaN",
-        "Loop", "If", "Scan", "Resize"  # Some Resize modes
-    }
-
-    print("\n=== ANE Compatibility Analysis ===")
-    print("Top CPU ops (candidates for optimization):")
-    for op, time_ms, count in cpu_ops[:15]:
-        marker = " ⚠️  ANE-unfriendly" if op in known_ane_unfriendly else ""
-        pct = ""
-        total_cpu = profile_summary.get("provider_total_time_ms", {}).get("CPUExecutionProvider", 0)
-        if total_cpu > 0:
-            pct = f" ({100.0 * time_ms / total_cpu:.1f}%)"
-        print(f"  • {op}: {time_ms:.2f}ms ({count} nodes){pct}{marker}")
-
-    # Suggest specific optimizations
-    op_names = {op for op, _, _ in cpu_ops[:15]}
-    suggestions = []
-
-    if "Slice" in op_names:
-        suggestions.append("  → Try --rewrite-slice-to-gather for simple slicing patterns")
-    if "NonMaxSuppression" in op_names:
-        suggestions.append("  → NMS is inherently CPU-bound; consider splitting model at detection head")
-    if "RoiAlign" in op_names:
-        suggestions.append("  → RoiAlign may not be ANE-supported; consider alternative pooling")
-
-    if suggestions:
-        print("\nOptimization suggestions:")
-        for s in suggestions:
-            print(s)
-
-
 def main():
-    parser = argparse.ArgumentParser(description="Enhanced graph surgery for PP-YOLOE ONNX with ANE optimizations")
+    parser = argparse.ArgumentParser(description="ONNX graph surgery for PP-YOLOE NCNN optimization")
     parser.add_argument(
         "--model",
         type=str,
@@ -1326,9 +1270,6 @@ def main():
         help="Path to source ONNX model",
     )
     parser.add_argument("--input-shape", type=str, default="1,3,640,640")
-    parser.add_argument("--warmup", type=int, default=5)
-    parser.add_argument("--runs", type=int, default=50)
-    parser.add_argument("--img", type=str, help="Path to image for realistic preprocessing (not needed for --find-nms)")
     parser.add_argument("--outdir", type=str, default="pipeline/PP-YOLOE/models/surgery")
     parser.add_argument("--rewrite-div", action="store_true", help="Rewrite Div to Mul with reciprocal")
     parser.add_argument("--rewrite-pow", action="store_true", help="Rewrite Pow patterns")
@@ -1341,38 +1282,12 @@ def main():
 
     args = parser.parse_args()
 
-    # Check required arguments for normal operation
-    if not args.img:
-        print("[ERROR] --img argument is required", file=sys.stderr)
-        return
-
     os.makedirs(args.outdir, exist_ok=True)
     ishape = parse_shape(args.input_shape)
-    img_path = args.img if os.path.isabs(args.img) else os.path.abspath(args.img)
-    if not os.path.exists(img_path):
-        print(f"[ERROR] Image not found: {img_path}")
-        return
 
-    print("=== Baseline ===")
+    print("=== Starting ONNX Graph Surgery ===")
     if ort is None:
-        print("onnxruntime not available; install 'onnxruntime' or 'onnxruntime-silicon'.")
-        return
-
-    base = run_benchmark(args.model, ishape, "coreml", args.warmup, args.runs,
-                        enable_profile=False, profile_dir=None, img_path=img_path)
-    b = base["benchmark"]
-    print("Providers (baseline):", b.get("providers"))
-    if base.get("coreml_capability"):
-        cap = base["coreml_capability"]
-        print(f"CoreML capability (baseline): partitions={cap.get('num_partitions')} nodes supported={cap.get('num_nodes')}")
-    print(
-        "Baseline Latency (ms) avg={:.2f} p50={:.2f} p90={:.2f} p95={:.2f}".format(
-            b["latency_ms_avg"], b["latency_ms_p50"], b["latency_ms_p90"], b["latency_ms_p95"]
-        )
-    )
-
-    if base.get("profile_summary"):
-        analyze_ane_compatibility(base["profile_summary"])
+        print("[WARNING] onnxruntime not available; some features may be limited.")
 
     # Build modified path
     mod_path = os.path.join(args.outdir, os.path.basename(args.model).replace('.onnx', '_mod.onnx'))
@@ -1532,63 +1447,7 @@ def main():
     print("="*70)
     print(f"Filename: {final_name}")
     print(f"Path: {final_abs}")
-
-    print("\n" + "="*70)
-    print("=== Modified Benchmark ===")
-    print("="*70)
-    mod = run_benchmark(work_path, ishape, "coreml", args.warmup, args.runs,
-                       enable_profile=False, profile_dir=None, img_path=img_path)
-    m = mod["benchmark"]
-    print("Providers (modified):", m.get("providers"))
-    if mod.get("coreml_capability"):
-        cap = mod["coreml_capability"]
-        print(f"CoreML capability (modified): partitions={cap.get('num_partitions')} nodes supported={cap.get('num_nodes')}")
-    print(
-        "Modified Latency (ms) avg={:.2f} p50={:.2f} p90={:.2f} p95={:.2f}".format(
-            m["latency_ms_avg"], m["latency_ms_p50"], m["latency_ms_p90"], m["latency_ms_p95"]
-        )
-    )
-
-    if mod.get("profile_summary"):
-        analyze_ane_compatibility(mod["profile_summary"])
-
-    # Comparison
-    def pct_delta(a, b):
-        return 100.0 * (b - a) / a if a and np.isfinite(a) else float('nan')
-
-    print("\n" + "="*70)
-    print("=== Performance Comparison (Modified vs Baseline) ===")
-    print("="*70)
-    avg_delta = pct_delta(b["latency_ms_avg"], m["latency_ms_avg"])
-    p50_delta = pct_delta(b["latency_ms_p50"], m["latency_ms_p50"])
-    p90_delta = pct_delta(b["latency_ms_p90"], m["latency_ms_p90"])
-    p95_delta = pct_delta(b["latency_ms_p95"], m["latency_ms_p95"])
-
-    def format_delta(d):
-        sign = "+" if d > 0 else ""
-        return f"{sign}{d:.2f}%"
-
-    print(f"Average latency: {b['latency_ms_avg']:.2f}ms → {m['latency_ms_avg']:.2f}ms ({format_delta(avg_delta)})")
-    print(f"P50 latency:     {b['latency_ms_p50']:.2f}ms → {m['latency_ms_p50']:.2f}ms ({format_delta(p50_delta)})")
-    print(f"P90 latency:     {b['latency_ms_p90']:.2f}ms → {m['latency_ms_p90']:.2f}ms ({format_delta(p90_delta)})")
-    print(f"P95 latency:     {b['latency_ms_p95']:.2f}ms → {m['latency_ms_p95']:.2f}ms ({format_delta(p95_delta)})")
-
-    # Speedup summary
-    if avg_delta < 0:
-        speedup = b["latency_ms_avg"] / m["latency_ms_avg"]
-        print(f"\n🚀 Speedup: {speedup:.2f}x faster")
-
-    # CoreML partition improvement
-    if base.get("coreml_capability") and mod.get("coreml_capability"):
-        base_parts = base["coreml_capability"].get("num_partitions", 0)
-        mod_parts = mod["coreml_capability"].get("num_partitions", 0)
-        base_nodes = base["coreml_capability"].get("num_nodes", 0)
-        mod_nodes = mod["coreml_capability"].get("num_nodes", 0)
-
-        if base_parts != mod_parts or base_nodes != mod_nodes:
-            print("\n=== CoreML Partition Changes ===")
-            print(f"Partitions: {base_parts} → {mod_parts}")
-            print(f"ANE-supported nodes: {base_nodes} → {mod_nodes} ({mod_nodes - base_nodes:+d})")
+    print("\n✓ ONNX graph surgery complete. Ready for NCNN conversion.")
 
 
 if __name__ == "__main__":
