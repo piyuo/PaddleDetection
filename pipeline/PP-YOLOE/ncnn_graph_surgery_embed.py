@@ -1414,19 +1414,16 @@ def main():
     discovered_info = auto_discover_outputs(work_path, img_hw=img_hw, verbose=True)
 
     # Build keep_outputs list from discovered info
+    # Only keep NMS outputs (boxes, scores) - feature maps are no longer needed
+    # since embeddings are added directly by insert_embedding_head.py
     nms = discovered_info.get('nms', {})
     if nms.get('boxes'):
         keep.append(nms['boxes'])
     if nms.get('scores'):
         keep.append(nms['scores'])
 
-    s8 = discovered_info.get('stride_8')
-    if s8:
-        keep.append(s8['name'])
-
-    s16 = discovered_info.get('stride_16')
-    if s16:
-        keep.append(s16['name'])
+    # Removed: stride_8 and stride_16 feature map exports
+    # These are no longer needed because insert_embedding_head.py adds embeddings directly to the model
 
     if keep:
         print(f"\n✓ Auto-discovered outputs to keep: {len(keep)} tensors")
