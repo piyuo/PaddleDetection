@@ -26,7 +26,6 @@ except Exception:
 from profile_onnx import (
     load_model_info,
     parse_shape,
-    run_benchmark,
 )
 
 
@@ -1186,8 +1185,6 @@ def main():
         help="Path to source ONNX model",
     )
     parser.add_argument("--input-shape", type=str, default="1,3,640,640")
-    parser.add_argument("--warmup", type=int, default=5)
-    parser.add_argument("--runs", type=int, default=50)
     parser.add_argument("--img", type=str, help="Path to image for realistic preprocessing (not needed for --find-nms)")
     parser.add_argument("--outdir", type=str, default="pipeline/PP-YOLOE/models/surgery")
     parser.add_argument("--rewrite-div", action="store_true", help="Rewrite Div to Mul with reciprocal")
@@ -1213,26 +1210,7 @@ def main():
         print(f"[ERROR] Image not found: {img_path}")
         return
 
-    print("=== Baseline ===")
-    if ort is None:
-        print("onnxruntime not available; install 'onnxruntime' or 'onnxruntime-silicon'.")
-        return
-
-    base = run_benchmark(args.model, ishape, "coreml", args.warmup, args.runs,
-                        enable_profile=False, profile_dir=None, img_path=img_path)
-    b = base["benchmark"]
-    print("Providers (baseline):", b.get("providers"))
-    if base.get("coreml_capability"):
-        cap = base["coreml_capability"]
-        print(f"CoreML capability (baseline): partitions={cap.get('num_partitions')} nodes supported={cap.get('num_nodes')}")
-    print(
-        "Baseline Latency (ms) avg={:.2f} p50={:.2f} p90={:.2f} p95={:.2f}".format(
-            b["latency_ms_avg"], b["latency_ms_p50"], b["latency_ms_p90"], b["latency_ms_p95"]
-        )
-    )
-
-    if base.get("profile_summary"):
-        analyze_ane_compatibility(base["profile_summary"])
+    print("=== Starting Model Optimization ===")
 
     # Build modified path
     mod_path = os.path.join(args.outdir, os.path.basename(args.model).replace('.onnx', '_mod.onnx'))
@@ -1376,10 +1354,10 @@ def main():
     if discovered_info and keep:
         print_output_guide(discovered_info, keep)
 
-    # Model info and benchmarking at the end
+    # Model info at the end
     mod_info = load_model_info(work_path)
     print("\n" + "="*70)
-    print("=== Modified Model Info ===")
+    print("=== Optimized Model Info ===")
     print("="*70)
     print("Nodes:", mod_info["node_count"], "Unique ops:", mod_info["unique_ops"])
     print("Modified model:", work_path)
@@ -1390,63 +1368,7 @@ def main():
     print("="*70)
     print(f"Filename: {final_name}")
     print(f"Path: {final_abs}")
-
-    print("\n" + "="*70)
-    print("=== Modified Benchmark ===")
-    print("="*70)
-    mod = run_benchmark(work_path, ishape, "coreml", args.warmup, args.runs,
-                       enable_profile=False, profile_dir=None, img_path=img_path)
-    m = mod["benchmark"]
-    print("Providers (modified):", m.get("providers"))
-    if mod.get("coreml_capability"):
-        cap = mod["coreml_capability"]
-        print(f"CoreML capability (modified): partitions={cap.get('num_partitions')} nodes supported={cap.get('num_nodes')}")
-    print(
-        "Modified Latency (ms) avg={:.2f} p50={:.2f} p90={:.2f} p95={:.2f}".format(
-            m["latency_ms_avg"], m["latency_ms_p50"], m["latency_ms_p90"], m["latency_ms_p95"]
-        )
-    )
-
-    if mod.get("profile_summary"):
-        analyze_ane_compatibility(mod["profile_summary"])
-
-    # Comparison
-    def pct_delta(a, b):
-        return 100.0 * (b - a) / a if a and np.isfinite(a) else float('nan')
-
-    print("\n" + "="*70)
-    print("=== Performance Comparison (Modified vs Baseline) ===")
-    print("="*70)
-    avg_delta = pct_delta(b["latency_ms_avg"], m["latency_ms_avg"])
-    p50_delta = pct_delta(b["latency_ms_p50"], m["latency_ms_p50"])
-    p90_delta = pct_delta(b["latency_ms_p90"], m["latency_ms_p90"])
-    p95_delta = pct_delta(b["latency_ms_p95"], m["latency_ms_p95"])
-
-    def format_delta(d):
-        sign = "+" if d > 0 else ""
-        return f"{sign}{d:.2f}%"
-
-    print(f"Average latency: {b['latency_ms_avg']:.2f}ms → {m['latency_ms_avg']:.2f}ms ({format_delta(avg_delta)})")
-    print(f"P50 latency:     {b['latency_ms_p50']:.2f}ms → {m['latency_ms_p50']:.2f}ms ({format_delta(p50_delta)})")
-    print(f"P90 latency:     {b['latency_ms_p90']:.2f}ms → {m['latency_ms_p90']:.2f}ms ({format_delta(p90_delta)})")
-    print(f"P95 latency:     {b['latency_ms_p95']:.2f}ms → {m['latency_ms_p95']:.2f}ms ({format_delta(p95_delta)})")
-
-    # Speedup summary
-    if avg_delta < 0:
-        speedup = b["latency_ms_avg"] / m["latency_ms_avg"]
-        print(f"\n🚀 Speedup: {speedup:.2f}x faster")
-
-    # CoreML partition improvement
-    if base.get("coreml_capability") and mod.get("coreml_capability"):
-        base_parts = base["coreml_capability"].get("num_partitions", 0)
-        mod_parts = mod["coreml_capability"].get("num_partitions", 0)
-        base_nodes = base["coreml_capability"].get("num_nodes", 0)
-        mod_nodes = mod["coreml_capability"].get("num_nodes", 0)
-
-        if base_parts != mod_parts or base_nodes != mod_nodes:
-            print("\n=== CoreML Partition Changes ===")
-            print(f"Partitions: {base_parts} → {mod_parts}")
-            print(f"ANE-supported nodes: {base_nodes} → {mod_nodes} ({mod_nodes - base_nodes:+d})")
+    print("\n✅ Model optimization complete!")
 
 
 if __name__ == "__main__":
