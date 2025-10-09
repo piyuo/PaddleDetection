@@ -1,10 +1,6 @@
 #!/usr/bin/env python3
 """
-Apple Neural Engine graph surgery for PP-YOLOE ONNX with aggressive ANE-targeted optimizations.
-
-New optimizations targeting CoreML ANE acceleration:
-- Aggressive constant folding (15 iterations)
-- Enhanced ANE compatibility analysis
+NCNN graph surgery for PP-YOLOE  with NCNN optimizations.
 """
 import argparse
 import os

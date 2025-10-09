@@ -1,4 +1,4 @@
-# pipeline/PP-YOLOE/ncnn_graph_surgery.sh
+# pipeline/PP-YOLOE/build_ncnn_model.sh
 #!/usr/bin/env bash
 
 # Activate the Python virtual environment
@@ -7,7 +7,7 @@ source pipeline/PP-YOLOE/venv/bin/activate
 
 mkdir -p pipeline/PP-YOLOE/models/ncnn
 
-python3 pipeline/PP-YOLOE/ncnn_graph_surgery.py \
+python3 pipeline/PP-YOLOE/build_ncnn_model.py \
 --model pipeline/PP-YOLOE/models/ppyoloe_crn_s_36e_pphuman.onnx \
 --input-shape 1,3,640,640 --warmup 20 --runs 80 \
 --img pipeline/dataset/demo/demo.jpg \
