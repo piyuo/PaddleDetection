@@ -31,4 +31,5 @@ pipeline/ncnnoptimize pipeline/PP-YOLOE/models/ncnn/ppyoloe_crn_s_36e_pphuman_em
              pipeline/PP-YOLOE/models/ppyoloe_crn_s_36e_pphuman_embed_ncnn.param \
              pipeline/PP-YOLOE/models/ppyoloe_crn_s_36e_pphuman_embed_ncnn.bin \
              1 keep=embed
-#./pipeline/PP-YOLOE/ncnn_inference_image.sh
+
+./pipeline/PP-YOLOE/ncnn_inference_embed.sh
