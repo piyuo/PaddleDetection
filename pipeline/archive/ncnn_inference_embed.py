@@ -1,15 +1,19 @@
 #!/usr/bin/env python3
-"""NCNN inference for PP-YOLOE Human model.
+"""NCNN inference for PP-YOLOE Human model with embedding head.
 
 This script runs inference on a single image using the NCNN runtime.
-It handles the pruned model format with raw boxes/scores outputs and
-optional feature maps for embeddings.
+It works with models that have embeddings directly added by insert_embedding_head.py.
+
+The model should have these outputs:
+- out0: boxes (N, 4) - detection boxes in xyxy format
+- out1: scores (N, 1) or (N,) - detection confidence scores
+- out2: embed (N, D) - L2-normalized appearance embeddings for BoT-SORT
 
 Usage:
-    python3 pipeline/PP-YOLOE/ncnn_inference_image.py \\
+    python3 pipeline/PP-YOLOE/ncnn_inference_embed.py \\
         --img pipeline/dataset/demo/demo.jpg \\
-        --ncnn_param pipeline/PP-YOLOE/models/ppyoloe_crn_s_36e_pphuman_ncnn.ncnn.param \\
-        --ncnn_bin pipeline/PP-YOLOE/models/ppyoloe_crn_s_36e_pphuman_ncnn.ncnn.bin \\
+        --ncnn_param pipeline/PP-YOLOE/models/ppyoloe_crn_s_36e_pphuman_embed_ncnn.param \\
+        --ncnn_bin pipeline/PP-YOLOE/models/ppyoloe_crn_s_36e_pphuman_embed_ncnn.bin \\
         --out pipeline/output \\
         --thresh 0.5
 """
@@ -31,136 +35,169 @@ STD = (0.229, 0.224, 0.225)
 DEFAULT_SIZE = (640, 640)
 
 
-def roi_align_pool_multi_scale(
-    feat_s8: np.ndarray,
-    feat_s16: np.ndarray,
-    boxes_xyxy: np.ndarray,
-    img_hw: tuple,
-    input_size_hw: tuple = (640, 640),
-    gp_w: float = 0.2,
-    avg_w: float = 1.0,
-    max_w: float = 0.0,
-    pp_w: float = 0.8,
-    pp_k: int = 9,
-    pp_stripe_h: int = 2,
-    pp_vertical_k: int = 2,
-    pp_vertical_stripe_w: int = 2,
-    use_inst_norm: bool = True,
-    pl_alpha: float = 0.35,
-) -> np.ndarray:
-    """Multi-scale ROI pooling (matching onnx_inference_ane_model.py logic).
+def validate_embedding_for_botsort(embeddings: np.ndarray, boxes: np.ndarray, verbose: bool = True):
+    """Validate embedding output for BoT-SORT compatibility.
 
-    Extracts embeddings from stride-8 and stride-16 feature maps using
-    global pooling and part-based pooling strategies.
+    Checks:
+    1. Embeddings are L2-normalized (norms should be ~1.0)
+    2. Pairwise cosine similarities are reasonable (not all identical)
+    3. Embeddings have sufficient separation for tracking
+
+    Args:
+        embeddings: (N, D) array of embeddings
+        boxes: (N, 6) array of detections (class_id, score, x0, y0, x1, y1)
+        verbose: Print detailed validation report
+
+    Returns:
+        Dict with validation results and statistics
     """
-    assert feat_s8.ndim == 4 and feat_s8.shape[0] == 1
-    assert feat_s16.ndim == 4 and feat_s16.shape[0] == 1
+    if embeddings.shape[0] == 0:
+        return {
+            'valid': True,
+            'num_detections': 0,
+            'message': 'No detections to validate'
+        }
 
-    _, c_s8, h_s8, w_s8 = feat_s8.shape
-    _, c_s16, h_s16, w_s16 = feat_s16.shape
-    h_img, w_img = img_hw
-    h_input, w_input = input_size_hw
+    N, D = embeddings.shape
 
-    def compute_scales(h_feat, w_feat):
-        scale_y = (h_input / float(h_img)) * (h_feat / float(h_input))
-        scale_x = (w_input / float(w_img)) * (w_feat / float(w_input))
-        return scale_x, scale_y
+    # Check L2 normalization
+    norms = np.linalg.norm(embeddings, axis=1)
+    norm_mean = norms.mean()
+    norm_std = norms.std()
+    is_normalized = np.allclose(norms, 1.0, atol=0.01)
 
-    scale_x_s8, scale_y_s8 = compute_scales(h_s8, w_s8)
-    scale_x_s16, scale_y_s16 = compute_scales(h_s16, w_s16)
+    # Compute pairwise cosine similarities
+    cosine_sims = []
+    ious = []
+    if N > 1:
+        # Compute pairwise cosines
+        for i in range(N):
+            for j in range(i + 1, N):
+                cos_sim = np.dot(embeddings[i], embeddings[j])
+                cosine_sims.append(cos_sim)
 
-    def extract_roi(feat_map, x0, y0, x1, y1, scale_x, scale_y, h_feat, w_feat, channels):
-        fx0 = int(max(0, np.floor(x0 * scale_x)))
-        fy0 = int(max(0, np.floor(y0 * scale_y)))
-        fx1 = int(min(w_feat, np.ceil(x1 * scale_x)))
-        fy1 = int(min(h_feat, np.ceil(y1 * scale_y)))
-        if fx1 <= fx0 or fy1 <= fy0:
-            return np.zeros((channels,), dtype=np.float32)
+                # Compute IoU for this pair
+                x0_i, y0_i, x1_i, y1_i = boxes[i, 2:6]
+                x0_j, y0_j, x1_j, y1_j = boxes[j, 2:6]
 
-        roi = feat_map[0, :, fy0:fy1, fx0:fx1]
-        _, h_roi, w_roi = roi.shape
-        features = []
+                x0_inter = max(x0_i, x0_j)
+                y0_inter = max(y0_i, y0_j)
+                x1_inter = min(x1_i, x1_j)
+                y1_inter = min(y1_i, y1_j)
 
-        # Global pooling
-        if gp_w > 0:
-            global_feat = np.zeros((channels,), dtype=np.float32)
-            if avg_w > 0:
-                global_feat += avg_w * roi.mean(axis=(1, 2))
-            if max_w > 0:
-                global_feat += max_w * roi.max(axis=(1, 2))
-            features.append(global_feat * gp_w)
+                if x1_inter > x0_inter and y1_inter > y0_inter:
+                    inter_area = (x1_inter - x0_inter) * (y1_inter - y0_inter)
+                    area_i = (x1_i - x0_i) * (y1_i - y0_i)
+                    area_j = (x1_j - x0_j) * (y1_j - y0_j)
+                    union_area = area_i + area_j - inter_area
+                    iou = inter_area / union_area if union_area > 0 else 0.0
+                else:
+                    iou = 0.0
 
-        # Part-based pooling (horizontal stripes)
-        if pp_w > 0 and pp_k > 0 and pp_stripe_h > 0:
-            stripe_size = max(1, h_roi // pp_k)
-            for i in range(pp_k):
-                y_start = i * stripe_size
-                y_end = min(h_roi, (i + 1) * stripe_size)
-                if y_end <= y_start:
-                    continue
-                sub_stripe_size = max(1, (y_end - y_start) // pp_stripe_h)
-                for j in range(pp_stripe_h):
-                    sub_y_start = y_start + j * sub_stripe_size
-                    sub_y_end = min(y_end, y_start + (j + 1) * sub_stripe_size)
-                    if sub_y_end <= sub_y_start:
-                        continue
-                    stripe = roi[:, sub_y_start:sub_y_end, :]
-                    stripe_feat = stripe.mean(axis=(1, 2))
-                    features.append(stripe_feat * pp_w / (pp_k * pp_stripe_h))
+                ious.append(iou)
 
-        # Part-based pooling (vertical stripes)
-        if pp_w > 0 and pp_vertical_k > 0 and pp_vertical_stripe_w > 0:
-            stripe_size = max(1, w_roi // pp_vertical_k)
-            for i in range(pp_vertical_k):
-                x_start = i * stripe_size
-                x_end = min(w_roi, (i + 1) * stripe_size)
-                if x_end <= x_start:
-                    continue
-                sub_stripe_size = max(1, (x_end - x_start) // pp_vertical_stripe_w)
-                for j in range(pp_vertical_stripe_w):
-                    sub_x_start = x_start + j * sub_stripe_size
-                    sub_x_end = min(x_end, x_start + (j + 1) * sub_stripe_size)
-                    if sub_x_end <= sub_x_start:
-                        continue
-                    stripe = roi[:, :, sub_x_start:sub_x_end]
-                    stripe_feat = stripe.mean(axis=(1, 2))
-                    features.append(stripe_feat * pp_w / (pp_vertical_k * pp_vertical_stripe_w))
+        cosine_sims = np.array(cosine_sims)
+        ious = np.array(ious)
 
-        if not features:
-            return np.zeros((channels,), dtype=np.float32)
+        # Separate high-IoU (likely same person) vs low-IoU (different people)
+        high_iou_mask = ious > 0.3
+        low_iou_mask = ious <= 0.3
 
-        combined = np.sum(features, axis=0)
+        cos_high_iou = cosine_sims[high_iou_mask] if high_iou_mask.any() else np.array([])
+        cos_low_iou = cosine_sims[low_iou_mask] if low_iou_mask.any() else np.array([])
+    else:
+        cosine_sims = np.array([])
+        ious = np.array([])
+        cos_high_iou = np.array([])
+        cos_low_iou = np.array([])
 
-        # Instance normalization
-        if use_inst_norm:
-            mean = combined.mean()
-            std = combined.std()
-            if std > 1e-6:
-                combined = (combined - mean) / std
+    # Quality checks
+    checks = {
+        'l2_normalized': is_normalized,
+        'has_variation': len(cosine_sims) == 0 or cosine_sims.std() > 0.01,
+        'reasonable_spread': len(cosine_sims) == 0 or (cosine_sims.min() < 0.8 and cosine_sims.max() < 0.95),
+    }
 
-        # Power-law transformation
-        if pl_alpha != 1.0:
-            sign = np.sign(combined)
-            combined = sign * np.power(np.abs(combined), pl_alpha)
+    is_valid = all(checks.values())
 
-        return combined
+    result = {
+        'valid': is_valid,
+        'num_detections': N,
+        'embedding_dim': D,
+        'checks': checks,
+        'norm_mean': float(norm_mean),
+        'norm_std': float(norm_std),
+        'norm_min': float(norms.min()),
+        'norm_max': float(norms.max()),
+    }
 
-    embs = []
-    for x0, y0, x1, y1 in boxes_xyxy:
-        feat_s8_vec = extract_roi(feat_s8, x0, y0, x1, y1, scale_x_s8, scale_y_s8, h_s8, w_s8, c_s8)
-        feat_s16_vec = extract_roi(feat_s16, x0, y0, x1, y1, scale_x_s16, scale_y_s16, h_s16, w_s16, c_s16)
-        combined = np.concatenate([feat_s8_vec, feat_s16_vec])
+    if len(cosine_sims) > 0:
+        result.update({
+            'cosine_mean': float(cosine_sims.mean()),
+            'cosine_std': float(cosine_sims.std()),
+            'cosine_min': float(cosine_sims.min()),
+            'cosine_max': float(cosine_sims.max()),
+            'cosine_median': float(np.median(cosine_sims)),
+            'cosine_p95': float(np.percentile(cosine_sims, 95)),
+        })
 
-        # L2 normalization
-        norm = np.linalg.norm(combined)
-        if norm > 1e-6:
-            combined = combined / norm
+        if len(cos_high_iou) > 0:
+            result['cosine_high_iou_mean'] = float(cos_high_iou.mean())
+            result['cosine_high_iou_max'] = float(cos_high_iou.max())
 
-        embs.append(combined)
+        if len(cos_low_iou) > 0:
+            result['cosine_low_iou_mean'] = float(cos_low_iou.mean())
+            result['cosine_low_iou_max'] = float(cos_low_iou.max())
 
-    if not embs:
-        return np.zeros((0, c_s8 + c_s16), dtype=np.float32)
-    return np.stack(embs, axis=0)
+    if verbose and N > 0:
+        print("\n" + "="*60)
+        print("=== Embedding Validation for BoT-SORT ===")
+        print("="*60)
+        print(f"Detections: {N}")
+        print(f"Embedding dimension: {D}")
+        print(f"\nL2 Normalization:")
+        print(f"  Norms: mean={norm_mean:.4f}, std={norm_std:.4f}, range=[{norms.min():.4f}, {norms.max():.4f}]")
+        print(f"  {'✓' if checks['l2_normalized'] else '✗'} Properly normalized: {checks['l2_normalized']}")
+
+        if len(cosine_sims) > 0:
+            print(f"\nPairwise Cosine Similarities ({len(cosine_sims)} pairs):")
+            print(f"  Mean:   {cosine_sims.mean():.4f}")
+            print(f"  Std:    {cosine_sims.std():.4f}")
+            print(f"  Min:    {cosine_sims.min():.4f}")
+            print(f"  Max:    {cosine_sims.max():.4f}")
+            print(f"  Median: {np.median(cosine_sims):.4f}")
+            print(f"  P95:    {np.percentile(cosine_sims, 95):.4f}")
+
+            if len(cos_high_iou) > 0:
+                print(f"\n  High IoU pairs (>0.3, likely same person): {len(cos_high_iou)}")
+                print(f"    Cosine mean: {cos_high_iou.mean():.4f}, max: {cos_high_iou.max():.4f}")
+
+            if len(cos_low_iou) > 0:
+                print(f"  Low IoU pairs (≤0.3, different people): {len(cos_low_iou)}")
+                print(f"    Cosine mean: {cos_low_iou.mean():.4f}, max: {cos_low_iou.max():.4f}")
+
+            print(f"\n  {'✓' if checks['has_variation'] else '✗'} Has variation: {checks['has_variation']}")
+            print(f"  {'✓' if checks['reasonable_spread'] else '✗'} Reasonable spread: {checks['reasonable_spread']}")
+
+        print(f"\n{'✅' if is_valid else '⚠️ '} Overall: {'VALID for BoT-SORT' if is_valid else 'Issues detected'}")
+
+        # BoT-SORT recommendations
+        print("\n=== BoT-SORT Integration Guide ===")
+        print("Recommended settings:")
+        if len(cos_low_iou) > 0:
+            max_low_iou_cos = cos_low_iou.max()
+            recommended_threshold = min(0.60, max_low_iou_cos + 0.10)
+            print(f"  • Cosine similarity threshold: {recommended_threshold:.2f}")
+            print(f"    (If using cosine distance, set max_dist = {1.0 - recommended_threshold:.2f})")
+        else:
+            print(f"  • Cosine similarity threshold: 0.55-0.60")
+            print(f"    (If using cosine distance, set max_dist = 0.40-0.45)")
+        print(f"  • Keep IoU gating enabled (IoU threshold ≥ 0.2-0.3)")
+        print(f"  • Feature history (nn_budget): 50-100")
+        print(f"  • Use EMA smoothing if available")
+        print("="*60)
+
+    return result
 
 
 def load_and_preprocess(img_path, target_size=DEFAULT_SIZE):
@@ -188,18 +225,24 @@ def load_and_preprocess(img_path, target_size=DEFAULT_SIZE):
     return mat, (orig_w, orig_h)
 
 
-def run_inference(net, img_mat, input_names=["in0", "in1"], output_names=["out0", "out1", "out2", "out3"],
-                  backbone_layers=None):
+def run_inference(net, img_mat, input_names=None, output_names=None):
     """Run NCNN inference and extract outputs.
 
     Args:
         net: NCNN network
         img_mat: Input image matrix
-        input_names: Names of input layers
-        output_names: Names of standard output layers (detections)
-        backbone_layers: Dict mapping output names to backbone layer names for manual extraction
-                        e.g., {"out2": "conv_147", "out3": "conv_159"}
+        input_names: Names of input layers (default: ["in0", "in1"])
+        output_names: Names of output layers (default: ["out0", "out1", "out2"])
+                     out0=boxes, out1=scores, out2=embed
+
+    Returns:
+        Dict of output tensors
     """
+    if input_names is None:
+        input_names = ["in0", "in1"]
+    if output_names is None:
+        output_names = ["out0", "out1", "out2"]
+
     # Create scale_factor input (required by PP-YOLOE)
     scale_factor = ncnn.Mat(np.array([1.0, 1.0], dtype=np.float32))
 
@@ -219,19 +262,8 @@ def run_inference(net, img_mat, input_names=["in0", "in1"], output_names=["out0"
         ret, out_mat = ex.extract(name)
         if ret == 0:
             outputs[name] = out_mat.numpy()
-
-    # Extract backbone feature maps manually (for optimized models)
-    if backbone_layers:
-        print(f"\n[Manual Feature Extraction] Attempting to extract from backbone layers...")
-        for out_name, layer_name in backbone_layers.items():
-            if out_name in outputs:
-                continue
-            ret, out_mat = ex.extract(layer_name)
-            if ret == 0:
-                outputs[out_name] = out_mat.numpy()
-                print(f"  ✓ Extracted {out_name} from layer '{layer_name}': shape={out_mat.numpy().shape}")
-            else:
-                print(f"  ✗ Failed to extract {out_name} from layer '{layer_name}' (error code: {ret})")
+        else:
+            print(f"[WARN] Failed to extract output: {name}")
 
     return outputs
 
@@ -361,16 +393,8 @@ def main():
     import time
     t0 = time.perf_counter()
 
-    # PP-YOLOE backbone layer mappings for feature extraction
-    # These layers correspond to stride-8 and stride-16 outputs in typical PP-YOLOE architecture
-    # Adjust these layer names based on your specific model architecture
-    backbone_feature_layers = {
-        "out2": "conv_147",  # Stride-8 feature map (96 channels @ 80x80)
-        "out3": "conv_159",  # Stride-16 feature map (192 channels @ 40x40)
-    }
-
     t_forward_start = time.perf_counter()
-    outputs = run_inference(net, img_mat, backbone_layers=backbone_feature_layers)
+    outputs = run_inference(net, img_mat, output_names=["out0", "out1", "out2"])
     t_forward_end = time.perf_counter()
 
     forward_ms = (t_forward_end - t_forward_start) * 1000.0
@@ -379,6 +403,7 @@ def main():
         print("[ERROR] No outputs extracted from model", file=sys.stderr)
         return 1
 
+    print(f"  Model outputs:")
     for name, arr in outputs.items():
         print(f"    - {name}: shape={arr.shape}")
 
@@ -386,6 +411,7 @@ def main():
     print("\n[5/6] Post-processing...")
     boxes_raw = outputs.get("out0")
     scores_raw = outputs.get("out1")
+    embeddings = outputs.get("out2")  # Embedding output added by insert_embedding_head.py
 
     if boxes_raw is None or scores_raw is None:
         print("[ERROR] Missing required outputs (out0, out1)", file=sys.stderr)
@@ -396,55 +422,22 @@ def main():
 
     print(f"  ✓ Found {len(boxes_nms)} detections after NMS")
 
-    # Extract embeddings (matching onnx_inference_ane_model.py)
-    embeddings = None
-    embed_ms = None
-    feat_s8 = outputs.get("out2")  # Stride-8 feature map
-    feat_s16 = outputs.get("out3")  # Stride-16 feature map
+    # Validate embeddings for BoT-SORT
+    if embeddings is not None and len(boxes_nms) > 0:
+        print(f"\n[Embeddings] Found embedding output: shape={embeddings.shape}")
 
-    if feat_s8 is not None and feat_s16 is not None and len(boxes_nms) > 0:
-        print(f"\n[Embeddings] Extracting multi-scale features...")
-        print(f"  ✓ Stride-8:  out2 (shape={feat_s8.shape})")
-        print(f"  ✓ Stride-16: out3 (shape={feat_s16.shape})")
+        # Validate embedding quality for BoT-SORT
+        validation_result = validate_embedding_for_botsort(embeddings, boxes_nms, verbose=True)
 
-        # Reshape to 4D if needed
-        if feat_s8.ndim == 3:
-            feat_s8 = feat_s8[np.newaxis, :]
-        if feat_s16.ndim == 3:
-            feat_s16 = feat_s16[np.newaxis, :]
-
-        # Extract boxes in xyxy format for embedding extraction
-        boxes_xyxy = boxes_nms[:, 2:6]  # Skip class_id and score
-
-        t_embed_start = time.perf_counter()
-        embeddings = roi_align_pool_multi_scale(
-            feat_s8,
-            feat_s16,
-            boxes_xyxy,
-            (orig_h, orig_w),
-            input_size_hw=(640, 640),
-            gp_w=0.2,
-            pp_w=0.8,
-            pp_k=9,
-            pp_stripe_h=2,
-            pp_vertical_k=2,
-            pp_vertical_stripe_w=2,
-            use_inst_norm=True,
-            pl_alpha=0.35,
-        )
-        print(f"  ✓ Embeddings shape: {embeddings.shape} (dim={embeddings.shape[1]})")
-
-        # Print embedding statistics
-        if embeddings.shape[0] > 0:
-            emb_norms = np.linalg.norm(embeddings, axis=1)
-            print(f"  ✓ Embedding norms: min={emb_norms.min():.4f}, max={emb_norms.max():.4f}, mean={emb_norms.mean():.4f}")
-
-        t_embed_end = time.perf_counter()
-        embed_ms = (t_embed_end - t_embed_start) * 1000.0
-    elif len(boxes_nms) > 0:
-        print(f"\n[WARN] Feature maps not available for embedding extraction")
+        if not validation_result['valid']:
+            print("\n⚠️  WARNING: Embedding validation detected potential issues!")
+            print("    Check the validation report above for details.")
+    elif embeddings is None:
+        print(f"\n[WARN] No embedding output found (expected 'out2')")
         print(f"       Available outputs: {list(outputs.keys())}")
-    # No detections keeps embed_ms as None
+        print(f"       Make sure the model was processed with insert_embedding_head.py")
+    else:
+        print(f"\n[INFO] No detections to validate embeddings")
 
     # Print detections
     if len(boxes_nms) > 0:
@@ -457,9 +450,8 @@ def main():
 
     t1 = time.perf_counter()
     total_ms = (t1 - t0) * 1000.0
+    print(f"\n[Timing]")
     print(f"  ✓ Forward pass: {forward_ms:.2f}ms")
-    if embed_ms is not None:
-        print(f"  ✓ Embedding extraction: {embed_ms:.2f}ms")
     print(f"  ✓ End-to-end latency: {total_ms:.2f}ms")
 
     # Save visualization
@@ -470,7 +462,7 @@ def main():
     print(f"  ✓ Visualization: {out_path}")
 
     # Save embeddings if requested
-    if args.save_embeddings and embeddings is not None:
+    if args.save_embeddings and embeddings is not None and len(boxes_nms) > 0:
         emb_path = os.path.join(args.out, out_basename + "_embeddings.npy")
         np.save(emb_path, embeddings)
         print(f"  ✓ Embeddings: {emb_path}")
@@ -478,11 +470,9 @@ def main():
     print("\n" + "="*60)
     print("✅ NCNN Inference Complete!")
     print(f"   Forward: {forward_ms:.2f}ms")
-    if embed_ms is not None:
-        print(f"   Embedding: {embed_ms:.2f}ms")
     print(f"   End-to-end: {total_ms:.2f}ms")
     print(f"   Detections: {len(boxes_nms)}")
-    if embeddings is not None:
+    if embeddings is not None and len(boxes_nms) > 0:
         print(f"   Embeddings: {embeddings.shape}")
     print("="*60)
     return 0

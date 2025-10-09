@@ -24,7 +24,7 @@ python3 pipeline/PP-YOLOE/ncnn_graph_surgery_embed.py \
 # convert onnx to ncnn
 pnnx pipeline/PP-YOLOE/models/ncnn/ppyoloe_crn_s_36e_pphuman_embed_ncnn.onnx fp16=1 optlevel=2 device=gpu
 
-# customized ncnnoptimize to keep out2 and out3
+# customized ncnnoptimize to keep the embedding output
 # please reference vision_sdk project to get the customized ncnnoptimize
 pipeline/ncnnoptimize pipeline/PP-YOLOE/models/ncnn/ppyoloe_crn_s_36e_pphuman_embed_ncnn.ncnn.param \
              pipeline/PP-YOLOE/models/ncnn/ppyoloe_crn_s_36e_pphuman_embed_ncnn.ncnn.bin \

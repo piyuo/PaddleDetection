@@ -17,8 +17,13 @@ pipeline/PP-YOLOE/export_to_onnx.sh \
     --config configs/pphuman/ppyoloe_crn_s_36e_pphuman.yml \
 	--weights pipeline/PP-YOLOE/weights/ppyoloe_crn_s_36e_pphuman.pdparams
 
+
+
+
+# create embedding head on onnx model may slow down the model inference on edge device, cause RoIAlign operator is not well supported on Edge devices,
+# event onnx with tensorrt backend may well support RoIAlign operator, we decide not to include embedding head into the base onnx model for now.
 # create embeded onnx model for BOT-SORT
 # output: pipeline/PP-YOLOE/models/ppyoloe_crn_s_36e_pphuman_embed.onnx
-python pipeline/PP-YOLOE/insert_embedding_head.py \
-                --onnx_in pipeline/PP-YOLOE/models/ppyoloe_crn_s_36e_pphuman.onnx \
-                --onnx_out pipeline/PP-YOLOE/models/ppyoloe_crn_s_36e_pphuman_embed.onnx
+#python pipeline/PP-YOLOE/insert_embedding_head.py \
+#                --onnx_in pipeline/PP-YOLOE/models/ppyoloe_crn_s_36e_pphuman.onnx \
+#                --onnx_out pipeline/PP-YOLOE/models/ppyoloe_crn_s_36e_pphuman_embed.onnx
