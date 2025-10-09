@@ -1185,7 +1185,6 @@ def main():
         help="Path to source ONNX model",
     )
     parser.add_argument("--input-shape", type=str, default="1,3,640,640")
-    parser.add_argument("--img", type=str, help="Path to image for realistic preprocessing (not needed for --find-nms)")
     parser.add_argument("--outdir", type=str, default="pipeline/PP-YOLOE/models/surgery")
     parser.add_argument("--rewrite-div", action="store_true", help="Rewrite Div to Mul with reciprocal")
     parser.add_argument("--rewrite-pow", action="store_true", help="Rewrite Pow patterns")
@@ -1198,17 +1197,8 @@ def main():
 
     args = parser.parse_args()
 
-    # Check required arguments for normal operation
-    if not args.img:
-        print("[ERROR] --img argument is required", file=sys.stderr)
-        return
-
     os.makedirs(args.outdir, exist_ok=True)
     ishape = parse_shape(args.input_shape)
-    img_path = args.img if os.path.isabs(args.img) else os.path.abspath(args.img)
-    if not os.path.exists(img_path):
-        print(f"[ERROR] Image not found: {img_path}")
-        return
 
     print("=== Starting Model Optimization ===")
 
