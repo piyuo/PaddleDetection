@@ -1,4 +1,4 @@
-# pipeline/PP-YOLOE/build_ncnn_model.sh
+# pipeline/PP-YOLOE/build_ncnn_model_simple.sh
 #!/usr/bin/env bash
 # NCNN model build script for mobile deployment
 # This script preserves all outputs (detection + feature maps for BOT-SORT)
@@ -30,14 +30,9 @@ python3 pipeline/PP-YOLOE/build_ncnn_model.py \
     --model pipeline/PP-YOLOE/models/ppyoloe_crn_s_36e_pphuman.onnx \
     --input-shape 1,3,640,640 \
     --outdir pipeline/PP-YOLOE/models/surgery \
-    --rewrite-div \
-    --rewrite-pow \
-    --rewrite-slice-to-gather \
-    --rewrite-slice-range-to-gather \
-    --rewrite-resize-to-static \
-    --remove-noop-slice \
-    --rewrite-reduce-to-globalpool \
     --output-model pipeline/PP-YOLOE/models/surgery/ppyoloe_crn_s_36e_pphuman_base_optimized.onnx
+
+
 
 echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
@@ -57,11 +52,7 @@ echo "🔧 Running PNNX conversion with optlevel=3 (max optimization)..."
 cd pipeline/PP-YOLOE/models/surgery
 
 # Model has 2 inputs: scale_factor [1,2] and image [1,3,640,640]
-pnnx ppyoloe_crn_s_36e_pphuman_base_optimized.onnx \
-    fp16=1 \
-    optlevel=3 \
-    device=gpu \
-    inputshape="[1,2]f32,[1,3,640,640]f32"
+pnnx ppyoloe_crn_s_36e_pphuman_base_optimized.onnx device=cpu/gpu fp16=0 optlevel=2
 
 cd ../../../..  # Back to project root
 
@@ -85,12 +76,9 @@ if [ ! -f "pipeline/ncnnoptimize" ]; then
 else
     echo "🔧 Running custom ncnnoptimize (preserving out2 and out3)..."
 
-    pipeline/ncnnoptimize \
-        pipeline/PP-YOLOE/models/surgery/ppyoloe_crn_s_36e_pphuman_base_optimized.ncnn.param \
-        pipeline/PP-YOLOE/models/surgery/ppyoloe_crn_s_36e_pphuman_base_optimized.ncnn.bin \
-        pipeline/PP-YOLOE/models/ppyoloe_crn_s_36e_pphuman_ncnn.param \
-        pipeline/PP-YOLOE/models/ppyoloe_crn_s_36e_pphuman_ncnn.bin \
-        1 keep=out2,out3
+
+    cp pipeline/PP-YOLOE/models/surgery/ppyoloe_crn_s_36e_pphuman_base_optimized.ncnn.param pipeline/PP-YOLOE/models/ppyoloe_crn_s_36e_pphuman_ncnn.param
+    cp pipeline/PP-YOLOE/models/surgery/ppyoloe_crn_s_36e_pphuman_base_optimized.ncnn.bin pipeline/PP-YOLOE/models/ppyoloe_crn_s_36e_pphuman_ncnn.bin
 fi
 
 echo ""
