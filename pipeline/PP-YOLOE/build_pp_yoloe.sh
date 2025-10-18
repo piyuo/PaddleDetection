@@ -28,11 +28,15 @@ pipeline/PP-YOLOE/ane_graph_surgery.sh \
     --output-model pipeline/PP-YOLOE/models/ppyoloe_crn_s_36e_pphuman_cust_ane.onnx \
     --img pipeline/dataset/demo/demo.jpg
 
+# cleanup the ANE onnx model
+python3 pipeline/PP-YOLOE/onnx_cleanup.py \
+    --model pipeline/PP-YOLOE/models/ppyoloe_crn_s_36e_pphuman_cust_ane.onnx \
+    --output-model pipeline/PP-YOLOE/models/ppyoloe_crn_s_36e_pphuman_cust_ane_cu.onnx
 
 # Run inference
 python3 pipeline/PP-YOLOE/onnx_inference_cust.py \
     --img pipeline/dataset/demo/demo.jpg \
-    --onnx pipeline/PP-YOLOE/models/ppyoloe_crn_s_36e_pphuman_cust_ane.onnx
+    --onnx pipeline/PP-YOLOE/models/ppyoloe_crn_s_36e_pphuman_cust_ane_cu.onnx
 
 
 # output: pipeline/PP-YOLOE/models/mot_ppyoloe_s_36e_ppvehicle.onnx
