@@ -138,7 +138,8 @@ else
 	exit 1
 fi
 
+rm -rf pipeline/PP-YOLOE/models/inference_model
 
 # print the final model is in pipeline/PP-YOLOE/models/ppyoloe_crn_s_36e_pphuman.onnx
 # and the inference model is in pipeline/PP-YOLOE/inference_model/ppyoloe_crn_s_36e_pphuman/
-echo "Final model is in ${ONNX_FILE}"
+echo "Final model is in ${ONNX_FILE}, This is base model for optimization to CoreML/NCNN/TensorFlow etc."

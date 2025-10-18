@@ -17,6 +17,12 @@ pipeline/PP-YOLOE/export_to_onnx.sh \
     --config configs/pphuman/ppyoloe_crn_s_36e_pphuman.yml \
 	--weights pipeline/PP-YOLOE/weights/ppyoloe_crn_s_36e_pphuman.pdparams
 
+# output: pipeline/PP-YOLOE/models/mot_ppyoloe_s_36e_ppvehicle.onnx
+pipeline/PP-YOLOE/export_to_onnx.sh \
+    --config configs/ppvehicle/mot_ppyoloe_s_36e_ppvehicle.yml \
+	--weights pipeline/PP-YOLOE/weights/mot_ppyoloe_s_36e_ppvehicle.pdparams
+
+
 # build ncnn model
 # output: pipeline/PP-YOLOE/models/ppyoloe_crn_s_36e_pphuman_ncnn.param + .bin
 ./pipeline/PP-YOLOE/build_ncnn_model.sh
