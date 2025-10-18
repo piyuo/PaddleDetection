@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # pipeline/PP-YOLOE/onnx_inference.sh
-# Simple demo script for running ONNX inference on an image
+# Simple demo script for running ONNX inference on an image,
+# this script only supports the base exported ONNX model (not customized).
 
 set -e
 
@@ -15,7 +16,7 @@ fi
 
 # Default paths
 IMG="${1:-pipeline/dataset/demo/demo.jpg}"
-ONNX="${2:-pipeline/PP-YOLOE/models/ppyoloe_crn_s_36e_pphuman_embed.onnx}"
+ONNX="${2:-pipeline/PP-YOLOE/models/ppyoloe_crn_s_36e_pphuman.onnx}"
 OUT="${3:-pipeline/output}"
 THRESH="${4:-0.5}"
 
@@ -35,6 +36,6 @@ echo ""
 echo "   Example:"
 echo "   ./pipeline/PP-YOLOE/onnx_inference.sh \\"
 echo "       pipeline/dataset/demo/demo.jpg \\"
-echo "       pipeline/PP-YOLOE/models/ppyoloe_crn_s_36e_pphuman_embed.onnx \\"
+echo "       pipeline/PP-YOLOE/models/ppyoloe_crn_s_36e_pphuman.onnx \\"
 echo "       pipeline/output \\"
 echo "       0.3"
