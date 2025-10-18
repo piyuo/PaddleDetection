@@ -17,6 +17,24 @@ pipeline/PP-YOLOE/export_to_onnx.sh \
     --config configs/pphuman/ppyoloe_crn_s_36e_pphuman.yml \
 	--weights pipeline/PP-YOLOE/weights/ppyoloe_crn_s_36e_pphuman.pdparams
 
+# Run customized
+python3 pipeline/PP-YOLOE/onnx_customize.py \
+    --model pipeline/PP-YOLOE/models/ppyoloe_crn_s_36e_pphuman.onnx \
+    --output-model pipeline/PP-YOLOE/models/ppyoloe_crn_s_36e_pphuman_cust.onnx
+
+# ane graph surgery to create ANE optimized onnx model
+pipeline/PP-YOLOE/ane_graph_surgery.sh \
+    --model pipeline/PP-YOLOE/models/ppyoloe_crn_s_36e_pphuman_cust.onnx \
+    --output-model pipeline/PP-YOLOE/models/ppyoloe_crn_s_36e_pphuman_cust_ane.onnx \
+    --img pipeline/dataset/demo/demo.jpg
+
+
+# Run inference
+python3 pipeline/PP-YOLOE/onnx_inference_cust.py \
+    --img pipeline/dataset/demo/demo.jpg \
+    --onnx pipeline/PP-YOLOE/models/ppyoloe_crn_s_36e_pphuman_cust_ane.onnx
+
+
 # output: pipeline/PP-YOLOE/models/mot_ppyoloe_s_36e_ppvehicle.onnx
 pipeline/PP-YOLOE/export_to_onnx.sh \
     --config configs/ppvehicle/mot_ppyoloe_s_36e_ppvehicle.yml \

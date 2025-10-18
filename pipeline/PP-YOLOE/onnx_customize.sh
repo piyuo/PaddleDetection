@@ -13,9 +13,3 @@ CUST_MODEL="pipeline/PP-YOLOE/models/ppyoloe_crn_s_36e_pphuman_cust.onnx"
 python3 pipeline/PP-YOLOE/onnx_customize.py \
     --model "$BASE_MODEL" \
     --output-model "$CUST_MODEL"
-
-# inference
-IMG="${1:-pipeline/dataset/demo/demo.jpg}"
-ONNX="${2:-pipeline/PP-YOLOE/models/ppyoloe_crn_s_36e_pphuman_cust.onnx}"
-OUT="${3:-pipeline/output}"
-THRESH="${4:-0.5}"
