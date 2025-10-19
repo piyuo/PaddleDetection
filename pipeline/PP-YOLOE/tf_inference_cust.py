@@ -233,8 +233,6 @@ def _select_boxes_and_scores(outputs: Dict[str, np.ndarray]) -> Tuple[str, np.nd
         if squeezed.ndim == 0:
             continue
         if squeezed.ndim == 1:
-            if squeezed.size > 4:
-                continue
             candidate_scores = squeezed.reshape(-1, 1)
             if scores_candidate is None or candidate_scores.shape[0] > scores_candidate[1].shape[0]:
                 scores_candidate = (name, candidate_scores)
@@ -245,7 +243,13 @@ def _select_boxes_and_scores(outputs: Dict[str, np.ndarray]) -> Tuple[str, np.nd
         if squeezed.ndim != 2:
             continue
 
-        last_dim = squeezed.shape[1]
+        rows, cols = squeezed.shape
+
+        if cols not in (1, 4) and rows in (1, 4):
+            squeezed = squeezed.T
+            rows, cols = squeezed.shape
+
+        last_dim = cols
         if last_dim == 4:
             if boxes_candidate is None or squeezed.shape[0] > boxes_candidate[1].shape[0]:
                 boxes_candidate = (name, squeezed)
