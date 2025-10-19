@@ -21,10 +21,44 @@ try:
     from onnx2tf import convert  # type: ignore
 except ModuleNotFoundError as exc:  # pragma: no cover - import guard
     missing = exc.name or "onnx2tf"
-    suggestion = f"pip install {missing}" if missing != "onnx2tf" else "pip install onnx2tf"
-    hint = " (required by onnx2tf)" if missing != "onnx2tf" else ""
-    print(f"[ERROR] Missing dependency: {missing}.{hint} Install with '{suggestion}'.", file=sys.stderr)
-    raise SystemExit(1) from exc
+    if missing == "ai_edge_litert":
+        import types
+
+        placeholder = types.ModuleType("ai_edge_litert")
+        interpreter_module = types.ModuleType("ai_edge_litert.interpreter")
+
+        class _StubInterpreter:  # minimal shim; onnx2tf only checks presence
+            def __init__(self, *args, **kwargs):  # pragma: no cover - shim
+                raise RuntimeError(
+                    "ai_edge_litert interpreter not available on this platform."
+                )
+
+        def _stub_load_delegate(*_args, **_kwargs):  # pragma: no cover - shim
+            raise RuntimeError("ai_edge_litert delegate not available.")
+
+        interpreter_module.Interpreter = _StubInterpreter
+        interpreter_module.load_delegate = _stub_load_delegate
+        placeholder.interpreter = interpreter_module
+
+        sys.modules.setdefault("ai_edge_litert", placeholder)
+        sys.modules.setdefault("ai_edge_litert.interpreter", interpreter_module)
+
+        try:
+            from onnx2tf import convert  # type: ignore
+        except ImportError as inner_exc:  # pragma: no cover
+            print(
+                f"[ERROR] Failed to import onnx2tf even after stubbing ai_edge_litert: {inner_exc}",
+                file=sys.stderr,
+            )
+            raise SystemExit(1) from inner_exc
+    else:
+        suggestion = f"pip install {missing}" if missing != "onnx2tf" else "pip install onnx2tf"
+        hint = " (required by onnx2tf)" if missing != "onnx2tf" else ""
+        print(
+            f"[ERROR] Missing dependency: {missing}.{hint} Install with '{suggestion}'.",
+            file=sys.stderr,
+        )
+        raise SystemExit(1) from exc
 except ImportError as exc:  # pragma: no cover - import guard
     print(f"[ERROR] Failed to import onnx2tf: {exc}", file=sys.stderr)
     raise SystemExit(1) from exc

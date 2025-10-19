@@ -6,7 +6,7 @@
 # This script runs inference using the customized TFLite model that omits NMS.
 
 IMG="${1:-pipeline/dataset/demo/demo.jpg}"
-TFLITE="${2:-pipeline/PP-YOLOE/models/ppyoloe_crn_s_36e_pphuman_cust_f32.tflite}"
+TFLITE="${2:-pipeline/PP-YOLOE/models/tensorflow/ppyoloe_saved_model/ppyoloe_crn_s_36e_pphuman_cust_tflite_float32.tflite}"
 OUT="${3:-pipeline/output}"
 THRESH="${4:-0.5}"
 
