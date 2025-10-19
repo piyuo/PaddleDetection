@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Convert PP-YOLOE ONNX models to TensorFlow SavedModel (and optional TFLite)."""
+"""Convert PP-YOLOE ONNX models to TensorFlow SavedModel."""
 
 from __future__ import annotations
 
@@ -29,15 +29,9 @@ except ImportError as exc:  # pragma: no cover - import guard
     print(f"[ERROR] Failed to import onnx2tf: {exc}", file=sys.stderr)
     raise SystemExit(1) from exc
 
-try:
-    import tensorflow as tf  # type: ignore
-except ImportError:
-    tf = None  # Optional; only needed for TFLite conversion
-
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Convert a PP-YOLOE ONNX model into TensorFlow SavedModel format (and optional TFLite)."
+        description="Convert a PP-YOLOE ONNX model into TensorFlow SavedModel format."
     )
     default_model = "pipeline/PP-YOLOE/models/ppyoloe_crn_s_36e_pphuman_cust.onnx"
     parser.add_argument("--model", type=str, default=default_model, help="Path to input ONNX model")
@@ -52,22 +46,6 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default="ppyoloe_saved_model",
         help="Subdirectory name for the SavedModel export",
-    )
-    parser.add_argument(
-        "--convert-tflite",
-        action="store_true",
-        help="Also convert the SavedModel to TFLite (requires TensorFlow).",
-    )
-    parser.add_argument(
-        "--tflite-output",
-        type=str,
-        default="ppyoloe_model.tflite",
-        help="Filename for the generated TFLite model (when --convert-tflite is set)",
-    )
-    parser.add_argument(
-        "--quantize",
-        action="store_true",
-        help="Apply float16 quantization when producing the TFLite model.",
     )
     parser.add_argument(
         "--verbose",
@@ -811,29 +789,6 @@ def export_to_saved_model(onnx_path: Path, saved_dir: Path, verbose: bool = Fals
     return saved_dir
 
 
-def convert_saved_model_to_tflite(saved_dir: Path, out_path: Path, quantize: bool = False, verbose: bool = False) -> Path:
-    if tf is None:
-        raise RuntimeError("TensorFlow is required for TFLite conversion. Install with 'pip install tensorflow'.")
-
-    if verbose:
-        print(f"[INFO] Converting SavedModel to TFLite: {saved_dir} → {out_path}")
-
-    converter = tf.lite.TFLiteConverter.from_saved_model(str(saved_dir))
-
-    if quantize:
-        if verbose:
-            print("[INFO] Enabling float16 quantization")
-        converter.optimizations = [tf.lite.Optimize.DEFAULT]
-        converter.target_spec.supported_types = [tf.float16]
-
-    tflite_model = converter.convert()
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_bytes(tflite_model)
-
-    print(f"[OK] TFLite model written to: {out_path}")
-    return out_path
-
-
 def main() -> None:
     args = parse_args()
 
@@ -850,16 +805,6 @@ def main() -> None:
     except Exception as exc:
         print(f"[ERROR] Failed to convert ONNX to TensorFlow SavedModel: {exc}", file=sys.stderr)
         raise SystemExit(1) from exc
-
-    if args.convert_tflite:
-        tflite_path = Path(args.tflite_output)
-        if not tflite_path.is_absolute():
-            tflite_path = output_dir / tflite_path
-        try:
-            convert_saved_model_to_tflite(saved_dir, tflite_path, quantize=args.quantize, verbose=args.verbose)
-        except Exception as exc:
-            print(f"[ERROR] Failed to create TFLite model: {exc}", file=sys.stderr)
-            raise SystemExit(1) from exc
 
     print("[DONE] Conversion pipeline completed successfully.")
 
