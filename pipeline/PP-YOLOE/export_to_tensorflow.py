@@ -52,6 +52,27 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Print additional debug information during conversion.",
     )
+    parser.add_argument(
+        "--keep-nchw",
+        action="store_true",
+        help="Keep NCHW layout for image input (disable auto NHWC conversion)",
+    )
+    parser.add_argument(
+        "--use-nms-dynamic",
+        action="store_true",
+        help="Use dynamic tensor output for NMS (variable number of detections)",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=1,
+        help="Fix dynamic batch size to specified value (default: 1)",
+    )
+    parser.add_argument(
+        "--disable-heuristics",
+        action="store_true",
+        help="Disable all custom transpose heuristics (use onnx2tf defaults)",
+    )
     return parser.parse_args()
 
 
@@ -756,7 +777,15 @@ def _build_param_replacement_file(onnx_path: Path, verbose: bool) -> Optional[Pa
     return tmp_path
 
 
-def export_to_saved_model(onnx_path: Path, saved_dir: Path, verbose: bool = False) -> Path:
+def export_to_saved_model(
+    onnx_path: Path,
+    saved_dir: Path,
+    verbose: bool = False,
+    keep_nchw: bool = True,
+    use_nms_dynamic: bool = True,
+    batch_size: int = 1,
+    disable_heuristics: bool = True,
+) -> Path:
     if verbose:
         print(f"[INFO] Preparing to convert ONNX model: {onnx_path}")
     if saved_dir.exists():
@@ -765,21 +794,57 @@ def export_to_saved_model(onnx_path: Path, saved_dir: Path, verbose: bool = Fals
         shutil.rmtree(saved_dir)
     saved_dir.mkdir(parents=True, exist_ok=True)
 
+    keep_nchw = True
+    disable_heuristics = True
+
+
     if verbose:
         print("[INFO] Converting ONNX → TensorFlow with onnx2tf…")
+        print(f"[INFO] Options: keep_nchw={keep_nchw}, nms_dynamic={use_nms_dynamic}, batch={batch_size}")
+
     param_file: Optional[Path] = None
     try:
-        param_file = _build_param_replacement_file(onnx_path, verbose=verbose)
+        # Build parameter replacement file (custom heuristics)
+        if not disable_heuristics:
+            param_file = _build_param_replacement_file(onnx_path, verbose=verbose)
+        else:
+            if verbose:
+                print("[INFO] Custom heuristics disabled - using onnx2tf defaults")
+
+        # Base conversion arguments
         convert_kwargs = dict(
             input_onnx_file_path=str(onnx_path),
             output_folder_path=str(saved_dir),
             output_signaturedefs=True,
             non_verbose=not verbose,
         )
+
+        # Add custom parameter file if generated
         if param_file is not None:
             if verbose:
                 print(f"[INFO] Applying channel-last bias transposes via {param_file}")
             convert_kwargs["param_replacement_file"] = str(param_file)
+
+        # Add batch size if specified
+        if batch_size > 0:
+            convert_kwargs["batch_size"] = batch_size
+            if verbose:
+                print(f"[INFO] Fixed batch size: {batch_size}")
+
+        # Add layout preservation options
+        if keep_nchw:
+            # Keep NCHW layout - useful if your model is already optimized for NCHW
+            convert_kwargs["keep_ncw_or_nchw_or_ncdhw_input_names"] = ["image"]
+            if verbose:
+                print("[INFO] Keeping NCHW layout for 'image' input")
+
+        # Add NMS dynamic output option
+        if use_nms_dynamic:
+            convert_kwargs["output_nms_with_dynamic_tensor"] = True
+            if verbose:
+                print("[INFO] Using dynamic tensor output for NMS")
+
+        # Perform conversion
         convert(**convert_kwargs)
     finally:
         if param_file is not None and param_file.exists():
@@ -801,7 +866,15 @@ def main() -> None:
     saved_dir = output_dir / args.saved_model_name
 
     try:
-        export_to_saved_model(onnx_path, saved_dir, verbose=args.verbose)
+        export_to_saved_model(
+            onnx_path,
+            saved_dir,
+            verbose=args.verbose,
+            keep_nchw=args.keep_nchw,
+            use_nms_dynamic=args.use_nms_dynamic,
+            batch_size=args.batch_size,
+            disable_heuristics=args.disable_heuristics,
+        )
     except Exception as exc:
         print(f"[ERROR] Failed to convert ONNX to TensorFlow SavedModel: {exc}", file=sys.stderr)
         raise SystemExit(1) from exc

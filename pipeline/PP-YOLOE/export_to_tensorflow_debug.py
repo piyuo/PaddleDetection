@@ -23,8 +23,8 @@ def patched_build_param(onnx_path: Path, verbose: bool):
         "squeeze_fixes": False,              # Squeeze axis fixes
         "add_const_transpose": False,        # Add 2D constant transpose
         "mul_const_transpose": False,        # Mul 2D constant transpose
-        "div_transpose": False,               # ⚠️ DISABLE DIV FIXES (likely culprit)
-        "name_based_fixes": False,            # ⚠️ DISABLE NAME-BASED FIXES (Div.0, etc)
+        "div_transpose": True,               # ⚠️ DISABLE DIV FIXES (likely culprit)
+        "name_based_fixes": True,            # ⚠️ DISABLE NAME-BASED FIXES (Div.0, etc)
     }
 
     print("[INFO] Custom export with disabled heuristics:")
