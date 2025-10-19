@@ -5,6 +5,7 @@
 echo "🔧 Activating Python environment..."
 source pipeline/PP-YOLOE/venv311/bin/activate
 
-python3 pipeline/PP-YOLOE/export_to_tensorflow.py \
-  --model pipeline/PP-YOLOE/models/ppyoloe_crn_s_36e_pphuman_cust.onnx \
-  --output-dir pipeline/PP-YOLOE/models/tensorflow
+python3 pipeline/PP-YOLOE/export_to_tensorflow_debug.py \
+  --model pipeline/PP-YOLOE/models/ppyoloe_crn_s_36e_pphuman_cust_tflite.onnx \
+  --output-dir pipeline/PP-YOLOE/models/tensorflow_debug \
+  --verbose
