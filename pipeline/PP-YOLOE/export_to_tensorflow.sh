@@ -28,5 +28,5 @@ python3 pipeline/PP-YOLOE/export_to_tensorflow.py \
 
 cp pipeline/PP-YOLOE/models/tensorflow/ppyoloe_saved_model/ppyoloe_crn_s_36e_pphuman_cust_tflite_no_split_float16.tflite pipeline/PP-YOLOE/models/ppyoloe_crn_s_36e_pphuman_cust_f16.tflite
 
-rm -f "$NOSPLIT_MODEL"
-rm -rf pipeline/PP-YOLOE/models/tensorflow
+#rm -f "$NOSPLIT_MODEL"
+#rm -rf pipeline/PP-YOLOE/models/tensorflow
