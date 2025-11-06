@@ -11,7 +11,7 @@ source pipeline/PP-YOLOE/venv/bin/activate
 
 # inference
 IMG="${1:-pipeline/dataset/demo/demo.jpg}"
-ONNX="${2:-pipeline/PP-YOLOE/models/ppyoloe_crn_s_36e_pphuman_cust_tflite.onnx}"
+ONNX="${2:-pipeline/PP-YOLOE/models/ppyoloe_crn_s_36e_pphuman_cust.onnx}"
 OUT="${3:-pipeline/output}"
 THRESH="${4:-0.5}"
 
