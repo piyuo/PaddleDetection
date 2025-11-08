@@ -1,15 +1,15 @@
-# Copyright (c) 2022 PaddlePaddle Authors. All Rights Reserved. 
-#   
-# Licensed under the Apache License, Version 2.0 (the "License");   
-# you may not use this file except in compliance with the License.  
-# You may obtain a copy of the License at   
-#   
-#     http://www.apache.org/licenses/LICENSE-2.0    
-#   
-# Unless required by applicable law or agreed to in writing, software   
-# distributed under the License is distributed on an "AS IS" BASIS, 
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  
-# See the License for the specific language governing permissions and   
+# Copyright (c) 2022 PaddlePaddle Authors. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
 # limitations under the License.
 
 from __future__ import absolute_import
@@ -237,8 +237,24 @@ class PPYOLOEWithAuxHead(BaseArch):
                     yolo_head_outs, self.yolo_head.mask_anchors,
                     self.inputs['im_shape'], self.inputs['scale_factor'])
             else:
-                bbox, bbox_num = self.yolo_head.post_process(
-                    yolo_head_outs, self.inputs['scale_factor'])
+                # tolerant unpack: support post_process returning (bbox, bbox_num),
+                # or (bbox, bbox_num, ...more...), or possibly a single object that unpacks.
+                res = self.yolo_head.post_process(yolo_head_outs, self.inputs['scale_factor'])
+
+                # If res is a tuple/list, pick first two elements. If it's some custom
+                # object that unpacks into two, the try will succeed.
+                try:
+                    # Try normal unpack first (works for len==2 or custom sequence)
+                    bbox, bbox_num = res
+                except Exception:
+                    # If unpack fails (e.g., res is tuple/list with >2 items), pick first two.
+                    if isinstance(res, (tuple, list)) and len(res) >= 2:
+                        bbox, bbox_num = res[0], res[1]
+                    else:
+                        # Unexpected shape — raise a descriptive error to help debugging.
+                        raise ValueError(f"Unexpected return from yolo_head.post_process: {type(res)} {getattr(res,'shape',None)} {res}")
+
+
             output = {'bbox': bbox, 'bbox_num': bbox_num}
 
             return output

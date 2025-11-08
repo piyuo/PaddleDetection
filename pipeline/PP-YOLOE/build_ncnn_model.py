@@ -1360,13 +1360,13 @@ def main():
 
     # Commented out: Stride-8 and Stride-16 feature maps (for embedding extraction)
     # These consume significant memory and may cause crashes on Android
-    s8 = discovered_info.get('stride_8')
-    if s8:
-        keep.append(s8['name'])
+    #s8 = discovered_info.get('stride_8')
+    #if s8:
+    #    keep.append(s8['name'])
 
-    s16 = discovered_info.get('stride_16')
-    if s16:
-        keep.append(s16['name'])
+    #s16 = discovered_info.get('stride_16')
+    #if s16:
+    #    keep.append(s16['name'])
 
     if keep:
         print(f"\n✓ Auto-discovered outputs to keep: {len(keep)} tensors")
