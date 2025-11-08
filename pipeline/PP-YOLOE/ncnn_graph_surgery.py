@@ -1,26 +1,23 @@
 #!/usr/bin/env python3
 """
-Apple Neural Engine Graph Surgery for PP-YOLOE ONNX
+NCNN/Vulkan Graph Surgery for PP-YOLOE ONNX
 
-This script applies CoreML ANE-specific optimizations to ONNX models:
-- Static shape fixing for ANE compatibility
-- Graph rewrites for ANE-friendly operations (Div→Mul, Pow patterns, Slice→Gather, etc.)
-- Constant folding and shape chain simplification
-- ANE compatibility analysis and profiling
+This pass prepares the customized PP-YOLOE detection head for NCNN+pnnx by:
+- Forcing static shapes so Vulkan shaders avoid dynamic branches
+- Rewriting costly ops into NCNN-friendly forms (Div→Mul, Pow rewrites, Slice→Gather, etc.)
+- Folding shape computation chains and clearing redundant nodes
+- Reporting ops that commonly block NCNN pipelines
 
-This script is focused ONLY on ANE optimizations. It expects a customized model
-as input (with NMS removed and feature outputs added via onnx_customize.py).
-
-Workflow:
+Expected workflow:
 1. export_to_onnx.sh → ppyoloe_crn_s_36e_pphuman.onnx (base model)
 2. onnx_customize.py → ppyoloe_crn_s_36e_pphuman_cust.onnx (customized model)
-3. ane_graph_surgery.py → ppyoloe_crn_s_36e_pphuman_cust_ane.onnx (ANE-optimized model)
-4. onnx_cleanup.py → ppyoloe_crn_s_36e_pphuman_cust_ane_cu.onnx (final cleaned model)
+3. ncnn_graph_surgery.py → ppyoloe_crn_s_36e_pphuman_cust_ncnn.onnx (NCNN-friendly model)
+4. export_to_ncnn.sh → final .param/.bin via pnnx + ncnnoptimize
 """
 import argparse
 import os
 import shutil
-from typing import Tuple, List, Dict
+from typing import Tuple, List, Dict, Any, Optional
 import sys
 
 import onnx
@@ -38,6 +35,7 @@ from profile_onnx import (
     parse_shape,
     run_benchmark,
 )
+
 def shape_infer_model(model_path: str, out_path: str) -> str:
     try:
         inferred = onnx.shape_inference.infer_shapes_path(model_path)
@@ -847,33 +845,35 @@ def rewrite_resize_to_static(model_path: str, out_path: str) -> str:
 def rewrite_reduce_to_globalpool(model_path: str, out_path: str) -> str:
     """Rewrite ReduceMean/ReduceMax over spatial dims [2,3] with keepdims=1 to GlobalAveragePool/GlobalMaxPool.
 
-    This typically improves CoreML EP partitioning as pooling is well supported, while some Reduce ops remain on CPU.
-    Safety: only for 4D inputs (N,C,H,W), axes exactly {2,3} (order-insensitive), keepdims=1.
+    This typically improves NCNN portability because pooling ops map directly to Vulkan kernels.
+    Safety: only for 4D inputs (N,C,H,W), axes exactly {2,3}, keepdims=1.
     """
     m = onnx.load(model_path)
     g = m.graph
 
-    # Build simple shape map to infer rank
     shape_map: Dict[str, List[int]] = {}
-    def record_vi(vi):
+
+    def record_vi(vi: onnx.ValueInfoProto) -> None:
         try:
             name = vi.name
             tt = vi.type.tensor_type
-            dims = []
+            dims: List[int] = []
             for d in tt.shape.dim:
                 dims.append(int(d.dim_value) if d.dim_value else None)
             shape_map[name] = dims
         except Exception:
             pass
+
     for vi in list(g.input) + list(g.value_info) + list(g.output):
         record_vi(vi)
 
-    def get_attr_ints(node, name):
+    def get_attr_ints(node: onnx.NodeProto, name: str) -> Optional[List[int]]:
         for a in node.attribute:
             if a.name == name and a.type == onnx.AttributeProto.INTS:
                 return list(a.ints)
         return None
-    def get_attr_int(node, name, default=None):
+
+    def get_attr_int(node: onnx.NodeProto, name: str, default: Optional[int] = None) -> Optional[int]:
         for a in node.attribute:
             if a.name == name and a.type == onnx.AttributeProto.INT:
                 return int(a.i)
@@ -881,6 +881,7 @@ def rewrite_reduce_to_globalpool(model_path: str, out_path: str) -> str:
 
     kept: List[onnx.NodeProto] = []
     changed = 0
+
     for node in g.node:
         if node.op_type not in ("ReduceMean", "ReduceMax"):
             kept.append(node)
@@ -888,11 +889,13 @@ def rewrite_reduce_to_globalpool(model_path: str, out_path: str) -> str:
         if not node.input:
             kept.append(node)
             continue
+
         x = node.input[0]
         shp = shape_map.get(x)
         if not shp or len(shp) != 4:
             kept.append(node)
             continue
+
         axes = get_attr_ints(node, "axes")
         keepdims = get_attr_int(node, "keepdims", 1)
         if keepdims != 1:
@@ -901,15 +904,15 @@ def rewrite_reduce_to_globalpool(model_path: str, out_path: str) -> str:
         if axes is None:
             kept.append(node)
             continue
-        # Canonicalize negative axes
-        axes_c = []
+
+        axes_c: List[int] = []
         for a in axes:
             aa = a if a >= 0 else (len(shp) + a)
             axes_c.append(int(aa))
         if sorted(axes_c) != [2, 3]:
             kept.append(node)
             continue
-        # Build Global Pool node
+
         op = "GlobalAveragePool" if node.op_type == "ReduceMean" else "GlobalMaxPool"
         new_node = helper.make_node(op, [x], list(node.output), name=node.name + "_toGlobalPool")
         kept.append(new_node)
@@ -934,28 +937,28 @@ def remove_noop_slice(model_path: str, out_path: str) -> str:
     m = onnx.load(model_path)
     g = m.graph
 
-    # Const maps
     consts = {init.name: numpy_helper.to_array(init) for init in g.initializer}
 
-    # Shape map for input ranks and dims
     shape_map: Dict[str, List[int]] = {}
-    def record_vi(vi):
+
+    def record_vi(vi: onnx.ValueInfoProto) -> None:
         try:
             name = vi.name
             tt = vi.type.tensor_type
-            dims = []
+            dims: List[int] = []
             for d in tt.shape.dim:
                 dims.append(int(d.dim_value) if d.dim_value else None)
             shape_map[name] = dims
         except Exception:
             pass
+
     for vi in list(g.input) + list(g.value_info) + list(g.output):
         record_vi(vi)
 
     kept: List[onnx.NodeProto] = []
     changed = 0
 
-    def read(name):
+    def read(name: str) -> Optional[np.ndarray]:
         arr = consts.get(name)
         if arr is None:
             return None
@@ -968,13 +971,16 @@ def remove_noop_slice(model_path: str, out_path: str) -> str:
         data, starts, ends = node.input[:3]
         axes = node.input[3] if len(node.input) >= 4 else None
         steps = node.input[4] if len(node.input) >= 5 else None
+
         s = read(starts)
         e = read(ends)
         ax = read(axes) if axes else None
         st = read(steps) if steps else None
+
         if s is None or e is None:
             kept.append(node)
             continue
+
         try:
             s = s.astype(np.int64).reshape(-1)
             e = e.astype(np.int64).reshape(-1)
@@ -989,13 +995,16 @@ def remove_noop_slice(model_path: str, out_path: str) -> str:
         except Exception:
             kept.append(node)
             continue
+
         if not (len(s) == len(e) == len(ax) == len(st)):
             kept.append(node)
             continue
+
         in_shape = shape_map.get(data)
         if not in_shape:
             kept.append(node)
             continue
+
         noop = True
         rank = len(in_shape)
         for i in range(len(s)):
@@ -1010,17 +1019,15 @@ def remove_noop_slice(model_path: str, out_path: str) -> str:
             if step_i != 1:
                 noop = False
                 break
-            # Normalize negative end index to dim + end
             if end_i < 0:
                 end_i = dim + end_i
-            # Treat very large end (common sentinel) as dim
             if end_i > dim:
                 end_i = dim
             if not (start_i == 0 and end_i == dim):
                 noop = False
                 break
+
         if noop:
-            # Replace Slice with Identity
             id_node = helper.make_node("Identity", [data], list(node.output), name=node.name + "_IdNoopSlice")
             kept.append(id_node)
             changed += 1
@@ -1038,288 +1045,397 @@ def remove_noop_slice(model_path: str, out_path: str) -> str:
     return out_path
 
 
+def remove_identity_nodes(model_path: str, out_path: str) -> str:
+    """Remove Identity nodes by rewiring consumers to their original inputs."""
+    m = onnx.load(model_path)
+    g = m.graph
+
+    targets: List[onnx.NodeProto] = []
+    mapping: Dict[str, str] = {}
+
+    for node in g.node:
+        if node.op_type != "Identity" or len(node.input) != 1 or len(node.output) != 1:
+            continue
+        src = node.input[0]
+        dst = node.output[0]
+        if src == dst:
+            continue
+        mapping[dst] = src
+        targets.append(node)
+
+    if not targets:
+        onnx.save(m, out_path)
+        return out_path
+
+    def resolve(name: str) -> str:
+        seen = set()
+        cur = name
+        while cur in mapping and cur not in seen:
+            seen.add(cur)
+            cur = mapping[cur]
+        return cur
+
+    for node in g.node:
+        if node in targets:
+            continue
+        for idx, nm in enumerate(node.input):
+            node.input[idx] = resolve(nm)
+
+    for vi in list(g.value_info) + list(g.output):
+        vi.name = resolve(vi.name)
+
+    kept = [n for n in g.node if n not in targets]
+    del g.node[:]
+    g.node.extend(kept)
+    onnx.save(m, out_path)
+    print(f"Removed Identity nodes: {len(targets)} node(s)")
+    return out_path
 
 
-def analyze_ane_compatibility(profile_summary: Dict) -> None:
-    """Analyze and report ops most likely blocking ANE execution."""
-    if not profile_summary:
+def analyze_ncnn_compatibility(model_info: Dict[str, Any]) -> None:
+    """Emit a small NCNN readiness report from the collected model info histogram."""
+    ops_hist = model_info.get("ops_hist", []) or []
+    if not ops_hist:
         return
 
-    cpu_ops = profile_summary.get("top_ops_by_time", {}).get("CPUExecutionProvider", [])
-    if not cpu_ops:
-        return
-
-    known_ane_unfriendly = {
-        "NonMaxSuppression", "RoiAlign", "TopK", "Where", "IsNaN",
-        "Loop", "If", "Scan", "Resize"  # Some Resize modes
+    unsupported = {
+        "NonMaxSuppression", "GridSample", "RoiAlign", "ScatterND", "ScatterElements",
+        "Loop", "If", "Scan", "TopK", "Unique", "Range", "Where", "Multinomial",
+        "OneHot", "NonZero", "CumSum",
+    }
+    needs_static = {
+        "Resize", "Slice", "Gather", "Expand", "Pad", "Tile", "Unsqueeze",
+        "Reshape", "ReduceMean", "ReduceMax", "ReduceSum",
     }
 
-    print("\n=== ANE Compatibility Analysis ===")
-    print("Top CPU ops (candidates for optimization):")
-    for op, time_ms, count in cpu_ops[:15]:
-        marker = " ⚠️  ANE-unfriendly" if op in known_ane_unfriendly else ""
-        pct = ""
-        total_cpu = profile_summary.get("provider_total_time_ms", {}).get("CPUExecutionProvider", 0)
-        if total_cpu > 0:
-            pct = f" ({100.0 * time_ms / total_cpu:.1f}%)"
-        print(f"  • {op}: {time_ms:.2f}ms ({count} nodes){pct}{marker}")
+    flagged = [(op, cnt) for op, cnt in ops_hist if op in unsupported]
+    cautions = [(op, cnt) for op, cnt in ops_hist if op in needs_static]
 
-    # Suggest specific optimizations
-    op_names = {op for op, _, _ in cpu_ops[:15]}
-    suggestions = []
+    print("\n=== NCNN Readiness Check ===")
+    if flagged:
+        print("Potential blockers (verify with pnnx, may need custom rewrites):")
+        for op, cnt in flagged:
+            print(f"  • {op}: {cnt} node(s)")
+    else:
+        print("No obvious NCNN-unsupported ops detected.")
 
-    if "Slice" in op_names:
-        suggestions.append("  → Try --rewrite-slice-to-gather for simple slicing patterns")
-    if "NonMaxSuppression" in op_names:
-        suggestions.append("  → NMS is inherently CPU-bound; consider splitting model at detection head")
-    if "RoiAlign" in op_names:
-        suggestions.append("  → RoiAlign may not be ANE-supported; consider alternative pooling")
-
-    if suggestions:
-        print("\nOptimization suggestions:")
-        for s in suggestions:
-            print(s)
+    if cautions:
+        print("Ops that prefer fully static shapes for Vulkan performance:")
+        for op, cnt in cautions:
+            print(f"  • {op}: {cnt} node(s)")
+        print("  ↳ Consider enabling --rewrite-* and --remove-noop-slice helpers.")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Enhanced graph surgery for PP-YOLOE ONNX with ANE optimizations")
+    parser = argparse.ArgumentParser(
+        description="Graph surgery for PP-YOLOE ONNX prior to NCNN/Vulkan export."
+    )
     parser.add_argument(
         "--model",
         type=str,
         default="pipeline/PP-YOLOE/models/ppyoloe_crn_s_36e_pphuman_embed.onnx",
         help="Path to source ONNX model",
     )
-    parser.add_argument("--input-shape", type=str, default="1,3,640,640")
-    parser.add_argument("--warmup", type=int, default=5)
-    parser.add_argument("--runs", type=int, default=50)
-    parser.add_argument("--img", type=str, help="Path to image for realistic preprocessing (not needed for --find-nms)")
-    parser.add_argument("--outdir", type=str, default="pipeline/PP-YOLOE/models/surgery")
-    parser.add_argument("--ort-profile-dir", type=str, help="Directory for ORT profiling (enables profiling automatically)")
-    parser.add_argument("--fp16", action="store_true", help="Attempt FP16 casting")
-    parser.add_argument("--split-concat", type=int, default=4, help="Split large Concat nodes")
+    parser.add_argument(
+        "--input-shape",
+        type=str,
+        default="1,3,640,640",
+        help="Static input shape as comma separated N,C,H,W",
+    )
+    parser.add_argument(
+        "--outdir",
+        type=str,
+        default="pipeline/PP-YOLOE/models/surgery",
+        help="Directory to store intermediate ONNX artifacts",
+    )
+    parser.add_argument(
+        "--output-model",
+        type=str,
+        help="Optional destination for the final NCNN-ready ONNX",
+    )
+    parser.add_argument(
+        "--run-benchmark",
+        action="store_true",
+        help="Run onnxruntime benchmark before/after surgery",
+    )
+    parser.add_argument(
+        "--img",
+        type=str,
+        help="Image path for benchmarking when --run-benchmark is enabled",
+    )
+    parser.add_argument("--warmup", type=int, default=5, help="Warmup iterations for benchmarking")
+    parser.add_argument("--runs", type=int, default=50, help="Timed iterations for benchmarking")
+    parser.add_argument(
+        "--ort-provider",
+        type=str,
+        default="cpu",
+        help="Execution provider for onnxruntime benchmarking (e.g. cpu, coreml, tensorrt)",
+    )
+    parser.add_argument(
+        "--enable-ort-profile",
+        action="store_true",
+        help="Enable onnxruntime profiling during benchmarking",
+    )
+    parser.add_argument(
+        "--ort-profile-dir",
+        type=str,
+        default="pipeline/PP-YOLOE/output",
+        help="Directory for ORT profiling traces",
+    )
+    parser.add_argument("--split-concat", type=int, default=4, help="Split large Concat nodes before NCNN export")
     parser.add_argument("--fix-input-shapes", action="store_true", help="Rewrite graph inputs to static shapes")
     parser.add_argument("--fold-static-shapes", action="store_true", help="Fold shape computation chains")
-    parser.add_argument("--rewrite-resize-to-static", action="store_true", help="Replace dynamic Resize with static sizes")
-    parser.add_argument("--fold-iterations", type=int, default=15, help="Iterations for constant folding (default: 15)")
-    parser.add_argument("--rewrite-div", action="store_true", help="Rewrite Div to Mul with reciprocal")
-    parser.add_argument("--rewrite-pow", action="store_true", help="Rewrite Pow patterns")
-    parser.add_argument("--rewrite-slice-range-to-gather", action="store_true", help="Rewrite range Slice (step=1) to Gather with indices")
-    parser.add_argument("--rewrite-slice-to-gather", action="store_true", help="Rewrite Slice to Gather")
-    parser.add_argument("--rewrite-reduce-to-globalpool", action="store_true", help="Rewrite ReduceMean/ReduceMax over H,W to GlobalPool")
-    parser.add_argument("--remove-noop-slice", action="store_true", help="Remove Slice ops that are effectively identity")
-    parser.add_argument("--output-model", type=str, help="Path to copy final optimized model to")
+    parser.add_argument(
+        "--fold-iterations",
+        type=int,
+        default=15,
+        help="Iterations for constant folding when --fold-static-shapes is set",
+    )
+    parser.add_argument(
+        "--rewrite-resize-to-static",
+        action="store_true",
+        help="Rewrite dynamic Resize ops to static sizes",
+    )
+    parser.add_argument("--rewrite-div", action="store_true", help="Rewrite Div by constant into Mul")
+    parser.add_argument("--rewrite-pow", action="store_true", help="Rewrite Pow patterns that NCNN lacks")
+    parser.add_argument(
+        "--rewrite-slice-range-to-gather",
+        action="store_true",
+        help="Rewrite Slice(range) to Gather with explicit indices",
+    )
+    parser.add_argument(
+        "--rewrite-slice-to-gather",
+        action="store_true",
+        help="Rewrite compatible Slice ops to Gather",
+    )
+    parser.add_argument(
+        "--rewrite-reduce-to-globalpool",
+        action="store_true",
+        help="Rewrite ReduceMean/ReduceMax over H,W to GlobalAverage/MaxPool",
+    )
+    parser.add_argument(
+        "--remove-noop-slice",
+        action="store_true",
+        help="Remove Slice ops that do not change tensor ranges",
+    )
+    parser.add_argument(
+        "--remove-identity",
+        action="store_true",
+        help="Remove Identity nodes after rewrites",
+    )
+    parser.add_argument("--fp16", action="store_true", help="Attempt FP16 casting on supported ops")
 
     args = parser.parse_args()
 
-    # Check required arguments for normal operation
-    if not args.img:
-        print("[ERROR] --img argument is required", file=sys.stderr)
-        return
+    if not os.path.exists(args.model):
+        print(f"[ERROR] Model not found: {args.model}", file=sys.stderr)
+        sys.exit(1)
 
     os.makedirs(args.outdir, exist_ok=True)
     ishape = parse_shape(args.input_shape)
-    img_path = args.img if os.path.isabs(args.img) else os.path.abspath(args.img)
-    if not os.path.exists(img_path):
-        print(f"[ERROR] Image not found: {img_path}")
-        return
 
-    # Enable profiling automatically if profile directory is specified
-    enable_profiling = bool(args.ort_profile_dir)
+    img_path: Optional[str] = None
+    enable_benchmark = bool(args.run_benchmark)
+    enable_profiling = bool(args.enable_ort_profile)
 
-    print("=== Baseline ===")
-    if ort is None:
-        print("onnxruntime not available; install 'onnxruntime' or 'onnxruntime-silicon'.")
-        return
+    if enable_benchmark:
+        if ort is None:
+            print("[WARN] onnxruntime not available; skipping benchmarking.")
+            enable_benchmark = False
+        elif not args.img:
+            print("[WARN] --run-benchmark requested but --img not provided; skipping benchmarking.")
+            enable_benchmark = False
+        else:
+            candidate = args.img if os.path.isabs(args.img) else os.path.abspath(args.img)
+            if os.path.exists(candidate):
+                img_path = candidate
+            else:
+                print(f"[WARN] Benchmark image not found: {candidate}; skipping benchmarking.")
+                enable_benchmark = False
 
-    base = run_benchmark(args.model, ishape, "coreml", args.warmup, args.runs,
-                        enable_profile=enable_profiling, profile_dir=args.ort_profile_dir, img_path=img_path)
-    b = base["benchmark"]
-    print("Providers (baseline):", b.get("providers"))
-    if base.get("coreml_capability"):
-        cap = base["coreml_capability"]
-        print(f"CoreML capability (baseline): partitions={cap.get('num_partitions')} nodes supported={cap.get('num_nodes')}")
-    print(
-        "Baseline Latency (ms) avg={:.2f} p50={:.2f} p90={:.2f} p95={:.2f}".format(
-            b["latency_ms_avg"], b["latency_ms_p50"], b["latency_ms_p90"], b["latency_ms_p95"]
+    if enable_benchmark and enable_profiling:
+        os.makedirs(args.ort_profile_dir, exist_ok=True)
+
+    base_info = load_model_info(args.model)
+    print("\n=== Source Model ===")
+    print(f"Path: {os.path.abspath(args.model)}")
+    print(f"Nodes: {base_info['node_count']}  Unique ops: {base_info['unique_ops']}")
+    analyze_ncnn_compatibility(base_info)
+
+    baseline_run = None
+    if enable_benchmark:
+        try:
+            baseline_run = run_benchmark(
+                args.model,
+                ishape,
+                args.ort_provider,
+                args.warmup,
+                args.runs,
+                enable_profile=enable_profiling,
+                profile_dir=args.ort_profile_dir if enable_profiling else None,
+                img_path=img_path,
+            )
+        except Exception as exc:
+            print(f"[WARN] Baseline benchmark failed: {exc}")
+            baseline_run = None
+            enable_benchmark = False
+
+    if baseline_run:
+        b = baseline_run["benchmark"]
+        print("\n=== Baseline Benchmark ===")
+        print(f"Provider: {args.ort_provider}")
+        print(
+            "Latency (ms) avg={:.2f} p50={:.2f} p90={:.2f} p95={:.2f}".format(
+                b["latency_ms_avg"], b["latency_ms_p50"], b["latency_ms_p90"], b["latency_ms_p95"]
+            )
         )
-    )
 
-    if base.get("profile_summary"):
-        analyze_ane_compatibility(base["profile_summary"])
+    base_name = os.path.splitext(os.path.basename(args.model))[0]
 
-    # Build modified path
-    mod_path = os.path.join(args.outdir, os.path.basename(args.model).replace('.onnx', '_mod.onnx'))
+    def stage_path(tag: str) -> str:
+        return os.path.join(args.outdir, f"{base_name}_{tag}.onnx")
+
     work_path = args.model
 
     if args.fix_input_shapes:
-        print("[stage] Fix input shapes to static…")
-        mod_fix = os.path.join(args.outdir, os.path.basename(args.model).replace('.onnx', '_fixed.onnx'))
-        work_path = fix_input_shapes(work_path, mod_fix, ishape if len(ishape) == 4 else (1, 3, 640, 640))
+        if len(ishape) == 4:
+            print("[stage] Fixing input shapes to static NCHW…")
+            nchw = tuple(int(x) for x in ishape[:4])
+            work_path = fix_input_shapes(work_path, stage_path("fixed"), nchw)
+        else:
+            print(f"[WARN] Cannot fix input shapes for non-4D input: {ishape}")
 
-    print("[stage] Shape inference…")
-    mod2 = mod_path.replace("_mod.onnx", "_shape.onnx")
-    work_path = shape_infer_model(work_path, mod2)
+    print("[stage] Running initial shape inference…")
+    work_path = shape_infer_model(work_path, stage_path("shape"))
 
-
-
-    if args.split_concat and args.split_concat > 0:
-        print(f"[stage] Splitting large Concat nodes (max_inputs={args.split_concat})…")
-        modC = os.path.join(args.outdir, os.path.basename(args.model).replace('.onnx', '_splitconcat.onnx'))
-        work_path = split_large_concats(work_path, modC, max_inputs=int(args.split_concat))
-
-    # Re-run shape inference after structural rewrites
-    print("[stage] Running shape inference (post-rewrite)…")
-    mod2b = mod_path.replace("_mod.onnx", "_shape2.onnx")
-    work_path = shape_infer_model(work_path, mod2b)
+    if args.split_concat and args.split_concat > 1:
+        print(f"[stage] Splitting Concat nodes (max_inputs={args.split_concat})…")
+        work_path = split_large_concats(
+            work_path,
+            stage_path("splitconcat"),
+            max_inputs=int(args.split_concat),
+        )
+        work_path = shape_infer_model(work_path, stage_path("shape_split"))
 
     if args.fold_static_shapes:
         print(f"[stage] Folding static shape chains ({args.fold_iterations} iterations)…")
-        modF = os.path.join(args.outdir, os.path.basename(args.model).replace('.onnx', '_foldshape.onnx'))
-        work_path = fold_static_shape_chains(work_path, modF, iterations=args.fold_iterations)
-
+        work_path = fold_static_shape_chains(
+            work_path,
+            stage_path("foldshape"),
+            iterations=int(args.fold_iterations),
+        )
 
     if args.rewrite_div:
-        print("[stage] Rewriting Div by constant…")
-        modD = os.path.join(args.outdir, os.path.basename(args.model).replace('.onnx', '_div2mul.onnx'))
-        work_path = rewrite_div_by_const(work_path, modD)
+        print("[stage] Rewriting Div by constants…")
+        work_path = rewrite_div_by_const(work_path, stage_path("div2mul"))
 
     if args.rewrite_pow:
         print("[stage] Rewriting Pow patterns…")
-        modW = os.path.join(args.outdir, os.path.basename(args.model).replace('.onnx', '_powrew.onnx'))
-        work_path = rewrite_pow_patterns(work_path, modW)
+        work_path = rewrite_pow_patterns(work_path, stage_path("powrew"))
 
     if args.rewrite_slice_range_to_gather:
-        print("[stage] Rewriting range Slice -> Gather…")
-        modSGR = os.path.join(args.outdir, os.path.basename(args.model).replace('.onnx', '_slice2gather_range.onnx'))
-        work_path = rewrite_slice_range_to_gather(work_path, modSGR)
+        print("[stage] Rewriting range Slice → Gather…")
+        work_path = rewrite_slice_range_to_gather(work_path, stage_path("slice2gather_range"))
 
     if args.rewrite_slice_to_gather:
-        print("[stage] Rewriting simple Slice -> Gather…")
-        modSG = os.path.join(args.outdir, os.path.basename(args.model).replace('.onnx', '_slice2gather.onnx'))
-        work_path = rewrite_slice_to_gather(work_path, modSG)
+        print("[stage] Rewriting Slice → Gather…")
+        work_path = rewrite_slice_to_gather(work_path, stage_path("slice2gather"))
 
     if args.rewrite_resize_to_static:
         print("[stage] Rewriting Resize to static sizes…")
-        modRZ = os.path.join(args.outdir, os.path.basename(args.model).replace('.onnx', '_resize_static.onnx'))
-        work_path = rewrite_resize_to_static(work_path, modRZ)
+        work_path = rewrite_resize_to_static(work_path, stage_path("resize_static"))
 
     if args.remove_noop_slice:
         print("[stage] Removing no-op Slice ops…")
-        modNS = os.path.join(args.outdir, os.path.basename(args.model).replace('.onnx', '_slice_noop.onnx'))
-        work_path = remove_noop_slice(work_path, modNS)
+        work_path = remove_noop_slice(work_path, stage_path("slice_noop"))
 
     if args.rewrite_reduce_to_globalpool:
-        print("[stage] Rewriting Reduce -> GlobalPool…")
-        modGP = os.path.join(args.outdir, os.path.basename(args.model).replace('.onnx', '_globalpool.onnx'))
-        work_path = rewrite_reduce_to_globalpool(work_path, modGP)
+        print("[stage] Rewriting Reduce → GlobalPool…")
+        work_path = rewrite_reduce_to_globalpool(work_path, stage_path("globalpool"))
 
-    # Final shape inference to refresh value_info after ANE rewrites
-    print("[stage] Running shape inference (final)…")
-    mod2c = mod_path.replace("_mod.onnx", "_shape3.onnx")
-    work_path = shape_infer_model(work_path, mod2c)
+    print("[stage] Running shape inference after rewrites…")
+    work_path = shape_infer_model(work_path, stage_path("shape_post"))
+
+    if args.remove_identity:
+        print("[stage] Removing Identity nodes…")
+        work_path = remove_identity_nodes(work_path, stage_path("noidentity"))
+        work_path = shape_infer_model(work_path, stage_path("shape_clean"))
 
     if args.fp16:
         print("[stage] Attempting FP16 casting…")
-        mod3 = os.path.join(args.outdir, os.path.basename(args.model).replace('.onnx', '_fp16.onnx'))
-        work_path = cast_graph_to_fp16(work_path, mod3)
+        work_path = cast_graph_to_fp16(work_path, stage_path("fp16"))
 
-    optimized_path = work_path
+    final_path = args.output_model or stage_path("ncnn_ready")
+    final_dir = os.path.dirname(os.path.abspath(final_path))
+    if final_dir:
+        os.makedirs(final_dir, exist_ok=True)
 
-    # Copy to final artifact
-    if args.output_model:
-        # Use the specified output model path
-        final_path = args.output_model
-        # Create directory if it doesn't exist
-        os.makedirs(os.path.dirname(os.path.abspath(final_path)), exist_ok=True)
-    else:
-        # Use default naming in output directory
-        final_path = os.path.join(
-            args.outdir, os.path.basename(args.model).replace('.onnx', '_ane.onnx')
+    if os.path.abspath(work_path) != os.path.abspath(final_path):
+        shutil.copyfile(work_path, final_path)
+    work_path = final_path
+
+    final_info = load_model_info(work_path)
+    print("\n=== Final Model ===")
+    print(f"Path: {os.path.abspath(work_path)}")
+    print(f"Nodes: {final_info['node_count']}  Unique ops: {final_info['unique_ops']}")
+    analyze_ncnn_compatibility(final_info)
+
+    optimized_run = None
+    if enable_benchmark:
+        try:
+            optimized_run = run_benchmark(
+                work_path,
+                ishape,
+                args.ort_provider,
+                args.warmup,
+                args.runs,
+                enable_profile=enable_profiling,
+                profile_dir=args.ort_profile_dir if enable_profiling else None,
+                img_path=img_path,
+            )
+        except Exception as exc:
+            print(f"[WARN] Benchmark on optimized model failed: {exc}")
+            optimized_run = None
+
+    if optimized_run:
+        m = optimized_run["benchmark"]
+        print("\n=== Optimized Benchmark ===")
+        print(f"Provider: {args.ort_provider}")
+        print(
+            "Latency (ms) avg={:.2f} p50={:.2f} p90={:.2f} p95={:.2f}".format(
+                m["latency_ms_avg"], m["latency_ms_p50"], m["latency_ms_p90"], m["latency_ms_p95"]
+            )
         )
 
-    try:
-        shutil.copyfile(optimized_path, final_path)
-        print(f"[stage] Copied ANE-optimized model to: {final_path}")
-    except Exception as e:
-        print(f"[WARNING] Failed to copy to final path: {e}")
-        final_path = optimized_path
+    if baseline_run and optimized_run:
+        b = baseline_run["benchmark"]
+        m = optimized_run["benchmark"]
 
-    final_abs = os.path.abspath(final_path)
-    final_name = os.path.basename(final_path)
+        def pct_delta(a: float, b_val: float) -> float:
+            return 100.0 * (b_val - a) / a if a and np.isfinite(a) else float("nan")
 
-    # Model info and benchmarking at the end
-    mod_info = load_model_info(final_path)
-    print("\n" + "="*70)
-    print("=== Modified Model Info ===")
-    print("="*70)
-    print("Nodes:", mod_info["node_count"], "Unique ops:", mod_info["unique_ops"])
-    print("Modified model:", optimized_path)
-    print("Final model:", final_path)
-
-    print("\n" + "="*70)
-    print("=== Final Artifact ===")
-    print("="*70)
-    print(f"Filename: {final_name}")
-    print(f"Path: {final_abs}")
-
-    print("\n" + "="*70)
-    print("=== Modified Benchmark ===")
-    print("="*70)
-    mod = run_benchmark(final_path, ishape, "coreml", args.warmup, args.runs,
-                       enable_profile=enable_profiling, profile_dir=args.ort_profile_dir, img_path=img_path)
-    m = mod["benchmark"]
-    print("Providers (modified):", m.get("providers"))
-    if mod.get("coreml_capability"):
-        cap = mod["coreml_capability"]
-        print(f"CoreML capability (modified): partitions={cap.get('num_partitions')} nodes supported={cap.get('num_nodes')}")
-    print(
-        "Modified Latency (ms) avg={:.2f} p50={:.2f} p90={:.2f} p95={:.2f}".format(
-            m["latency_ms_avg"], m["latency_ms_p50"], m["latency_ms_p90"], m["latency_ms_p95"]
+        print("\n=== Benchmark Delta (optimized vs baseline) ===")
+        print(
+            "Average latency: {0:.2f}ms → {1:.2f}ms ({2:+.2f}%)".format(
+                b["latency_ms_avg"], m["latency_ms_avg"], pct_delta(b["latency_ms_avg"], m["latency_ms_avg"])
+            )
         )
-    )
-
-    if mod.get("profile_summary"):
-        analyze_ane_compatibility(mod["profile_summary"])
-
-    # Comparison
-    def pct_delta(a, b):
-        return 100.0 * (b - a) / a if a and np.isfinite(a) else float('nan')
-
-    print("\n" + "="*70)
-    print("=== Performance Comparison (Modified vs Baseline) ===")
-    print("="*70)
-    avg_delta = pct_delta(b["latency_ms_avg"], m["latency_ms_avg"])
-    p50_delta = pct_delta(b["latency_ms_p50"], m["latency_ms_p50"])
-    p90_delta = pct_delta(b["latency_ms_p90"], m["latency_ms_p90"])
-    p95_delta = pct_delta(b["latency_ms_p95"], m["latency_ms_p95"])
-
-    def format_delta(d):
-        sign = "+" if d > 0 else ""
-        return f"{sign}{d:.2f}%"
-
-    print(f"Average latency: {b['latency_ms_avg']:.2f}ms → {m['latency_ms_avg']:.2f}ms ({format_delta(avg_delta)})")
-    print(f"P50 latency:     {b['latency_ms_p50']:.2f}ms → {m['latency_ms_p50']:.2f}ms ({format_delta(p50_delta)})")
-    print(f"P90 latency:     {b['latency_ms_p90']:.2f}ms → {m['latency_ms_p90']:.2f}ms ({format_delta(p90_delta)})")
-    print(f"P95 latency:     {b['latency_ms_p95']:.2f}ms → {m['latency_ms_p95']:.2f}ms ({format_delta(p95_delta)})")
-
-    # Speedup summary
-    if avg_delta < 0:
-        speedup = b["latency_ms_avg"] / m["latency_ms_avg"]
-        print(f"\n🚀 Speedup: {speedup:.2f}x faster")
-
-    # CoreML partition improvement
-    if base.get("coreml_capability") and mod.get("coreml_capability"):
-        base_parts = base["coreml_capability"].get("num_partitions", 0)
-        mod_parts = mod["coreml_capability"].get("num_partitions", 0)
-        base_nodes = base["coreml_capability"].get("num_nodes", 0)
-        mod_nodes = mod["coreml_capability"].get("num_nodes", 0)
-
-        if base_parts != mod_parts or base_nodes != mod_nodes:
-            print("\n=== CoreML Partition Changes ===")
-            print(f"Partitions: {base_parts} → {mod_parts}")
-            print(f"ANE-supported nodes: {base_nodes} → {mod_nodes} ({mod_nodes - base_nodes:+d})")
+        print(
+            "P50 latency: {0:.2f}ms → {1:.2f}ms ({2:+.2f}%)".format(
+                b["latency_ms_p50"], m["latency_ms_p50"], pct_delta(b["latency_ms_p50"], m["latency_ms_p50"])
+            )
+        )
+        print(
+            "P90 latency: {0:.2f}ms → {1:.2f}ms ({2:+.2f}%)".format(
+                b["latency_ms_p90"], m["latency_ms_p90"], pct_delta(b["latency_ms_p90"], m["latency_ms_p90"])
+            )
+        )
+        print(
+            "P95 latency: {0:.2f}ms → {1:.2f}ms ({2:+.2f}%)".format(
+                b["latency_ms_p95"], m["latency_ms_p95"], pct_delta(b["latency_ms_p95"], m["latency_ms_p95"])
+            )
+        )
 
 
 if __name__ == "__main__":
-
     main()
