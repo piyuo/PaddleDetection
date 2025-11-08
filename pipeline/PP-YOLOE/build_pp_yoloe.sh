@@ -39,10 +39,20 @@ python3 pipeline/PP-YOLOE/onnx_inference_cust.py \
     --onnx pipeline/PP-YOLOE/models/ppyoloe_crn_s_36e_pphuman_cust_ane_cu.onnx
 
 
+# ncnn
+pipeline/PP-YOLOE/ncnn_graph_surgery.sh \
+    --model pipeline/PP-YOLOE/models/ppyoloe_crn_s_36e_pphuman_cust.onnx \
+    --output-model pipeline/PP-YOLOE/models/ppyoloe_crn_s_36e_pphuman_cust_ncnn.onnx \
+    --img pipeline/dataset/demo/demo.jpg
+
+
 # output: pipeline/PP-YOLOE/models/mot_ppyoloe_s_36e_ppvehicle.onnx
 pipeline/PP-YOLOE/export_to_onnx.sh \
     --config configs/ppvehicle/mot_ppyoloe_s_36e_ppvehicle.yml \
 	--weights pipeline/PP-YOLOE/weights/mot_ppyoloe_s_36e_ppvehicle.pdparams
+
+
+
 
 
 # build ncnn model
