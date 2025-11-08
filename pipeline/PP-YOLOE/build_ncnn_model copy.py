@@ -1350,16 +1350,12 @@ def main():
     discovered_info = auto_discover_outputs(work_path, img_hw=img_hw, verbose=True)
 
     # Build keep_outputs list from discovered info
-    # NOTE: Only keeping NMS outputs (boxes, scores) - excluding stride-8/16 feature maps
-    # to reduce memory usage for Android deployment
     nms = discovered_info.get('nms', {})
     if nms.get('boxes'):
         keep.append(nms['boxes'])
     if nms.get('scores'):
         keep.append(nms['scores'])
 
-    # Commented out: Stride-8 and Stride-16 feature maps (for embedding extraction)
-    # These consume significant memory and may cause crashes on Android
     s8 = discovered_info.get('stride_8')
     if s8:
         keep.append(s8['name'])

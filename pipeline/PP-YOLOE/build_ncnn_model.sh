@@ -93,6 +93,10 @@ else
         1 keep=out2,out3
 fi
 
+
+
+
+
 echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo "Step 4: Verify Model Outputs"
@@ -178,3 +182,6 @@ echo "   • Model optimized by PNNX (1022 ONNX nodes → ~346 NCNN layers)"
 echo ""
 echo "🚀 Ready for Android deployment!"
 echo ""
+
+cp -f pipeline/PP-YOLOE/models/ppyoloe_crn_s_36e_pphuman_ncnn.bin ../flutter-vision/assets/models/ppyoloe_crn_s_36e_pphuman_ncnn.bin
+cp -f pipeline/PP-YOLOE/models/ppyoloe_crn_s_36e_pphuman_ncnn.param ../flutter-vision/assets/models/ppyoloe_crn_s_36e_pphuman_ncnn.param
