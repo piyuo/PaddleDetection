@@ -38,9 +38,6 @@ def run_original_inference(
 
     valid_mask = (bboxes[:, 0] > -1) & (bboxes[:, 1] >= float(draw_threshold))
     boxes_valid = bboxes[valid_mask]
-    embs_valid = np.zeros((boxes_valid.shape[0], 0), dtype=np.float32)
-    if boxes_valid.size:
-        print("[INFO] Original model does not provide embeddings; returning empty features.")
 
     post_ms = (time.perf_counter() - post_start) * 1000.0
 
@@ -54,4 +51,4 @@ def run_original_inference(
         "total_ms": inference_ms + post_ms,
     }
 
-    return boxes_valid, embs_valid, benchmark
+    return boxes_valid, benchmark

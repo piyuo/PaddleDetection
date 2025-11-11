@@ -149,7 +149,7 @@ def main():
     print("  • Input tensor: (1, 3, 640, 640) NCHW format, float32")
     print(f"  • Input tensor name: \"{input_names[0] if input_names else 'unknown'}\"")
     print(f"  • Score threshold: {draw_threshold} (filter detections below this)")
-    print("  • Post-processing: L2-normalize embeddings, filter detections by score")
+    print("  • Post-processing: custom NMS on raw detections (embeddings disabled)")
     print("  • No dependency on PaddleDetection - standalone preprocessing implementation")
 
     out_names = [o.name for o in sess.get_outputs()]
@@ -164,14 +164,14 @@ def main():
 
     warmup_runs = 3
     if model_type == "original":
-        boxes_valid, embs_valid, benchmark = run_original_inference(
+        boxes_valid, benchmark = run_original_inference(
             sess,
             feed,
             draw_threshold,
             warmup_runs=warmup_runs,
         )
     else:
-        boxes_valid, embs_valid, benchmark = run_ane_inference(
+        boxes_valid, benchmark = run_ane_inference(
             sess,
             feed,
             args.img,
@@ -198,10 +198,6 @@ def main():
         print("[WARN] Failed to save visualization:", exc)
 
     print(f"\n[Summary] detections kept: {boxes_valid.shape[0]} (threshold {draw_threshold})")
-    if embs_valid.size == 0:
-        print("[Summary] embeddings: none (model does not output features)")
-    else:
-        print(f"[Summary] embeddings shape: {embs_valid.shape}")
     print(f"[Summary] model type: {model_type}")
     if benchmark:
         inference_ms = benchmark.get("inference_ms")

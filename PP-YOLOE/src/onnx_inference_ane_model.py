@@ -11,7 +11,6 @@ import cv2
 import numpy as np
 
 from onnx_inference_utils import (
-    print_embedding_diagnostics,
     print_outputs_header,
     run_session_with_warmup,
 )
@@ -86,11 +85,7 @@ def run_ane_inference(
         print(f"  NMS found no boxes above threshold {score_threshold:.2f}")
         bboxes = np.zeros((0, 6), dtype=np.float32)
 
-    if len(bboxes) > 0:
-        print("  [INFO] Embedding extraction disabled (feature maps not exported)")
-        embs_nms = np.zeros((len(bboxes), 0), dtype=np.float32)
-    else:
-        embs_nms = np.zeros((0, 0), dtype=np.float32)
+
 
     print("\nDetections after NMS (class score x0 y0 x1 y1):")
     if len(bboxes) > 0:
@@ -99,22 +94,16 @@ def run_ane_inference(
     else:
         print(f"No boxes above threshold {draw_threshold} after NMS.")
 
-    det_embs = embs_nms.astype(np.float32)
-    embs_valid = det_embs
-    boxes_valid = bboxes
-
-    print_embedding_diagnostics(det_embs, embs_valid, boxes_valid)
-
     post_ms = (time.perf_counter() - post_start) * 1000.0
 
     benchmark = {
         "model_type": "ane",
         "warmup_runs": warmup_runs,
         "inference_ms": inference_ms,
-        "num_detections": int(boxes_valid.shape[0]),
+        "num_detections": int(bboxes.shape[0]),
         "output_names": list(out_names),
         "post_ms": post_ms,
         "total_ms": inference_ms + post_ms,
     }
 
-    return boxes_valid, embs_valid, benchmark
+    return bboxes, benchmark
