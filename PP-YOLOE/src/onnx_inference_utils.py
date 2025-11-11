@@ -70,9 +70,8 @@ def preprocess_image(
     return {
         "image": im,
         "im_shape": np.array(im.shape[1:], dtype=np.float32),
-        # scale_factor: [scale_y, scale_x] = [resized_h/orig_h, resized_w/orig_w]
-        # Used by PP-YOLOE post-process to convert boxes: network_coords → original_coords
-        # For embedding ROI alignment: multiply boxes by scale_factor to get back to network coords
+    # scale_factor: [scale_y, scale_x] = [resized_h/orig_h, resized_w/orig_w]
+    # Used by PP-YOLOE post-process to convert boxes: network_coords -> original_coords
         "scale_factor": np.array([im_scale_y, im_scale_x], dtype=np.float32),
     }
 
@@ -253,19 +252,14 @@ def print_outputs_header(model_type: str, out_names: Sequence[str], outputs: Seq
             print(" - Original model with NMS (no embeddings)")
     elif model_type == "ane":
         if outputs:
-            print(f" ✓ ANE-optimized model (automatic surgery) with {len(outputs)} outputs")
+            print(f" - ANE-optimized model (automatic surgery) with {len(outputs)} outputs")
         if len(outputs) >= 1:
             print(f" - outputs[0]: raw boxes {outputs[0].shape} [x_center, y_center, w, h]")
         if len(outputs) >= 2:
             print(f" - outputs[1]: raw scores {outputs[1].shape} - needs squeeze and NMS")
-        if len(outputs) >= 3:
-            print(f" - outputs[2]: stride-8 features {outputs[2].shape} - fine-grained")
-        if len(outputs) >= 4:
-            s8_ch = outputs[2].shape[1]
-            s16_ch = outputs[3].shape[1]
-            total_dim = s8_ch + s16_ch
-            print(f" - outputs[3]: stride-16 features {outputs[3].shape} - semantic")
-            print(f" ✓ Multi-scale embeddings: {total_dim}D ({s8_ch} + {s16_ch})")
+        extra_outputs = len(outputs) - 2
+        if extra_outputs > 0:
+            print(f" - Additional outputs detected ({extra_outputs}); embeddings disabled in this pipeline")
     else:
         print(" - Unknown model structure, see output details below")
 
@@ -340,7 +334,15 @@ def print_embedding_diagnostics(
 
     d = det_embs.shape[1] if det_embs.ndim == 2 else 0
     print("\n[Embeddings check] Basic stats:")
-    print(f"  - embedding dim: {d}, total N: {det_embs.shape[0] if det_embs.ndim == 2 else 0}, valid N: {embs_valid.shape[0] if embs_valid.ndim == 2 else 0}")
+    print(
+        f"  - embedding dim: {d}, total N: {det_embs.shape[0] if det_embs.ndim == 2 else 0}, "
+        f"valid N: {embs_valid.shape[0] if embs_valid.ndim == 2 else 0}"
+    )
+
+    if d == 0 or det_embs.size == 0:
+        print("  - embeddings disabled; downstream tracker will rely on motion cues only")
+        return
+
     if det_embs.size:
         norms_all = np.linalg.norm(det_embs, axis=1)
         print(f"  - L2 norms (all, after normalization): min={norms_all.min():.4f} mean={norms_all.mean():.4f} max={norms_all.max():.4f}")

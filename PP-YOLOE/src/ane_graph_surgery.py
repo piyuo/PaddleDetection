@@ -9,7 +9,7 @@ This script applies CoreML ANE-specific optimizations to ONNX models:
 - ANE compatibility analysis and profiling
 
 This script is focused ONLY on ANE optimizations. It expects a customized model
-as input (with NMS removed and feature outputs added via onnx_customize.py).
+as input (with NMS removed added via onnx_customize.py).
 
 Workflow:
 1. export_to_onnx.sh → ppyoloe_crn_s_36e_pphuman.onnx (base model)
