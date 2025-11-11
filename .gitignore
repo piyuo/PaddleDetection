@@ -98,3 +98,7 @@ pipeline/PP-YOLOE/venv311
 pipeline/PP-YOLOE/models
 pipeline/PP-YOLOE/weights
 pipeline/PP-YOLOE/*.onnx
+
+
+#PP-YOLOE
+PP-YOLOE/build/
