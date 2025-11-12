@@ -156,7 +156,7 @@ def main():
     parser.add_argument("--img", required=True, help="Path to input image")
     parser.add_argument("--ncnn_param", required=True, help="Path to NCNN .param file")
     parser.add_argument("--ncnn_bin", required=True, help="Path to NCNN .bin file")
-    parser.add_argument("--out", default="pipeline/output", help="Output directory")
+    parser.add_argument("--out", default="PP-YOLOE/build/output", help="Output directory")
     parser.add_argument("--thresh", type=float, default=0.5, help="Score threshold")
     parser.add_argument("--nms-thresh", type=float, default=0.5, help="NMS IoU threshold")
     parser.add_argument("--warmup", type=int, default=3, help="Warmup runs")

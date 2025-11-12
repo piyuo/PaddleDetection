@@ -195,17 +195,9 @@ def get_coreml_version_info() -> dict:
 def default_paths() -> Tuple[str, str, str]:
     root = repo_root()
     model_name = "ppyoloe_crn_s_36e_pphuman"
-    onnx_candidates = [
-        os.path.join(root, "pipeline", "PP-YOLOE", "models", f"{model_name}_embed_det.onnx"),
-        os.path.join(root, "pipeline", "PP-YOLOE", "models", f"{model_name}_embed.onnx"),
-        os.path.join(root, "pipeline", "PP-YOLOE", "models", f"{model_name}.onnx"),
-        os.path.join(root, "pipeline", "output", "onnx", f"{model_name}.onnx"),
-        os.path.join(root, "pipeline", "output", f"{model_name}.onnx"),
-    ]
-    onnx_path = next((p for p in onnx_candidates if os.path.exists(p)), onnx_candidates[0])
-
-    img_path = os.path.join(root, "pipeline", "dataset", "demo", "demo.jpg")
-    out_dir = os.path.join(root, "pipeline", "output", "onnx_vis")
+    onnx_path = os.path.join(root, "PP-YOLOE", "build", "models", f"{model_name}.onnx")
+    img_path = os.path.join(root, "PP-YOLOE","build", "dataset", "demo", "demo.jpg")
+    out_dir = os.path.join(root, "PP-YOLOE","build", "output")
     return onnx_path, img_path, out_dir
 
 

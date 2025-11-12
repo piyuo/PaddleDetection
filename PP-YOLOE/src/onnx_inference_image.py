@@ -182,7 +182,7 @@ def main():
 
     os.makedirs(args.out, exist_ok=True)
     base = os.path.splitext(os.path.basename(args.img))[0]
-    vis_path = os.path.join(args.out, f"{base}.jpg")
+    vis_path = os.path.join(args.out, f"{base}_ane.jpg")
     try:
         ids_valid = np.arange(boxes_valid.shape[0])
         draw_and_save_with_ids(

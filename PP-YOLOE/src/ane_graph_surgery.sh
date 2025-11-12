@@ -5,7 +5,7 @@
 
 MODEL="PP-YOLOE/build/models/ppyoloe_crn_s_36e_pphuman_cust.onnx"
 OUTPUT_MODEL="PP-YOLOE/build/models/ppyoloe_crn_s_36e_pphuman_cust_ane.onnx"
-IMG="PP-YOLOE/build/dataset/demo/demo.jpg"
+IMG="PP-YOLOE/build/dataset/demo/demo_ane.jpg"
 OUTDIR="PP-YOLOE/build/models/surgery"
 
 while [[ $# -gt 0 ]]; do
