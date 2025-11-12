@@ -10,7 +10,6 @@ python3 PP-YOLOE/src/ncnn_inference.py \
     --ncnn_bin PP-YOLOE/build/models/ppyoloe_crn_s_36e_pphuman_ncnn.bin \
     --out PP-YOLOE/build/output \
     --thresh 0.5 \
-    --save-embeddings \
     --nms-thresh 0.5 \
     --threads 4 \
     --warmup 3
