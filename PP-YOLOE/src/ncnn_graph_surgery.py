@@ -410,6 +410,223 @@ def fold_conv_add_bias(model_path: str, out_path: str) -> str:
     print(f"Folded Conv+Add(bias): {changed} node(s)")
     return out_path
 
+
+def fold_pad_into_conv(model_path: str, out_path: str) -> str:
+    """Fold zero-constant Pad on NCHW into Conv pads attribute.
+
+    Pattern: y = Conv(Pad(x, pads, mode='constant', value=0), W, b) -> Conv(x, W, b, pads+=...)
+    Constraints:
+    - Only H/W pads are nonzero (N/C pads must be 0)
+    - Pad mode is 'constant' and value is 0 (or absent)
+    - Conv's auto_pad must be not set
+    - Conv must consume the Pad output as its X and Pad's output has single consumer
+    """
+    m = onnx.load(model_path)
+    g = m.graph
+
+    init_map: Dict[str, np.ndarray] = {init.name: numpy_helper.to_array(init) for init in g.initializer}
+    consumers = _build_consumers(g)
+    out_to_node: Dict[str, onnx.NodeProto] = {n.output[0]: n for n in g.node if n.output}
+
+    def get_attr_str(node: onnx.NodeProto, name: str, default: Optional[str] = None) -> Optional[str]:
+        for a in node.attribute:
+            if a.name == name and a.type == onnx.AttributeProto.STRING:
+                try:
+                    return a.s.decode() if isinstance(a.s, (bytes, bytearray)) else str(a.s)
+                except Exception:
+                    return default
+        return default
+
+    def has_attr(node: onnx.NodeProto, name: str) -> bool:
+        return any(a.name == name for a in node.attribute)
+
+    changed = 0
+    removed: List[onnx.NodeProto] = []
+
+    for node in g.node:
+        if node.op_type != "Pad" or not node.output:
+            continue
+        y = node.output[0]
+        # Single consumer and must be Conv
+        if len(consumers.get(y, [])) != 1:
+            continue
+        conv = consumers[y][0]
+        if conv.op_type != "Conv" or not conv.input:
+            continue
+        if conv.input[0] != y:
+            continue
+
+        # Get pads const from input[1] for Pad or attribute? (ONNX Pad v11+ uses input)
+        if len(node.input) < 2 or node.input[1] not in init_map:
+            continue
+        pads = np.array(init_map[node.input[1]]).astype(np.int64).reshape(-1)
+        # Optional constant value input
+        pad_value = 0.0
+        if len(node.input) >= 3 and node.input[2] in init_map:
+            val = np.array(init_map[node.input[2]]).astype(np.float32)
+            if val.size != 1:
+                continue
+            pad_value = float(val.reshape(-1)[0])
+        mode = get_attr_str(node, "mode", "constant")
+        if mode != "constant" or abs(pad_value) > 1e-8:
+            continue
+
+        # Expect rank 4: [N,C,H,W]; pads length 8
+        if pads.size != 8:
+            continue
+        n_b, c_b, h_b, w_b, n_e, c_e, h_e, w_e = [int(v) for v in pads.tolist()]
+        if any(v != 0 for v in (n_b, c_b, n_e, c_e)):
+            continue
+        if min(h_b, h_e, w_b, w_e) < 0:
+            continue
+
+        # Skip if Conv has auto_pad
+        if has_attr(conv, "auto_pad"):
+            continue
+
+        # Read existing conv pads attribute (4 ints) if any
+        curr_pads = [0, 0, 0, 0]
+        pad_attr_idx = None
+        for idx, a in enumerate(conv.attribute):
+            if a.name == "pads" and a.type == onnx.AttributeProto.INTS:
+                pa = list(a.ints)
+                if len(pa) == 4:
+                    curr_pads = [int(pa[0]), int(pa[1]), int(pa[2]), int(pa[3])]
+                pad_attr_idx = idx
+                break
+        new_pads = [curr_pads[0] + h_b, curr_pads[1] + w_b, curr_pads[2] + h_e, curr_pads[3] + w_e]
+
+        # Update conv attribute
+        pads_attr = onnx.helper.make_attribute("pads", new_pads)
+        if pad_attr_idx is not None:
+            conv.attribute[pad_attr_idx].CopyFrom(pads_attr)
+        else:
+            conv.attribute.extend([pads_attr])
+
+        # Bypass Pad: feed Conv with Pad's input
+        conv.input[0] = node.input[0]
+        removed.append(node)
+        changed += 1
+
+    if changed == 0:
+        onnx.save(m, out_path)
+        return out_path
+
+    new_nodes = [n for n in g.node if n not in removed]
+    del g.node[:]
+    g.node.extend(new_nodes)
+    onnx.save(m, out_path)
+    print(f"Folded Pad into Conv: {changed} node(s)")
+    return out_path
+
+
+def simplify_transpose(model_path: str, out_path: str) -> str:
+    """Remove identity Transpose and merge consecutive Transpose ops.
+
+    - Transpose with perm=[0,1,2,3] (or rank identity) -> Identity
+    - Transpose(Transpose(x, p1), p2) -> Transpose(x, compose(p2, p1)); if compose==identity, remove both
+    Conservatively handles only when the first transpose output has a single consumer.
+    """
+    m = onnx.load(model_path)
+    g = m.graph
+
+    def get_perm(node: onnx.NodeProto) -> Optional[List[int]]:
+        if node.op_type != "Transpose":
+            return None
+        for a in node.attribute:
+            if a.name == "perm" and a.type == onnx.AttributeProto.INTS:
+                return [int(v) for v in a.ints]
+        return None
+
+    def make_transpose(node: onnx.NodeProto, inp: str, out: str, perm: List[int]) -> onnx.NodeProto:
+        n = helper.make_node("Transpose", [inp], [out], name=(node.name + "_m") if node.name else "TransposeMerged")
+        n.attribute.extend([onnx.helper.make_attribute("perm", perm)])
+        return n
+
+    consumers = _build_consumers(g)
+
+    kept: List[onnx.NodeProto] = []
+    changed = 0
+
+    # First pass: remove identity transpose
+    for node in g.node:
+        if node.op_type != "Transpose":
+            kept.append(node)
+            continue
+        perm = get_perm(node)
+        rank = None
+        if perm is not None:
+            rank = len(perm)
+        if perm is not None and perm == list(range(rank)):
+            # identity
+            idn = helper.make_node("Identity", [node.input[0]], list(node.output), name=node.name + "_IdT")
+            kept.append(idn)
+            changed += 1
+        else:
+            kept.append(node)
+
+    if changed:
+        del g.node[:]
+        g.node.extend(kept)
+        kept = []
+
+    # Recompute consumers after first pass
+    consumers = _build_consumers(g)
+
+    # Second pass: merge consecutive transpose
+    for node in g.node:
+        if node.op_type != "Transpose":
+            kept.append(node)
+            continue
+        inp = node.input[0]
+        prev = None
+        for cand in g.node:
+            if cand.output and cand.output[0] == inp and cand.op_type == "Transpose":
+                prev = cand
+                break
+        if prev is None:
+            kept.append(node)
+            continue
+        # Only safe to merge if prev output has single consumer
+        if len(consumers.get(prev.output[0], [])) != 1:
+            kept.append(node)
+            continue
+        p1 = get_perm(prev)
+        p2 = get_perm(node)
+        if p1 is None or p2 is None or len(p1) != len(p2):
+            kept.append(node)
+            continue
+        # Compose p = p2 ∘ p1 (apply p1 then p2)
+        composed = [p1[i] for i in p2]
+        if composed == list(range(len(p1))):
+            # identity -> bypass both
+            idn = helper.make_node("Identity", [prev.input[0]], list(node.output), name=node.name + "_IdTT")
+            # Do not keep prev nor node
+            for n in (prev, node):
+                if n in kept:
+                    kept.remove(n)
+            kept.append(idn)
+            changed += 1
+        else:
+            # Merge into single transpose from prev input to node output
+            merged = make_transpose(node, prev.input[0], node.output[0], composed)
+            # Remove prev if present in kept
+            for n in (prev, node):
+                if n in kept:
+                    kept.remove(n)
+            kept.append(merged)
+            changed += 1
+
+    if changed == 0:
+        onnx.save(m, out_path)
+        return out_path
+
+    del g.node[:]
+    g.node.extend(kept)
+    onnx.save(m, out_path)
+    print(f"Simplified Transpose: {changed} change(s)")
+    return out_path
+
 def shape_infer_model(model_path: str, out_path: str) -> str:
     try:
         inferred = onnx.shape_inference.infer_shapes_path(model_path)
@@ -1588,6 +1805,16 @@ def main():
         help="Fold Conv+Add(per-channel bias) into Conv",
     )
     parser.add_argument(
+        "--fold-pad-conv",
+        action="store_true",
+        help="Fold zero Pad before Conv into Conv pads attribute",
+    )
+    parser.add_argument(
+        "--simplify-transpose",
+        action="store_true",
+        help="Simplify Transpose chains (merge/remove identities)",
+    )
+    parser.add_argument(
         "--rewrite-slice-range-to-gather",
         action="store_true",
         help="Rewrite Slice(range) to Gather with explicit indices",
@@ -1737,6 +1964,16 @@ def main():
         print("[stage] Folding Conv+Add(bias)…")
         work_path = fold_conv_add_bias(work_path, stage_path("conv_add_fold"))
         work_path = shape_infer_model(work_path, stage_path("shape_add"))
+
+    if args.fold_pad_conv:
+        print("[stage] Folding Pad into Conv…")
+        work_path = fold_pad_into_conv(work_path, stage_path("pad_conv_fold"))
+        work_path = shape_infer_model(work_path, stage_path("shape_padconv"))
+
+    if args.simplify_transpose:
+        print("[stage] Simplifying Transpose chains…")
+        work_path = simplify_transpose(work_path, stage_path("transpose_simplify"))
+        work_path = shape_infer_model(work_path, stage_path("shape_transpose"))
 
     if args.rewrite_slice_range_to_gather:
         print("[stage] Rewriting range Slice → Gather…")
