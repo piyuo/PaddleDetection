@@ -72,6 +72,9 @@ python3 PP-YOLOE/src/ncnn_graph_surgery.py \
 	--model "PP-YOLOE/build/models/${MODEL_NAME}_cust.onnx" \
 	--input-shape 1,3,640,640 \
 	--fix-input-shapes \
+    --fold-conv-bn \
+    --fold-conv-mul \
+    --fold-conv-add \
 	--fold-iterations 15 \
 	--split-concat 4 \
 	--fold-static-shapes \
@@ -84,6 +87,7 @@ python3 PP-YOLOE/src/ncnn_graph_surgery.py \
 	--remove-identity \
 	--rewrite-reduce-to-globalpool \
 	--output-model "PP-YOLOE/build/models/pnnx/${MODEL_NAME}_cust.onnx"
+
 
 pnnx "PP-YOLOE/build/models/pnnx/${MODEL_NAME}_cust.onnx"  \
     fp16=1 \

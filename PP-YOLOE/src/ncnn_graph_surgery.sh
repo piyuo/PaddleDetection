@@ -96,6 +96,9 @@ CMD=(python3 PP-YOLOE/src/ncnn_graph_surgery.py \
 	--warmup "$WARMUP" --runs "$RUNS" \
 	--outdir "$OUTDIR" \
 	--fix-input-shapes \
+    --fold-conv-bn \
+	--fold-conv-mul \
+	--fold-conv-add \
 	--fold-iterations 15 \
 	--split-concat 4 \
 	--fold-static-shapes \

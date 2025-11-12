@@ -36,6 +36,380 @@ from onnx_profile import (
     run_benchmark,
 )
 
+
+def _build_consumers(graph: onnx.GraphProto) -> Dict[str, List[onnx.NodeProto]]:
+    consumers: Dict[str, List[onnx.NodeProto]] = {}
+    for node in graph.node:
+        for nm in node.input:
+            if not nm:
+                continue
+            consumers.setdefault(nm, []).append(node)
+    return consumers
+
+
+def fold_conv_batchnorm(model_path: str, out_path: str) -> str:
+    """Fold Conv->BatchNormalization into a single Conv by absorbing BN params.
+
+    Safety constraints:
+    - Only when the BN input comes directly from a Conv output
+    - That Conv output has a single consumer (the BN)
+    - Conv weights and BN params are initializers (constants)
+    - Supports Conv with or without bias
+    """
+    m = onnx.load(model_path)
+    g = m.graph
+
+    # Map initializer name -> array
+    init_map: Dict[str, np.ndarray] = {init.name: numpy_helper.to_array(init) for init in g.initializer}
+    name_to_init: Dict[str, onnx.TensorProto] = {init.name: init for init in g.initializer}
+
+    # Quick lookup for node by its first output
+    out_to_node: Dict[str, onnx.NodeProto] = {}
+    for node in g.node:
+        if node.output:
+            out_to_node[node.output[0]] = node
+
+    consumers = _build_consumers(g)
+
+    kept: List[onnx.NodeProto] = []
+    removed: List[onnx.NodeProto] = []
+    changed = 0
+
+    for node in g.node:
+        if node.op_type != "BatchNormalization":
+            kept.append(node)
+            continue
+        if len(node.input) < 5:
+            kept.append(node)
+            continue
+
+        x, gamma_n, beta_n, mean_n, var_n = node.input[:5]
+        conv = out_to_node.get(x)
+        if conv is None or conv.op_type != "Conv":
+            kept.append(node)
+            continue
+
+        # ensure single consumer of conv output
+        if len(consumers.get(conv.output[0], [])) != 1:
+            kept.append(node)
+            continue
+
+        # Fetch conv weights and (optional) bias
+        if len(conv.input) < 2:
+            kept.append(node)
+            continue
+        w_name = conv.input[1]
+        if w_name not in init_map:
+            kept.append(node)
+            continue
+        W = init_map[w_name].astype(np.float32)
+        b = None
+        if len(conv.input) >= 3 and conv.input[2] in init_map:
+            b = init_map[conv.input[2]].astype(np.float32)
+
+        # Fetch BN params
+        if not all(nm in init_map for nm in (gamma_n, beta_n, mean_n, var_n)):
+            kept.append(node)
+            continue
+        gamma = init_map[gamma_n].astype(np.float32).reshape(-1)
+        beta = init_map[beta_n].astype(np.float32).reshape(-1)
+        mean = init_map[mean_n].astype(np.float32).reshape(-1)
+        var = init_map[var_n].astype(np.float32).reshape(-1)
+
+        eps = 1e-5
+        for a in node.attribute:
+            if a.name == "epsilon":
+                try:
+                    eps = float(a.f)
+                except Exception:
+                    eps = eps
+
+        oc = W.shape[0]
+        if gamma.shape[0] != oc or beta.shape[0] != oc or mean.shape[0] != oc or var.shape[0] != oc:
+            kept.append(node)
+            continue
+
+        # Compute scale and new parameters
+        std = np.sqrt(var + eps)
+        scale = (gamma / std).reshape(oc, 1, 1, 1)
+        W_new = W * scale
+        if b is None:
+            b0 = np.zeros((oc,), dtype=np.float32)
+        else:
+            b0 = b
+        b_new = beta + (b0 - mean) * (gamma / std)
+
+        # Update initializers in-place
+        # weights
+        if w_name in name_to_init:
+            del name_to_init[w_name].raw_data
+            name_to_init[w_name].CopyFrom(numpy_helper.from_array(W_new.astype(np.float32), name=w_name))
+        else:
+            # replace map and graph initializer list
+            for i, init in enumerate(list(g.initializer)):
+                if init.name == w_name:
+                    g.initializer[i] = numpy_helper.from_array(W_new.astype(np.float32), name=w_name)
+                    break
+
+        # bias
+        if len(conv.input) >= 3 and conv.input[2] in name_to_init:
+            b_name = conv.input[2]
+            del name_to_init[b_name].raw_data
+            name_to_init[b_name].CopyFrom(numpy_helper.from_array(b_new.astype(np.float32), name=b_name))
+        else:
+            # create new bias initializer and hook into conv
+            b_name = conv.name + "_bnfold_bias"
+            # ensure unique name
+            exist_names = {init.name for init in g.initializer}
+            if b_name in exist_names:
+                idx = 0
+                while f"{b_name}_{idx}" in exist_names:
+                    idx += 1
+                b_name = f"{b_name}_{idx}"
+            g.initializer.extend([numpy_helper.from_array(b_new.astype(np.float32), name=b_name)])
+            if len(conv.input) >= 3:
+                conv.input[2] = b_name
+            else:
+                conv.input.extend([b_name])
+
+        # Rewire outputs: Conv now produces BN's output
+        if node.output and conv.output:
+            conv.output[0] = node.output[0]
+
+        # Mark BN for removal (do not append to kept)
+        removed.append(node)
+        changed += 1
+
+    if changed == 0:
+        onnx.save(m, out_path)
+        return out_path
+
+    # Rebuild node list without removed BNs
+    new_nodes = [n for n in g.node if n not in removed]
+    del g.node[:]
+    g.node.extend(new_nodes)
+
+    onnx.save(m, out_path)
+    print(f"Folded Conv+BatchNorm: {changed} chain(s)")
+    return out_path
+
+
+def _extract_channel_vector(arr: np.ndarray, C: int) -> Optional[np.ndarray]:
+    """Try to reduce arr to a (C,) vector by squeezing dims of size 1.
+    Returns None if not possible or mismatched length.
+    """
+    a = np.array(arr)
+    # Try common shapes first
+    if a.ndim == 1 and a.shape[0] == C:
+        return a.astype(np.float32).reshape(C)
+    # Squeeze all ones
+    squeezed = np.squeeze(a)
+    if squeezed.ndim == 1 and squeezed.shape[0] == C:
+        return squeezed.astype(np.float32).reshape(C)
+    # Handle (1,C,1,1) explicitly
+    if a.ndim == 4 and a.shape[1] == C and a.shape[0] in (1, ) and a.shape[2] in (1,) and a.shape[3] in (1,):
+        return a.reshape(C).astype(np.float32)
+    return None
+
+
+def fold_conv_mul_scale(model_path: str, out_path: str) -> str:
+    """Fold per-channel constant Mul after Conv into Conv weights/bias.
+
+    Pattern: y = Mul(Conv(x, W, b), s) where s is constant broadcastable to (N,C,H,W) per-channel.
+    Requires Conv output to be consumed only by this Mul.
+    """
+    m = onnx.load(model_path)
+    g = m.graph
+
+    init_map: Dict[str, np.ndarray] = {init.name: numpy_helper.to_array(init) for init in g.initializer}
+    name_to_init: Dict[str, onnx.TensorProto] = {init.name: init for init in g.initializer}
+    consumers = _build_consumers(g)
+    out_to_node: Dict[str, onnx.NodeProto] = {n.output[0]: n for n in g.node if n.output}
+
+    removed: List[onnx.NodeProto] = []
+    changed = 0
+
+    for node in g.node:
+        if node.op_type != "Mul" or len(node.input) != 2 or not node.output:
+            continue
+        a, b = node.input
+        # identify conv output and scale constant
+        conv_out = None
+        scale_name = None
+        if a in out_to_node and out_to_node[a].op_type == "Conv" and b in init_map:
+            conv_out, scale_name = a, b
+        elif b in out_to_node and out_to_node[b].op_type == "Conv" and a in init_map:
+            conv_out, scale_name = b, a
+        else:
+            continue
+
+        conv = out_to_node[conv_out]
+        if len(consumers.get(conv.output[0], [])) != 1:
+            continue
+
+        # Fetch conv params
+        if len(conv.input) < 2:
+            continue
+        w_name = conv.input[1]
+        if w_name not in init_map:
+            continue
+        W = init_map[w_name].astype(np.float32)
+        oc = W.shape[0]
+
+        bias = None
+        if len(conv.input) >= 3 and conv.input[2] in init_map:
+            bias = init_map[conv.input[2]].astype(np.float32)
+
+        s = _extract_channel_vector(init_map[scale_name], oc)
+        if s is None:
+            continue
+
+        # Apply folding: W' = W * s[:,1,1,1]; b' = b * s
+        scale4 = s.reshape(oc, 1, 1, 1)
+        W_new = W * scale4
+        if bias is not None:
+            b_new = (bias * s).astype(np.float32)
+        else:
+            b_new = None
+
+        # Update initializers
+        if w_name in name_to_init:
+            del name_to_init[w_name].raw_data
+            name_to_init[w_name].CopyFrom(numpy_helper.from_array(W_new.astype(np.float32), name=w_name))
+        else:
+            for i, init in enumerate(list(g.initializer)):
+                if init.name == w_name:
+                    g.initializer[i] = numpy_helper.from_array(W_new.astype(np.float32), name=w_name)
+                    break
+        if b_new is not None:
+            if len(conv.input) >= 3 and conv.input[2] in name_to_init:
+                b_name = conv.input[2]
+                del name_to_init[b_name].raw_data
+                name_to_init[b_name].CopyFrom(numpy_helper.from_array(b_new.astype(np.float32), name=b_name))
+            elif len(conv.input) >= 3:
+                # replace existing by name
+                for i, init in enumerate(list(g.initializer)):
+                    if init.name == conv.input[2]:
+                        g.initializer[i] = numpy_helper.from_array(b_new.astype(np.float32), name=conv.input[2])
+                        break
+            else:
+                # create new bias
+                b_name = conv.name + "_mulfold_bias"
+                exist_names = {init.name for init in g.initializer}
+                if b_name in exist_names:
+                    idx = 0
+                    while f"{b_name}_{idx}" in exist_names:
+                        idx += 1
+                    b_name = f"{b_name}_{idx}"
+                g.initializer.extend([numpy_helper.from_array(b_new.astype(np.float32), name=b_name)])
+                conv.input.extend([b_name])
+
+        # Rewire conv output to mul output, drop Mul
+        conv.output[0] = node.output[0]
+        removed.append(node)
+        changed += 1
+
+    if changed == 0:
+        onnx.save(m, out_path)
+        return out_path
+
+    new_nodes = [n for n in g.node if n not in removed]
+    del g.node[:]
+    g.node.extend(new_nodes)
+    onnx.save(m, out_path)
+    print(f"Folded Conv+Mul(scale): {changed} node(s)")
+    return out_path
+
+
+def fold_conv_add_bias(model_path: str, out_path: str) -> str:
+    """Fold per-channel constant Add after Conv into Conv bias.
+
+    Pattern: y = Add(Conv(x, W, b), c) where c is constant broadcastable to per-channel.
+    Requires Conv output to be consumed only by this Add.
+    """
+    m = onnx.load(model_path)
+    g = m.graph
+
+    init_map: Dict[str, np.ndarray] = {init.name: numpy_helper.to_array(init) for init in g.initializer}
+    name_to_init: Dict[str, onnx.TensorProto] = {init.name: init for init in g.initializer}
+    consumers = _build_consumers(g)
+    out_to_node: Dict[str, onnx.NodeProto] = {n.output[0]: n for n in g.node if n.output}
+
+    removed: List[onnx.NodeProto] = []
+    changed = 0
+
+    for node in g.node:
+        if node.op_type != "Add" or len(node.input) != 2 or not node.output:
+            continue
+        a, b = node.input
+        conv_out = None
+        bias_name = None
+        if a in out_to_node and out_to_node[a].op_type == "Conv" and b in init_map:
+            conv_out, bias_name = a, b
+        elif b in out_to_node and out_to_node[b].op_type == "Conv" and a in init_map:
+            conv_out, bias_name = b, a
+        else:
+            continue
+
+        conv = out_to_node[conv_out]
+        if len(consumers.get(conv.output[0], [])) != 1:
+            continue
+
+        # Fetch conv params
+        if len(conv.input) < 2:
+            continue
+        w_name = conv.input[1]
+        if w_name not in init_map:
+            continue
+        W = init_map[w_name]
+        oc = W.shape[0]
+
+        add_vec = _extract_channel_vector(init_map[bias_name], oc)
+        if add_vec is None:
+            continue
+
+        if len(conv.input) >= 3 and conv.input[2] in init_map:
+            b_old = init_map[conv.input[2]].astype(np.float32)
+            b_new = (b_old + add_vec).astype(np.float32)
+            b_name = conv.input[2]
+            if b_name in name_to_init:
+                del name_to_init[b_name].raw_data
+                name_to_init[b_name].CopyFrom(numpy_helper.from_array(b_new, name=b_name))
+            else:
+                for i, init in enumerate(list(g.initializer)):
+                    if init.name == b_name:
+                        g.initializer[i] = numpy_helper.from_array(b_new, name=b_name)
+                        break
+        else:
+            b_name = conv.name + "_addfold_bias"
+            exist_names = {init.name for init in g.initializer}
+            if b_name in exist_names:
+                idx = 0
+                while f"{b_name}_{idx}" in exist_names:
+                    idx += 1
+                b_name = f"{b_name}_{idx}"
+            g.initializer.extend([numpy_helper.from_array(add_vec.astype(np.float32), name=b_name)])
+            if len(conv.input) >= 3:
+                conv.input[2] = b_name
+            else:
+                conv.input.extend([b_name])
+
+        # Rewire conv output to add output, drop Add
+        conv.output[0] = node.output[0]
+        removed.append(node)
+        changed += 1
+
+    if changed == 0:
+        onnx.save(m, out_path)
+        return out_path
+
+    new_nodes = [n for n in g.node if n not in removed]
+    del g.node[:]
+    g.node.extend(new_nodes)
+    onnx.save(m, out_path)
+    print(f"Folded Conv+Add(bias): {changed} node(s)")
+    return out_path
+
 def shape_infer_model(model_path: str, out_path: str) -> str:
     try:
         inferred = onnx.shape_inference.infer_shapes_path(model_path)
@@ -1199,6 +1573,21 @@ def main():
     parser.add_argument("--rewrite-div", action="store_true", help="Rewrite Div by constant into Mul")
     parser.add_argument("--rewrite-pow", action="store_true", help="Rewrite Pow patterns that NCNN lacks")
     parser.add_argument(
+        "--fold-conv-bn",
+        action="store_true",
+        help="Fold Conv+BatchNormalization into Conv weights/bias",
+    )
+    parser.add_argument(
+        "--fold-conv-mul",
+        action="store_true",
+        help="Fold Conv+Mul(per-channel scale) into Conv",
+    )
+    parser.add_argument(
+        "--fold-conv-add",
+        action="store_true",
+        help="Fold Conv+Add(per-channel bias) into Conv",
+    )
+    parser.add_argument(
         "--rewrite-slice-range-to-gather",
         action="store_true",
         help="Rewrite Slice(range) to Gather with explicit indices",
@@ -1308,6 +1697,12 @@ def main():
     print("[stage] Running initial shape inference…")
     work_path = shape_infer_model(work_path, stage_path("shape"))
 
+    # Early fusions to reduce op count and improve kernel selection
+    if args.fold_conv_bn:
+        print("[stage] Folding Conv+BatchNorm…")
+        work_path = fold_conv_batchnorm(work_path, stage_path("conv_bn_fold"))
+        work_path = shape_infer_model(work_path, stage_path("shape_bn"))
+
     if args.split_concat and args.split_concat > 1:
         print(f"[stage] Splitting Concat nodes (max_inputs={args.split_concat})…")
         work_path = split_large_concats(
@@ -1332,6 +1727,16 @@ def main():
     if args.rewrite_pow:
         print("[stage] Rewriting Pow patterns…")
         work_path = rewrite_pow_patterns(work_path, stage_path("powrew"))
+
+    if args.fold_conv_mul:
+        print("[stage] Folding Conv+Mul(scale)…")
+        work_path = fold_conv_mul_scale(work_path, stage_path("conv_mul_fold"))
+        work_path = shape_infer_model(work_path, stage_path("shape_mul"))
+
+    if args.fold_conv_add:
+        print("[stage] Folding Conv+Add(bias)…")
+        work_path = fold_conv_add_bias(work_path, stage_path("conv_add_fold"))
+        work_path = shape_infer_model(work_path, stage_path("shape_add"))
 
     if args.rewrite_slice_range_to_gather:
         print("[stage] Rewriting range Slice → Gather…")
