@@ -1724,7 +1724,7 @@ def main():
     parser.add_argument(
         "--model",
         type=str,
-        default="pipeline/PP-YOLOE/models/ppyoloe_crn_s_36e_pphuman_embed.onnx",
+        default="PP-YOLOE/build/models/ppyoloe_crn_s_36e_pphuman_embed.onnx",
         help="Path to source ONNX model",
     )
     parser.add_argument(
@@ -1736,7 +1736,7 @@ def main():
     parser.add_argument(
         "--outdir",
         type=str,
-        default="pipeline/PP-YOLOE/models/surgery",
+        default="PP-YOLOE/build/models/surgery",
         help="Directory to store intermediate ONNX artifacts",
     )
     parser.add_argument(

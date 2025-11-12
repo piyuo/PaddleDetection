@@ -1148,14 +1148,14 @@ def main():
     parser.add_argument(
         "--model",
         type=str,
-        default="pipeline/PP-YOLOE/models/ppyoloe_crn_s_36e_pphuman_embed.onnx",
+        default="PP-YOLOE/build/models/ppyoloe_crn_s_36e_pphuman_cust.onnx",
         help="Path to source ONNX model",
     )
     parser.add_argument("--input-shape", type=str, default="1,3,640,640")
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--runs", type=int, default=50)
     parser.add_argument("--img", type=str, help="Path to image for realistic preprocessing (not needed for --find-nms)")
-    parser.add_argument("--outdir", type=str, default="pipeline/PP-YOLOE/models/surgery")
+    parser.add_argument("--outdir", type=str, default="PP-YOLOE/build/models/surgery")
     parser.add_argument("--ort-profile-dir", type=str, help="Directory for ORT profiling (enables profiling automatically)")
     parser.add_argument("--fp16", action="store_true", help="Attempt FP16 casting")
     parser.add_argument("--split-concat", type=int, default=4, help="Split large Concat nodes")

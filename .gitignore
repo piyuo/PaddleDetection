@@ -88,17 +88,6 @@ kernel_meta/
 # MAC
 *.DS_Store
 
-# pipeline
-.olive-cache/
-pipeline/output/
-pipeline/dataset/
-pipeline/models/
-pipeline/PP-YOLOE/venv
-pipeline/PP-YOLOE/venv311
-pipeline/PP-YOLOE/models
-pipeline/PP-YOLOE/weights
-pipeline/PP-YOLOE/*.onnx
-
-
 #PP-YOLOE
+.olive-cache/
 PP-YOLOE/build/
