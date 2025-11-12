@@ -1,4 +1,4 @@
-# PP-YOLOE/build_pedestrian.sh
+# PP-YOLOE/build_human.sh
 #!/usr/bin/env bash
 
 # Activate the Python virtual environment
@@ -10,8 +10,8 @@ set -e
 MODEL_NAME="ppyoloe_crn_s_36e_pphuman"
 MODEL_WEIGHT="PP-YOLOE/build/weights/${MODEL_NAME}.pdparams"
 MODEL_CONFIG="configs/pphuman/${MODEL_NAME}.yml"
-MODEL_PRODUCT_NAME="pedestrian"
-DEMO_JPG="PP-YOLOE/build/dataset/demo/pedestrian.png"
+MODEL_PRODUCT_NAME="human"
+DEMO_JPG="PP-YOLOE/build/dataset/demo/human.png"
 
 echo "╔════════════════════════════════════════════════════════════╗"
 echo "║   Onnx Model Build.                                        ║"
