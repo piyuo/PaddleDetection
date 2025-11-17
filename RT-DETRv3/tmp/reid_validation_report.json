@@ -1,0 +1,930 @@
+{
+  "model_path": "onnx/backbone/rtdetrv3_r18vd_6x.onnx",
+  "validation_timestamp": "2025-08-31T23:08:12",
+  "checks": {
+    "model_structure": {
+      "status": "PASS",
+      "details": {
+        "total_candidates": 339,
+        "backbone_candidates": 233,
+        "has_c5_features": true,
+        "c5_candidate": "p2o.pd_op.conv2d.18.0"
+      },
+      "issues": []
+    },
+    "detection_format": {
+      "status": "PASS",
+      "details": {
+        "sample_size": 5,
+        "detection_samples": [
+          {
+            "index": 0,
+            "length": 6,
+            "values": [
+              0.0,
+              0.9389439821243286,
+              643.8360595703125,
+              246.88429260253906,
+              793.4296875,
+              630.071533203125
+            ],
+            "parsed": {
+              "class_id": 0.0,
+              "confidence": 0.9389439821243286,
+              "bbox": [
+                643.8360595703125,
+                246.88429260253906,
+                793.4296875,
+                630.071533203125
+              ]
+            }
+          },
+          {
+            "index": 1,
+            "length": 6,
+            "values": [
+              0.0,
+              0.9287946224212646,
+              482.0712890625,
+              268.071044921875,
+              607.698486328125,
+              684.496337890625
+            ],
+            "parsed": {
+              "class_id": 0.0,
+              "confidence": 0.9287946224212646,
+              "bbox": [
+                482.0712890625,
+                268.071044921875,
+                607.698486328125,
+                684.496337890625
+              ]
+            }
+          },
+          {
+            "index": 2,
+            "length": 6,
+            "values": [
+              0.0,
+              0.9260885715484619,
+              1016.1298828125,
+              287.9720458984375,
+              1174.8826904296875,
+              672.4430541992188
+            ],
+            "parsed": {
+              "class_id": 0.0,
+              "confidence": 0.9260885715484619,
+              "bbox": [
+                1016.1298828125,
+                287.9720458984375,
+                1174.8826904296875,
+                672.4430541992188
+              ]
+            }
+          },
+          {
+            "index": 3,
+            "length": 6,
+            "values": [
+              0.0,
+              0.9161720275878906,
+              145.25204467773438,
+              190.22921752929688,
+              337.0201416015625,
+              637.413818359375
+            ],
+            "parsed": {
+              "class_id": 0.0,
+              "confidence": 0.9161720275878906,
+              "bbox": [
+                145.25204467773438,
+                190.22921752929688,
+                337.0201416015625,
+                637.413818359375
+              ]
+            }
+          },
+          {
+            "index": 4,
+            "length": 6,
+            "values": [
+              0.0,
+              0.9060523509979248,
+              1192.281982421875,
+              255.48324584960938,
+              1280.0396728515625,
+              629.4243774414062
+            ],
+            "parsed": {
+              "class_id": 0.0,
+              "confidence": 0.9060523509979248,
+              "bbox": [
+                1192.281982421875,
+                255.48324584960938,
+                1280.0396728515625,
+                629.4243774414062
+              ]
+            }
+          }
+        ]
+      },
+      "issues": []
+    },
+    "coordinate_consistency": {
+      "status": "PASS",
+      "details": {
+        "simple_resize": {
+          "preprocessing_method": "simple_resize",
+          "original_image_shape": [
+            720,
+            1280,
+            3
+          ],
+          "feature_map_shape": [
+            1,
+            512,
+            40,
+            40
+          ],
+          "num_detections": 28,
+          "num_valid_scaled": 28,
+          "letterbox_info": null,
+          "sample_scaling": [
+            {
+              "detection_id": 0,
+              "original_bbox": [
+                643.8360595703125,
+                246.88429260253906,
+                793.4296875,
+                630.071533203125
+              ],
+              "scaled_bbox": [
+                39.0,
+                15.430268287658691,
+                40.0,
+                39.37947082519531
+              ],
+              "scaling_factors": [
+                0.06057442639361963,
+                0.0625
+              ]
+            },
+            {
+              "detection_id": 1,
+              "original_bbox": [
+                482.0712890625,
+                268.071044921875,
+                607.698486328125,
+                684.496337890625
+              ],
+              "scaled_bbox": [
+                30.12945556640625,
+                16.754440307617188,
+                37.98115539550781,
+                40.0
+              ],
+              "scaling_factors": [
+                0.0625,
+                0.0625
+              ]
+            },
+            {
+              "detection_id": 2,
+              "original_bbox": [
+                1016.1298828125,
+                287.9720458984375,
+                1174.8826904296875,
+                672.4430541992188
+              ],
+              "scaled_bbox": [
+                39.0,
+                17.998252868652344,
+                40.0,
+                40.0
+              ],
+              "scaling_factors": [
+                0.03838092025406601,
+                0.0625
+              ]
+            }
+          ]
+        },
+        "letterbox": {
+          "preprocessing_method": "letterbox",
+          "original_image_shape": [
+            720,
+            1280,
+            3
+          ],
+          "feature_map_shape": [
+            1,
+            512,
+            40,
+            40
+          ],
+          "num_detections": 29,
+          "num_valid_scaled": 29,
+          "letterbox_info": {
+            "scale": 0.5,
+            "pad_top": 140,
+            "pad_left": 0,
+            "original_shape": [
+              720,
+              1280
+            ],
+            "resized_shape": [
+              360,
+              640
+            ],
+            "letterbox_shape": [
+              640,
+              640
+            ]
+          },
+          "sample_scaling": [
+            {
+              "detection_id": 0,
+              "original_bbox": [
+                1287.776611328125,
+                312.485107421875,
+                1591.988037109375,
+                744.0511474609375
+              ],
+              "scaled_bbox": [
+                39.0,
+                17.36028374565972,
+                40.0,
+                40.0
+              ],
+              "scaling_factors": [
+                0.030284755645451626,
+                0.05555555555555555
+              ]
+            },
+            {
+              "detection_id": 1,
+              "original_bbox": [
+                969.23779296875,
+                338.197998046875,
+                1213.949462890625,
+                805.3580322265625
+              ],
+              "scaled_bbox": [
+                30.288681030273438,
+                18.788777669270832,
+                37.93592071533203,
+                40.0
+              ],
+              "scaling_factors": [
+                0.03125,
+                0.05555555555555555
+              ]
+            },
+            {
+              "detection_id": 2,
+              "original_bbox": [
+                2029.61083984375,
+                360.64959716796875,
+                2342.709716796875,
+                789.1927490234375
+              ],
+              "scaled_bbox": [
+                39.0,
+                20.036088731553818,
+                40.0,
+                40.0
+              ],
+              "scaling_factors": [
+                0.019215506359338535,
+                0.05555555555555555
+              ]
+            }
+          ]
+        }
+      },
+      "issues": []
+    },
+    "roi_extraction": {
+      "status": "WARN",
+      "details": {
+        "num_embeddings": 28,
+        "roi_analysis": [
+          {
+            "detection_id": 0,
+            "class_id": 0,
+            "roi_shape": [
+              512,
+              2,
+              2
+            ],
+            "roi_area": 4,
+            "embedding_stats": {
+              "min": -0.10984411835670471,
+              "max": 0.22545774281024933,
+              "mean": 0.005214388482272625,
+              "std": 0.043885476887226105,
+              "norm": 0.9999999403953552
+            },
+            "issues": [
+              "Very small RoI area"
+            ]
+          },
+          {
+            "detection_id": 1,
+            "class_id": 0,
+            "roi_shape": [
+              512,
+              23,
+              8
+            ],
+            "roi_area": 184,
+            "embedding_stats": {
+              "min": -0.07365534454584122,
+              "max": 0.3261043131351471,
+              "mean": 0.008494413457810879,
+              "std": 0.04337015375494957,
+              "norm": 1.0
+            }
+          },
+          {
+            "detection_id": 2,
+            "class_id": 0,
+            "roi_shape": [
+              512,
+              2,
+              2
+            ],
+            "roi_area": 4,
+            "embedding_stats": {
+              "min": -0.10055462270975113,
+              "max": 0.28130993247032166,
+              "mean": 0.0055250548757612705,
+              "std": 0.043847449123859406,
+              "norm": 1.0
+            },
+            "issues": [
+              "Very small RoI area"
+            ]
+          },
+          {
+            "detection_id": 3,
+            "class_id": 0,
+            "roi_shape": [
+              512,
+              28,
+              13
+            ],
+            "roi_area": 364,
+            "embedding_stats": {
+              "min": -0.07305813580751419,
+              "max": 0.2606677711009979,
+              "mean": 0.010678684338927269,
+              "std": 0.042884621769189835,
+              "norm": 1.0
+            }
+          },
+          {
+            "detection_id": 4,
+            "class_id": 0,
+            "roi_shape": [
+              512,
+              2,
+              2
+            ],
+            "roi_area": 4,
+            "embedding_stats": {
+              "min": -0.11340140551328659,
+              "max": 0.2521001696586609,
+              "mean": 0.005479350686073303,
+              "std": 0.04385318234562874,
+              "norm": 1.0
+            },
+            "issues": [
+              "Very small RoI area"
+            ]
+          },
+          {
+            "detection_id": 5,
+            "class_id": 0,
+            "roi_shape": [
+              512,
+              2,
+              2
+            ],
+            "roi_area": 4,
+            "embedding_stats": {
+              "min": -0.11340140551328659,
+              "max": 0.2521001696586609,
+              "mean": 0.005479350686073303,
+              "std": 0.04385318234562874,
+              "norm": 1.0
+            },
+            "issues": [
+              "Very small RoI area"
+            ]
+          },
+          {
+            "detection_id": 6,
+            "class_id": 0,
+            "roi_shape": [
+              512,
+              2,
+              2
+            ],
+            "roi_area": 4,
+            "embedding_stats": {
+              "min": -0.11340140551328659,
+              "max": 0.2521001696586609,
+              "mean": 0.005479350686073303,
+              "std": 0.04385318234562874,
+              "norm": 1.0
+            },
+            "issues": [
+              "Very small RoI area"
+            ]
+          },
+          {
+            "detection_id": 7,
+            "class_id": 0,
+            "roi_shape": [
+              512,
+              22,
+              6
+            ],
+            "roi_area": 132,
+            "embedding_stats": {
+              "min": -0.07787714898586273,
+              "max": 0.2951139807701111,
+              "mean": 0.009325282648205757,
+              "std": 0.043199118226766586,
+              "norm": 1.0
+            }
+          },
+          {
+            "detection_id": 8,
+            "class_id": 9,
+            "roi_shape": [
+              512,
+              2,
+              2
+            ],
+            "roi_area": 4,
+            "embedding_stats": {
+              "min": -0.1316228061914444,
+              "max": 0.2757135331630707,
+              "mean": 0.005164120811969042,
+              "std": 0.04389142245054245,
+              "norm": 1.0
+            },
+            "issues": [
+              "Very small RoI area"
+            ]
+          },
+          {
+            "detection_id": 9,
+            "class_id": 0,
+            "roi_shape": [
+              512,
+              20,
+              3
+            ],
+            "roi_area": 60,
+            "embedding_stats": {
+              "min": -0.07946815341711044,
+              "max": 0.27694228291511536,
+              "mean": 0.007653334178030491,
+              "std": 0.04352644458413124,
+              "norm": 0.9999999403953552
+            }
+          },
+          {
+            "detection_id": 10,
+            "class_id": 26,
+            "roi_shape": [
+              512,
+              6,
+              2
+            ],
+            "roi_area": 12,
+            "embedding_stats": {
+              "min": -0.09536696970462799,
+              "max": 0.29138025641441345,
+              "mean": 0.005913699511438608,
+              "std": 0.04379672557115555,
+              "norm": 0.9999999403953552
+            }
+          },
+          {
+            "detection_id": 11,
+            "class_id": 0,
+            "roi_shape": [
+              512,
+              6,
+              3
+            ],
+            "roi_area": 18,
+            "embedding_stats": {
+              "min": -0.08824271708726883,
+              "max": 0.2499457448720932,
+              "mean": 0.006363161373883486,
+              "std": 0.04373368248343468,
+              "norm": 1.0
+            }
+          },
+          {
+            "detection_id": 12,
+            "class_id": 26,
+            "roi_shape": [
+              512,
+              2,
+              2
+            ],
+            "roi_area": 4,
+            "embedding_stats": {
+              "min": -0.11166898161172867,
+              "max": 0.28973934054374695,
+              "mean": 0.005534002091735601,
+              "std": 0.04384632036089897,
+              "norm": 1.0
+            },
+            "issues": [
+              "Very small RoI area"
+            ]
+          },
+          {
+            "detection_id": 13,
+            "class_id": 26,
+            "roi_shape": [
+              512,
+              7,
+              5
+            ],
+            "roi_area": 35,
+            "embedding_stats": {
+              "min": -0.12520436942577362,
+              "max": 0.33144497871398926,
+              "mean": 0.006081871222704649,
+              "std": 0.04377369210124016,
+              "norm": 1.0
+            }
+          },
+          {
+            "detection_id": 14,
+            "class_id": 0,
+            "roi_shape": [
+              512,
+              2,
+              2
+            ],
+            "roi_area": 4,
+            "embedding_stats": {
+              "min": -0.12707000970840454,
+              "max": 0.19444972276687622,
+              "mean": 0.0065480442717671394,
+              "std": 0.04370638355612755,
+              "norm": 0.9999999403953552
+            },
+            "issues": [
+              "Very small RoI area"
+            ]
+          },
+          {
+            "detection_id": 15,
+            "class_id": 9,
+            "roi_shape": [
+              512,
+              2,
+              2
+            ],
+            "roi_area": 4,
+            "embedding_stats": {
+              "min": -0.12312285602092743,
+              "max": 0.28492674231529236,
+              "mean": 0.0057208724319934845,
+              "std": 0.04382232949137688,
+              "norm": 0.9999999403953552
+            },
+            "issues": [
+              "Very small RoI area"
+            ]
+          },
+          {
+            "detection_id": 16,
+            "class_id": 0,
+            "roi_shape": [
+              512,
+              2,
+              2
+            ],
+            "roi_area": 4,
+            "embedding_stats": {
+              "min": -0.1554768830537796,
+              "max": 0.20335175096988678,
+              "mean": 0.0045388140715658665,
+              "std": 0.043960485607385635,
+              "norm": 1.0
+            },
+            "issues": [
+              "Very small RoI area"
+            ]
+          },
+          {
+            "detection_id": 17,
+            "class_id": 0,
+            "roi_shape": [
+              512,
+              2,
+              2
+            ],
+            "roi_area": 4,
+            "embedding_stats": {
+              "min": -0.12707000970840454,
+              "max": 0.19444972276687622,
+              "mean": 0.0065480442717671394,
+              "std": 0.04370638355612755,
+              "norm": 0.9999999403953552
+            },
+            "issues": [
+              "Very small RoI area"
+            ]
+          },
+          {
+            "detection_id": 18,
+            "class_id": 26,
+            "roi_shape": [
+              512,
+              2,
+              2
+            ],
+            "roi_area": 4,
+            "embedding_stats": {
+              "min": -0.16416026651859283,
+              "max": 0.20831920206546783,
+              "mean": 0.0052083805203437805,
+              "std": 0.04388618841767311,
+              "norm": 0.9999999403953552
+            },
+            "issues": [
+              "Very small RoI area"
+            ]
+          },
+          {
+            "detection_id": 19,
+            "class_id": 26,
+            "roi_shape": [
+              512,
+              12,
+              6
+            ],
+            "roi_area": 72,
+            "embedding_stats": {
+              "min": -0.1082606315612793,
+              "max": 0.3483298122882843,
+              "mean": 0.007196167018264532,
+              "std": 0.04360436275601387,
+              "norm": 1.0
+            }
+          },
+          {
+            "detection_id": 20,
+            "class_id": 0,
+            "roi_shape": [
+              512,
+              2,
+              2
+            ],
+            "roi_area": 4,
+            "embedding_stats": {
+              "min": -0.12217036634683609,
+              "max": 0.19946420192718506,
+              "mean": 0.006501278840005398,
+              "std": 0.043713368475437164,
+              "norm": 1.0
+            },
+            "issues": [
+              "Very small RoI area"
+            ]
+          },
+          {
+            "detection_id": 21,
+            "class_id": 0,
+            "roi_shape": [
+              512,
+              2,
+              2
+            ],
+            "roi_area": 4,
+            "embedding_stats": {
+              "min": -0.13406231999397278,
+              "max": 0.21408560872077942,
+              "mean": 0.005865179002285004,
+              "std": 0.043803248554468155,
+              "norm": 1.0
+            },
+            "issues": [
+              "Very small RoI area"
+            ]
+          },
+          {
+            "detection_id": 22,
+            "class_id": 9,
+            "roi_shape": [
+              512,
+              6,
+              4
+            ],
+            "roi_area": 24,
+            "embedding_stats": {
+              "min": -0.0868726298213005,
+              "max": 0.3600864112377167,
+              "mean": 0.007631287444382906,
+              "std": 0.04353031516075134,
+              "norm": 1.0
+            }
+          },
+          {
+            "detection_id": 23,
+            "class_id": 0,
+            "roi_shape": [
+              512,
+              2,
+              2
+            ],
+            "roi_area": 4,
+            "embedding_stats": {
+              "min": -0.12217036634683609,
+              "max": 0.19946420192718506,
+              "mean": 0.006501278840005398,
+              "std": 0.043713368475437164,
+              "norm": 1.0
+            },
+            "issues": [
+              "Very small RoI area"
+            ]
+          },
+          {
+            "detection_id": 24,
+            "class_id": 0,
+            "roi_shape": [
+              512,
+              2,
+              2
+            ],
+            "roi_area": 4,
+            "embedding_stats": {
+              "min": -0.13406231999397278,
+              "max": 0.21408560872077942,
+              "mean": 0.005865179002285004,
+              "std": 0.043803248554468155,
+              "norm": 1.0
+            },
+            "issues": [
+              "Very small RoI area"
+            ]
+          },
+          {
+            "detection_id": 25,
+            "class_id": 0,
+            "roi_shape": [
+              512,
+              2,
+              2
+            ],
+            "roi_area": 4,
+            "embedding_stats": {
+              "min": -0.13406231999397278,
+              "max": 0.21408560872077942,
+              "mean": 0.005865179002285004,
+              "std": 0.043803248554468155,
+              "norm": 1.0
+            },
+            "issues": [
+              "Very small RoI area"
+            ]
+          },
+          {
+            "detection_id": 26,
+            "class_id": 26,
+            "roi_shape": [
+              512,
+              2,
+              2
+            ],
+            "roi_area": 4,
+            "embedding_stats": {
+              "min": -0.10984411835670471,
+              "max": 0.22545774281024933,
+              "mean": 0.005214388482272625,
+              "std": 0.043885476887226105,
+              "norm": 0.9999999403953552
+            },
+            "issues": [
+              "Very small RoI area"
+            ]
+          },
+          {
+            "detection_id": 27,
+            "class_id": 0,
+            "roi_shape": [
+              512,
+              19,
+              5
+            ],
+            "roi_area": 95,
+            "embedding_stats": {
+              "min": -0.08247650414705276,
+              "max": 0.30101174116134644,
+              "mean": 0.00785110518336296,
+              "std": 0.04349120706319809,
+              "norm": 0.9999999403953552
+            }
+          }
+        ],
+        "quality_stats": {
+          "very_small_rois": 18,
+          "zero_embeddings": 0,
+          "invalid_embeddings": 0,
+          "total_embeddings": 28
+        }
+      },
+      "issues": [
+        "High percentage of very small RoIs: 18/28"
+      ]
+    },
+    "embedding_quality": {
+      "status": "WARN",
+      "details": {
+        "num_embeddings": 28,
+        "embedding_dimension": 512,
+        "norm_stats": {
+          "mean": 1.0,
+          "std": 3.379265578473678e-08,
+          "min": 0.9999999403953552,
+          "max": 1.0
+        },
+        "separability_analysis": {
+          "same_class_count": 189,
+          "diff_class_count": 189,
+          "same_class_stats": {
+            "mean": 0.6653448343276978,
+            "std": 0.17871440947055817
+          },
+          "diff_class_stats": {
+            "mean": 0.4055689573287964,
+            "std": 0.3130146265029907
+          },
+          "separability_ratio": 0.6095620393753052
+        },
+        "consistency_analysis": {
+          "mean_consistency": 1.0,
+          "consistency_scores": [
+            0.9999998807907104,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            0.9999999403953552,
+            0.9999999403953552,
+            1.0,
+            1.0,
+            1.0000001192092896,
+            0.9999999403953552,
+            0.9999999403953552,
+            1.0000001192092896,
+            0.9999999403953552,
+            0.9999999403953552,
+            1.0000001192092896,
+            1.0000001192092896,
+            1.0,
+            1.0000001192092896,
+            1.0000001192092896,
+            1.0,
+            1.0,
+            0.9999998807907104,
+            0.9999999403953552
+          ]
+        }
+      },
+      "issues": [
+        "Poor class separability: ratio=0.61 (should be > 1.2)"
+      ]
+    }
+  },
+  "overall_status": "WARN",
+  "critical_issues": [],
+  "warnings": [
+    "roi_extraction: High percentage of very small RoIs: 18/28",
+    "embedding_quality: Poor class separability: ratio=0.61 (should be > 1.2)"
+  ],
+  "recommendations": [
+    "Consider using higher resolution feature maps (C4 instead of C5) for small object Re-ID",
+    "Poor class separability detected - consider fine-tuning model with Re-ID supervision",
+    "Try combining multiple feature map levels (C3+C4+C5) for better discriminative power",
+    "Run validation again after implementing recommended fixes"
+  ]
+}

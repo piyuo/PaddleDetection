@@ -91,3 +91,4 @@ kernel_meta/
 #PP-YOLOE
 .olive-cache/
 PP-YOLOE/build/
+RT-DETRv3/build/
