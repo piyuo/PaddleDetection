@@ -78,5 +78,3 @@ kernel_meta/
 .olive-cache/
 PP-YOLOE/build/
 RT-DETRv3/build/
-activity/
-tools/
