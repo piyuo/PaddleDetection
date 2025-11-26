@@ -31,5 +31,6 @@
 		"Wimg",
 		"xyxy",
 		"YOLOE"
-	]
+	],
+	"cmake.ignoreCMakeListsMissing": true
 }
