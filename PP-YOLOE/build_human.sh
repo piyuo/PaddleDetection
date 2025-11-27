@@ -106,15 +106,15 @@ python3 PP-YOLOE/src/ncnn_inference.py \
     --ncnn_param "PP-YOLOE/build/models/${MODEL_NAME}_ncnn.param" \
     --ncnn_bin "PP-YOLOE/build/models/${MODEL_NAME}_ncnn.bin"
 
-cp -f "PP-YOLOE/build/models/${MODEL_NAME}_ncnn.bin" "PP-YOLOE/build/output/${MODEL_PRODUCT_NAME}.bin"
-cp -f "PP-YOLOE/build/models/${MODEL_NAME}_ncnn.param" "PP-YOLOE/build/output/${MODEL_PRODUCT_NAME}.param"
-cp -f "PP-YOLOE/build/output/${MODEL_PRODUCT_NAME}.bin" "../flutter-vision/assets/models/${MODEL_PRODUCT_NAME}.bin"
-cp -f "PP-YOLOE/build/output/${MODEL_PRODUCT_NAME}.param" "../flutter-vision/assets/models/${MODEL_PRODUCT_NAME}.param"
+#cp -f "PP-YOLOE/build/models/${MODEL_NAME}_ncnn.bin" "PP-YOLOE/build/output/${MODEL_PRODUCT_NAME}.bin"
+#cp -f "PP-YOLOE/build/models/${MODEL_NAME}_ncnn.param" "PP-YOLOE/build/output/${MODEL_PRODUCT_NAME}.param"
+#cp -f "PP-YOLOE/build/output/${MODEL_PRODUCT_NAME}.bin" "../flutter-vision/assets/models/${MODEL_PRODUCT_NAME}.bin"
+#cp -f "PP-YOLOE/build/output/${MODEL_PRODUCT_NAME}.param" "../flutter-vision/assets/models/${MODEL_PRODUCT_NAME}.param"
 
 
 # cleanup temporary files
-rm -rf PP-YOLOE/build/models/
-mkdir -p PP-YOLOE/build/models/
+#rm -rf PP-YOLOE/build/models/
+#mkdir -p PP-YOLOE/build/models/
 
 # show the final output onnx and ncnn files
 echo ""
