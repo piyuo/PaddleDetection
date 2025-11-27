@@ -93,8 +93,9 @@ def preprocess_reid(img_crop: np.ndarray, target_size: Tuple[int, int] = (256, 1
 
     # Normalize
     img = img.astype(np.float32) / 255.0
-    mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
-    std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+    # Based on provided infer_cfg.yml: mean=[0,0,0], std=[1,1,1]
+    mean = np.array([0.0, 0.0, 0.0], dtype=np.float32)
+    std = np.array([1.0, 1.0, 1.0], dtype=np.float32)
     img = (img - mean) / std
 
     # HWC -> CHW
@@ -175,6 +176,9 @@ def main():
     print(f"{'ID':<5} {'Class':<5} {'Score':<10} {'Box':<25} {'Embedding Shape'}")
     print("-" * 70)
 
+    embeddings = []
+    valid_ids = []
+
     for i, box in enumerate(boxes_valid):
         cls_id, score, x0, y0, x1, y1 = box
 
@@ -195,8 +199,9 @@ def main():
         reid_input = preprocess_reid(crop)
         reid_output = reid_sess.run(None, {reid_input_name: reid_input})[0]
 
-        # Normalize embedding (optional, but standard for ReID)
-        # embedding = reid_output / np.linalg.norm(reid_output)
+        # Store for analysis
+        embeddings.append(reid_output.flatten())
+        valid_ids.append(i)
 
         print(f"{i:<5} {int(cls_id):<5} {score:.4f}     [{x0}, {y0}, {x1}, {y1}]     {reid_output.shape}")
 
@@ -209,5 +214,70 @@ def main():
     cv2.imwrite(vis_path, vis_img)
     print(f"\n✅ Visualization saved to: {vis_path}")
 
+    # --- BoT-SORT Suitability Analysis ---
+    if len(embeddings) > 1:
+        print("\n" + "="*60)
+        print("🔍 BoT-SORT Suitability Analysis (Discriminative Power)")
+        print("="*60)
+
+        # Stack and Normalize
+        feats = np.stack(embeddings) # (N, 256)
+        norms = np.linalg.norm(feats, axis=1, keepdims=True)
+        feats_norm = feats / (norms + 1e-6)
+
+        print(f"[Info] Embedding Norms (should be non-zero): {norms.flatten().round(2)}")
+
+        # Compute Cosine Similarity Matrix (N x N)
+        # Sim(A, B) = (A . B) / (|A|*|B|)
+        sim_matrix = np.dot(feats_norm, feats_norm.T)
+
+        # We are looking for LOW similarity between different IDs (off-diagonal elements)
+        # Mask the diagonal (self-similarity is always 1.0)
+        np.fill_diagonal(sim_matrix, -1.0)
+
+        max_sim = np.max(sim_matrix)
+        avg_sim = np.mean(sim_matrix[sim_matrix > -1.0])
+
+        print(f"\n[Stats] Similarity between DIFFERENT people (Lower is better):")
+        print(f"  • Max Similarity: {max_sim:.4f}")
+        print(f"  • Avg Similarity: {avg_sim:.4f}")
+
+        # Thresholds for BoT-SORT
+        # Typically, a match is rejected if distance > 0.2~0.4 (Similarity < 0.8~0.6)
+        # Conversely, if different people have similarity > 0.7, tracking might fail.
+
+        print("\n[Top Confusing Pairs] (High similarity between different IDs):")
+        print(f"  {'ID_A':<5} {'ID_B':<5} {'Similarity':<10} {'Status'}")
+        print("-" * 45)
+
+        # Find pairs with high similarity
+        count_high = 0
+        # Only check upper triangle to avoid duplicates
+        for r in range(len(valid_ids)):
+            for c in range(r + 1, len(valid_ids)):
+                sim = sim_matrix[r, c]
+                id_a = valid_ids[r]
+                id_b = valid_ids[c]
+
+                status = ""
+                if sim > 0.8:
+                    status = "🔴 CRITICAL (Likely ID Switch)"
+                    count_high += 1
+                elif sim > 0.6:
+                    status = "🟡 WARN (Risk of Switch)"
+                else:
+                    status = "🟢 OK"
+
+                if sim > 0.5: # Only print relevant ones
+                    print(f"  {id_a:<5} {id_b:<5} {sim:.4f}     {status}")
+
+        if count_high == 0 and max_sim < 0.6:
+            print("\n✅ RESULT: Embeddings look GOOD for BoT-SORT.")
+            print("   Different people are well separated in the embedding space.")
+        elif count_high > 0:
+            print("\n❌ RESULT: Embeddings might cause ID SWITCHES.")
+            print("   Some different people look too similar to the model.")
+        else:
+            print("\n⚠️ RESULT: Embeddings are ACCEPTABLE but not perfect.")
 if __name__ == "__main__":
     main()
