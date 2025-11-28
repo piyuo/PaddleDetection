@@ -1,4 +1,4 @@
-# PP-YOLOE/src/reid/human_reid_to_onnx.sh
+# PP-YOLOE/src/reid/build_human_reid.sh
 #!/usr/bin/env bash
 
 set -euo pipefail
@@ -98,6 +98,8 @@ echo ""
 
 
 cp -f "${ONNX_FILE}" "../flutter-vision/assets/models/${MODEL_NAME}.onnx"
+cp -f "PP-YOLOE/build/models/human_reid.param" "../flutter-vision/assets/models/human_reid.param"
+cp -f "PP-YOLOE/build/models/human_reid.bin" "../flutter-vision/assets/models/human_reid.bin"
 
 
 # and the inference model is in PP-YOLOE/inference_model/ppyoloe_crn_s_36e_pphuman/
