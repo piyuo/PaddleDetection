@@ -1,3 +1,4 @@
+# PP-YOLOE/src/reid/ncnn_inference_reid.sh
 #!/usr/bin/env bash
 
 echo "🔧 Running NCNN Detection + NCNN ReID inference..."
