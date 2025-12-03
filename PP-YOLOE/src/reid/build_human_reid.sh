@@ -63,6 +63,7 @@ if [ -f "${SURGERY_SCRIPT}" ]; then
         --rewrite-pow \
         --rewrite-hardsigmoid \
         --remove-noop-slice \
+        --fp16 \
         --split-concat 0
 
     echo "✅ ANE optimized model saved to ${OUT_DIR}/surgery/${MODEL_NAME}_ane.onnx"
