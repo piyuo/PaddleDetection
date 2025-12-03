@@ -60,7 +60,8 @@ def fix_input_shapes(model_path: str, out_path: str, nchw: Tuple[int, int, int, 
     for vi in m.graph.input:
         tt = vi.type.tensor_type
         rank = len(tt.shape.dim)
-        if rank == 4 and ("image" in vi.name.lower() or "input" in vi.name.lower()):
+        # Check for "x" specifically for ReID models, or generic "image"/"input"
+        if rank == 4 and ("image" in vi.name.lower() or "input" in vi.name.lower() or vi.name == "x"):
             dims = [n, c, h, w]
             for i, d in enumerate(tt.shape.dim):
                 d.dim_param = ""

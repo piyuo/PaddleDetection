@@ -54,6 +54,7 @@ if [ -f "${SURGERY_SCRIPT}" ]; then
         --img "${DEMO_IMG}" \
         --outdir "${OUT_DIR}/surgery" \
         --output-model "${OUT_DIR}/surgery/${MODEL_NAME}_ane.onnx" \
+        --ort-profile-dir "${OUT_DIR}/profile_reid" \
         --fix-input-shapes \
         --rewrite-reduce-to-globalpool \
         --rewrite-slice-to-gather \
@@ -69,6 +70,9 @@ else
     echo "⚠️  Surgery script not found at ${SURGERY_SCRIPT}"
 fi
 
+
+cp -f "${OUT_DIR}/surgery/${MODEL_NAME}_ane.onnx" "${ONNX_FILE}"
+echo "${OUT_DIR}/surgery/${MODEL_NAME}_ane.onnx" "->" "${ONNX_FILE}"
 
 # convert to ncnn
 
