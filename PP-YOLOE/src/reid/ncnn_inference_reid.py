@@ -245,7 +245,10 @@ def main():
         crop = orig_img[y0:y1, x0:x1]
 
         # NCNN Inference
+        t0 = time.time()
         reid_output = run_reid_ncnn(reid_net, crop)
+        t1 = time.time()
+        print(f"     [Time] ReID Inference (NCNN): {(t1 - t0) * 1000:.2f} ms")
 
         embeddings.append(reid_output.flatten())
         valid_ids.append(i)
