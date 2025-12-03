@@ -57,12 +57,15 @@ if [ -f "${SURGERY_SCRIPT}" ]; then
         --ort-profile-dir "${OUT_DIR}/profile_reid" \
         --fix-input-shapes \
         --rewrite-reduce-to-globalpool \
+        --rewrite-slice-range-to-gather \
         --rewrite-slice-to-gather \
         --fold-static-shapes \
+        --fold-conv-bn \
         --rewrite-div \
         --rewrite-pow \
         --rewrite-hardsigmoid \
         --remove-noop-slice \
+        --remove-identity \
         --fp16 \
         --split-concat 0
 
@@ -71,7 +74,7 @@ else
     echo "⚠️  Surgery script not found at ${SURGERY_SCRIPT}"
 fi
 
-
+rm -f "${ONNX_FILE}"
 cp -f "${OUT_DIR}/surgery/${MODEL_NAME}_ane.onnx" "${ONNX_FILE}"
 echo "${OUT_DIR}/surgery/${MODEL_NAME}_ane.onnx" "->" "${ONNX_FILE}"
 

@@ -700,6 +700,122 @@ def rewrite_slice_to_gather(model_path: str, out_path: str) -> str:
 # NEW OPTIMIZATIONS FOR ANE
 
 
+def fold_conv_batchnorm(model_path: str, out_path: str) -> str:
+    """Fold BatchNormalization parameters into preceding Conv weights/bias when safe."""
+    m = onnx.load(model_path)
+    g = m.graph
+
+    def unique_name(base: str) -> str:
+        idx = 0
+        existing = {n.name for n in g.node}
+        existing.update({vi.name for vi in list(g.input) + list(g.output)})
+        existing.update({init.name for init in g.initializer})
+        name = f"{base}__{idx}"
+        while name in existing:
+            idx += 1
+            name = f"{base}__{idx}"
+        return name
+
+    init_map = {init.name: numpy_helper.to_array(init) for init in g.initializer}
+
+    def set_initializer(name: str, arr: np.ndarray):
+        replaced = False
+        for i, init in enumerate(g.initializer):
+            if init.name == name:
+                g.initializer[i].CopyFrom(numpy_helper.from_array(arr, name=name))
+                replaced = True
+                break
+        if not replaced:
+            g.initializer.extend([numpy_helper.from_array(arr, name=name)])
+        init_map[name] = arr
+
+    output_to_node: Dict[str, onnx.NodeProto] = {}
+    for node in g.node:
+        for out in node.output:
+            output_to_node[out] = node
+
+    consumers: Dict[str, List[onnx.NodeProto]] = {}
+    for node in g.node:
+        for inp in node.input:
+            consumers.setdefault(inp, []).append(node)
+
+    nodes_to_remove: List[onnx.NodeProto] = []
+    fused = 0
+
+    for node in g.node:
+        if node.op_type != "BatchNormalization" or len(node.input) < 5 or len(node.output) != 1:
+            continue
+        bn_in = node.input[0]
+        prod = output_to_node.get(bn_in)
+        if prod is None or prod.op_type != "Conv":
+            continue
+        if len(consumers.get(bn_in, [])) != 1:
+            continue
+        conv = prod
+        if len(conv.input) < 2:
+            continue
+
+        weight_name = conv.input[1]
+        weight = init_map.get(weight_name)
+        if weight is None:
+            continue
+
+        scale = init_map.get(node.input[1])
+        bias = init_map.get(node.input[2])
+        mean = init_map.get(node.input[3])
+        var = init_map.get(node.input[4])
+        if any(v is None for v in (scale, bias, mean, var)):
+            continue
+
+        epsilon = 1e-5
+        for attr in node.attribute:
+            if attr.name == "epsilon":
+                epsilon = float(attr.f)
+                break
+
+        conv_bias_name = None
+        conv_bias = None
+        if len(conv.input) >= 3 and conv.input[2]:
+            conv_bias_name = conv.input[2]
+            conv_bias = init_map.get(conv_bias_name)
+        if conv_bias is None:
+            conv_bias_name = conv_bias_name or unique_name(conv.name + "_bias")
+            conv_bias = np.zeros(weight.shape[0], dtype=weight.dtype)
+            if len(conv.input) >= 3:
+                conv.input[2] = conv_bias_name
+            else:
+                conv.input.append(conv_bias_name)
+        dtype = weight.dtype
+        scale = scale.astype(np.float32)
+        bias = bias.astype(np.float32)
+        mean = mean.astype(np.float32)
+        var = var.astype(np.float32)
+        conv_bias = conv_bias.astype(np.float32)
+
+        inv = scale / np.sqrt(var + epsilon)
+        inv_shape = inv.reshape(-1, *([1] * (weight.ndim - 1)))
+        new_weight = (weight.astype(np.float32) * inv_shape).astype(dtype)
+        new_bias = (inv * (conv_bias - mean) + bias).astype(np.float32)
+
+        set_initializer(weight_name, new_weight)
+        set_initializer(conv_bias_name, new_bias.astype(dtype))
+
+        conv.output[0] = node.output[0]
+        nodes_to_remove.append(node)
+        fused += 1
+
+    if fused == 0:
+        onnx.save(m, out_path)
+        return out_path
+
+    kept = [n for n in g.node if n not in nodes_to_remove]
+    del g.node[:]
+    g.node.extend(kept)
+    onnx.save(m, out_path)
+    print(f"Folded Conv+BatchNorm: {fused} pair(s)")
+    return out_path
+
+
 def rewrite_slice_range_to_gather(model_path: str, out_path: str) -> str:
     """Rewrite Slice with static scalar range (start/end) and step=1 into a Gather with constant indices.
 
@@ -1105,6 +1221,49 @@ def remove_noop_slice(model_path: str, out_path: str) -> str:
 
 
 
+def remove_identity_nodes(model_path: str, out_path: str) -> str:
+    """Remove Identity nodes whose outputs are not graph outputs."""
+    m = onnx.load(model_path)
+    g = m.graph
+    graph_outputs = {out.name for out in g.output}
+
+    replacements: Dict[str, str] = {}
+    nodes_to_remove: List[onnx.NodeProto] = []
+    for node in g.node:
+        if node.op_type != "Identity" or len(node.input) != 1 or len(node.output) != 1:
+            continue
+        out_name = node.output[0]
+        if out_name in graph_outputs:
+            continue
+        replacements[out_name] = node.input[0]
+        nodes_to_remove.append(node)
+
+    if not replacements:
+        onnx.save(m, out_path)
+        return out_path
+
+    def resolve(name: str) -> str:
+        seen = set()
+        cur = name
+        while cur in replacements and cur not in seen:
+            seen.add(cur)
+            cur = replacements[cur]
+        return cur
+
+    for node in g.node:
+        for i, inp in enumerate(node.input):
+            if inp in replacements:
+                node.input[i] = resolve(inp)
+
+    kept = [n for n in g.node if n not in nodes_to_remove]
+    del g.node[:]
+    g.node.extend(kept)
+    onnx.save(m, out_path)
+    print(f"Removed Identity nodes: {len(nodes_to_remove)} node(s)")
+    return out_path
+
+
+
 
 def analyze_ane_compatibility(profile_summary: Dict) -> None:
     """Analyze and report ops most likely blocking ANE execution."""
@@ -1174,6 +1333,8 @@ def main():
     parser.add_argument("--rewrite-slice-to-gather", action="store_true", help="Rewrite Slice to Gather")
     parser.add_argument("--rewrite-reduce-to-globalpool", action="store_true", help="Rewrite ReduceMean/ReduceMax over H,W to GlobalPool")
     parser.add_argument("--remove-noop-slice", action="store_true", help="Remove Slice ops that are effectively identity")
+    parser.add_argument("--fold-conv-bn", action="store_true", help="Fold BatchNorm parameters into preceding Conv nodes")
+    parser.add_argument("--remove-identity", action="store_true", help="Remove redundant Identity nodes")
     parser.add_argument("--output-model", type=str, help="Path to copy final optimized model to")
 
     args = parser.parse_args()
@@ -1229,6 +1390,13 @@ def main():
 
 
 
+    if args.fold_conv_bn:
+        print("[stage] Folding Conv+BatchNorm…")
+        modCB = os.path.join(args.outdir, os.path.basename(args.model).replace('.onnx', '_convbn.onnx'))
+        work_path = fold_conv_batchnorm(work_path, modCB)
+
+
+
     if args.split_concat and args.split_concat > 0:
         print(f"[stage] Splitting large Concat nodes (max_inputs={args.split_concat})…")
         modC = os.path.join(args.outdir, os.path.basename(args.model).replace('.onnx', '_splitconcat.onnx'))
@@ -1278,6 +1446,11 @@ def main():
         print("[stage] Removing no-op Slice ops…")
         modNS = os.path.join(args.outdir, os.path.basename(args.model).replace('.onnx', '_slice_noop.onnx'))
         work_path = remove_noop_slice(work_path, modNS)
+
+    if args.remove_identity:
+        print("[stage] Removing Identity nodes…")
+        modID = os.path.join(args.outdir, os.path.basename(args.model).replace('.onnx', '_no_identity.onnx'))
+        work_path = remove_identity_nodes(work_path, modID)
 
     if args.rewrite_reduce_to_globalpool:
         print("[stage] Rewriting Reduce -> GlobalPool…")
