@@ -38,6 +38,37 @@ paddle2onnx \
 	--save_file "${ONNX_FILE}"
 set +x
 
+# ANE Optimization
+echo "╔════════════════════════════════════════════════════════════╗"
+echo "║   ANE Graph Surgery for CoreML Optimization               ║"
+echo "╚════════════════════════════════════════════════════════════╝"
+
+SURGERY_SCRIPT="${SCRIPT_DIR}/ane_graph_surgery_reid.py"
+DEMO_IMG="${REPO_ROOT}/PP-YOLOE/build/dataset/demo/demo.jpg"
+
+if [ -f "${SURGERY_SCRIPT}" ]; then
+    echo "🔧 Running ANE graph surgery..."
+    python3 "${SURGERY_SCRIPT}" \
+        --model "${ONNX_FILE}" \
+        --input-shape "1,3,256,128" \
+        --img "${DEMO_IMG}" \
+        --outdir "${OUT_DIR}/surgery" \
+        --output-model "${OUT_DIR}/surgery/${MODEL_NAME}_ane.onnx" \
+        --fix-input-shapes \
+        --rewrite-reduce-to-globalpool \
+        --rewrite-slice-to-gather \
+        --fold-static-shapes \
+        --rewrite-div \
+        --rewrite-pow \
+        --rewrite-hardsigmoid \
+        --remove-noop-slice \
+        --split-concat 0
+
+    echo "✅ ANE optimized model saved to ${OUT_DIR}/surgery/${MODEL_NAME}_ane.onnx"
+else
+    echo "⚠️  Surgery script not found at ${SURGERY_SCRIPT}"
+fi
+
 
 # convert to ncnn
 

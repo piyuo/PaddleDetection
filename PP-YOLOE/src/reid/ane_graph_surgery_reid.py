@@ -32,6 +32,9 @@ try:
 except Exception:
     ort = None
 
+# Add parent directory to path to import onnx_profile
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
 # Reuse functions from profile_onnx
 from onnx_profile import (
     load_model_info,
@@ -1148,20 +1151,20 @@ def main():
     parser.add_argument(
         "--model",
         type=str,
-        default="PP-YOLOE/build/models/ppyoloe_crn_s_36e_pphuman_cust.onnx",
+        default="PP-YOLOE/build/models/human_reid.onnx",
         help="Path to source ONNX model",
     )
-    parser.add_argument("--input-shape", type=str, default="1,3,640,640")
+    parser.add_argument("--input-shape", type=str, default="1,3,256,128")
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--runs", type=int, default=50)
     parser.add_argument("--img", type=str, help="Path to image for realistic preprocessing (not needed for --find-nms)")
     parser.add_argument("--outdir", type=str, default="PP-YOLOE/build/models/surgery")
     parser.add_argument("--ort-profile-dir", type=str, help="Directory for ORT profiling (enables profiling automatically)")
     parser.add_argument("--fp16", action="store_true", help="Attempt FP16 casting")
-    parser.add_argument("--split-concat", type=int, default=4, help="Split large Concat nodes")
+    parser.add_argument("--split-concat", type=int, default=0, help="Split large Concat nodes (default: 0/disabled for ReID)")
     parser.add_argument("--fix-input-shapes", action="store_true", help="Rewrite graph inputs to static shapes")
     parser.add_argument("--fold-static-shapes", action="store_true", help="Fold shape computation chains")
-    parser.add_argument("--rewrite-resize-to-static", action="store_true", help="Replace dynamic Resize with static sizes")
+    # parser.add_argument("--rewrite-resize-to-static", action="store_true", help="Replace dynamic Resize with static sizes")
     parser.add_argument("--fold-iterations", type=int, default=15, help="Iterations for constant folding (default: 15)")
     parser.add_argument("--rewrite-div", action="store_true", help="Rewrite Div to Mul with reciprocal")
     parser.add_argument("--rewrite-pow", action="store_true", help="Rewrite Pow patterns")
@@ -1265,10 +1268,10 @@ def main():
         modSG = os.path.join(args.outdir, os.path.basename(args.model).replace('.onnx', '_slice2gather.onnx'))
         work_path = rewrite_slice_to_gather(work_path, modSG)
 
-    if args.rewrite_resize_to_static:
-        print("[stage] Rewriting Resize to static sizes…")
-        modRZ = os.path.join(args.outdir, os.path.basename(args.model).replace('.onnx', '_resize_static.onnx'))
-        work_path = rewrite_resize_to_static(work_path, modRZ)
+    # if args.rewrite_resize_to_static:
+    #     print("[stage] Rewriting Resize to static sizes…")
+    #     modRZ = os.path.join(args.outdir, os.path.basename(args.model).replace('.onnx', '_resize_static.onnx'))
+    #     work_path = rewrite_resize_to_static(work_path, modRZ)
 
     if args.remove_noop_slice:
         print("[stage] Removing no-op Slice ops…")

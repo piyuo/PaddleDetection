@@ -136,6 +136,9 @@ def make_image_inputs(model_info: Dict[str, Any], input_shape: Tuple[int, ...], 
             name = inp["name"]
             if name == 'image' and 'image' in prep:
                 feeds[name] = prep['image'][None, :]
+            elif name == 'x' and 'image' in prep:
+                # Handle ReID model input 'x'
+                feeds[name] = prep['image'][None, :]
             elif name in ('im_shape', 'scale_factor') and name in prep:
                 feeds[name] = prep[name][None, :]
         # Ensure all inputs are covered without synthetic fallbacks
