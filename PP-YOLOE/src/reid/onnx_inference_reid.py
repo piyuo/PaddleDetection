@@ -197,7 +197,10 @@ def main():
 
         # ReID Inference
         reid_input = preprocess_reid(crop)
+        t0 = time.time()
         reid_output = reid_sess.run(None, {reid_input_name: reid_input})[0]
+        t1 = time.time()
+        print(f"     [Time] ReID Inference: {(t1 - t0) * 1000:.2f} ms")
 
         # Store for analysis
         embeddings.append(reid_output.flatten())
