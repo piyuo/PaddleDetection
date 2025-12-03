@@ -27,9 +27,10 @@ from onnx_inference_utils import (
     get_coreml_version_info,
 )
 
-def get_session(onnx_path: str):
+def get_session(onnx_path: str, force_cpu: bool = False):
     try:
         import onnxruntime as ort
+        import platform
     except Exception as exc:
         print(
             "[ERROR] onnxruntime not installed. Install with: pip install onnxruntime",
@@ -37,14 +38,19 @@ def get_session(onnx_path: str):
         )
         raise exc
 
+    print(f"[INFO] System: {platform.system()} {platform.machine()}")
+    print(f"[INFO] Python: {sys.version.split()[0]}")
+    print(f"[INFO] ONNX Runtime Version: {ort.__version__}")
     available = ort.get_available_providers()
+    print(f"[INFO] Available Providers: {available}")
+
     providers = None
-    if "CoreMLExecutionProvider" in available:
+    if not force_cpu and "CoreMLExecutionProvider" in available:
         coreml_opts = {
             "ModelFormat": "MLProgram",
             "EnableOnSubgraphs": "1",
             "MLComputeUnits": "ALL",
-            "RequireStaticInputShapes": "1",
+            "RequireStaticInputShapes": "0", # Relaxed constraint
         }
         providers = [("CoreMLExecutionProvider", coreml_opts), "CPUExecutionProvider"]
         print(f"[INFO] Loading {os.path.basename(onnx_path)} with CoreMLExecutionProvider...")
@@ -56,10 +62,11 @@ def get_session(onnx_path: str):
             print("[ERROR] Failed to initialize CoreMLExecutionProvider session:", exc, file=sys.stderr)
             raise
     else:
-        print(f"[INFO] Loading {os.path.basename(onnx_path)} with default providers: {available}")
+        print(f"[INFO] Loading {os.path.basename(onnx_path)} with default providers (CPU forced: {force_cpu}): {available}")
         so = ort.SessionOptions()
         so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-        sess = ort.InferenceSession(onnx_path, sess_options=so, providers=providers)
+        sess = ort.InferenceSession(onnx_path, sess_options=so, providers=["CPUExecutionProvider"])
+
     return sess
 
 
@@ -119,6 +126,7 @@ def main():
     parser.add_argument("--reid_onnx", default=default_reid_onnx, help="Path to ReID ONNX model file")
     parser.add_argument("--out", default=default_out, help="Directory to save visualization")
     parser.add_argument("--thresh", type=float, default=0.5, help="Score threshold for detection (default: 0.5)")
+    parser.add_argument("--cpu", action="store_true", help="Force CPU execution (disable CoreML)")
     args = parser.parse_args()
 
     # 1. Check files
@@ -129,7 +137,7 @@ def main():
 
     # 2. Load Detection Model
     print("\n[1/3] Loading Detection Model...")
-    det_sess = get_session(args.det_onnx)
+    det_sess = get_session(args.det_onnx, args.cpu)
 
     # 3. Run Detection
     print("\n[2/3] Running Detection...")
@@ -156,8 +164,18 @@ def main():
 
     # 4. Load ReID Model
     print("\n[3/3] Loading ReID Model and Extracting Features...")
-    reid_sess = get_session(args.reid_onnx)
+    reid_sess = get_session(args.reid_onnx, args.cpu)
     reid_input_name = reid_sess.get_inputs()[0].name
+
+    # Warmup ReID
+    if not args.cpu:
+        print("[INFO] Warming up ReID model...")
+        try:
+            # Create a dummy input matching the expected shape (1, 3, 256, 128)
+            dummy_input = np.zeros((1, 3, 256, 128), dtype=np.float32)
+            reid_sess.run(None, {reid_input_name: dummy_input})
+        except Exception as e:
+            print(f"[WARN] ReID warmup failed: {e}")
 
     # Load original image for cropping
     orig_img = cv2.imread(args.img)
