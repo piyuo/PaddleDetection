@@ -1385,7 +1385,7 @@ def main():
         default="PP-YOLOE/build/models/human_reid.onnx",
         help="Path to source ONNX model",
     )
-    parser.add_argument("--input-shape", type=str, default="1,3,256,128")
+    parser.add_argument("--input-shape", type=str, default="4,3,256,128")
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--runs", type=int, default=50)
     parser.add_argument("--img", type=str, help="Path to image for realistic preprocessing (not needed for --find-nms)")

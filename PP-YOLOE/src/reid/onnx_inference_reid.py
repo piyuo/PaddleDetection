@@ -48,7 +48,7 @@ def get_session(onnx_path: str, force_cpu: bool = False):
             "ModelFormat": "MLProgram",
             "EnableOnSubgraphs": "1",
             "MLComputeUnits": "ALL",
-            "RequireStaticInputShapes": "0", # Relaxed constraint
+            "RequireStaticInputShapes": "1", # Enforce static shapes for performance
         }
         providers = [("CoreMLExecutionProvider", coreml_opts), "CPUExecutionProvider"]
         print(f"[INFO] Loading {os.path.basename(onnx_path)} with CoreMLExecutionProvider...")
@@ -98,10 +98,7 @@ def preprocess_reid(img_crop: np.ndarray, target_size: Tuple[int, int] = (256, 1
 
     # Normalize
     img = img.astype(np.float32) / 255.0
-    # Based on provided infer_cfg.yml: mean=[0,0,0], std=[1,1,1]
-    mean = np.array([0.0, 0.0, 0.0], dtype=np.float32)
-    std = np.array([1.0, 1.0, 1.0], dtype=np.float32)
-    img = (img - mean) / std
+    # Mean=[0,0,0], Std=[1,1,1] -> No op required
 
     # HWC -> CHW
     img = img.transpose(2, 0, 1)
@@ -163,8 +160,11 @@ def main():
     if not args.cpu:
         print("[INFO] Warming up ReID model...")
         try:
-            # Create a dummy input matching the expected shape (1, 3, 256, 128)
-            dummy_input = np.zeros((1, 3, 256, 128), dtype=np.float32)
+            # Create a dummy input matching the expected shape
+            input_shape = reid_sess.get_inputs()[0].shape
+            # Handle dynamic batch if present (though we know it's fixed to 4 now)
+            batch = input_shape[0] if isinstance(input_shape[0], int) and input_shape[0] > 0 else 1
+            dummy_input = np.zeros((batch, 3, 256, 128), dtype=np.float32)
             reid_sess.run(None, {reid_input_name: dummy_input})
         except Exception as e:
             print(f"[WARN] ReID warmup failed: {e}")
@@ -188,7 +188,10 @@ def main():
 
     embeddings = []
     valid_ids = []
+    crops = []
+    valid_boxes = []
 
+    # 1. Collect crops
     for i, box in enumerate(boxes_valid):
         cls_id, score, x0, y0, x1, y1 = box
 
@@ -204,13 +207,81 @@ def main():
 
         # Crop
         crop = orig_img[y0:y1, x0:x1]
+        crops.append(crop)
+        valid_boxes.append((i, cls_id, score, x0, y0, x1, y1))
 
-        # ReID Inference
-        reid_input = preprocess_reid(crop)
-        t0 = time.time()
-        reid_output = reid_sess.run(None, {reid_input_name: reid_input})[0]
-        t1 = time.time()
-        print(f"     [Time] ReID Inference: {(t1 - t0) * 1000:.2f} ms")
+    if not crops:
+        print("No valid crops found.")
+        return
+
+    # 2. Prepare Batch
+    # Check model input shape to decide on batching
+    input_shape = reid_sess.get_inputs()[0].shape
+    # input_shape[0] might be 1, 'batch', or None
+    can_batch = False
+    fixed_batch_size = 1
+
+    if len(input_shape) == 4:
+        if isinstance(input_shape[0], str) or input_shape[0] is None:
+            can_batch = True
+        elif input_shape[0] > 1:
+            can_batch = True # Fixed batch size > 1 (requires padding if len(crops) < batch)
+            fixed_batch_size = input_shape[0]
+        else:
+            # Batch size is 1
+            can_batch = False
+
+    # Preprocess all crops
+    preprocessed_crops = [preprocess_reid(c) for c in crops]
+
+    reid_outputs = []
+
+    if can_batch:
+        print(f"[INFO] Running Batch Inference (Batch Size: {fixed_batch_size}) for {len(crops)} objects...")
+
+        # Process in chunks of fixed_batch_size
+        for i in range(0, len(preprocessed_crops), fixed_batch_size):
+            chunk = preprocessed_crops[i:i + fixed_batch_size]
+
+            # Pad if necessary
+            if len(chunk) < fixed_batch_size:
+                pad_size = fixed_batch_size - len(chunk)
+                # Use the last image for padding (or zeros)
+                pad_img = chunk[-1] if chunk else np.zeros_like(preprocessed_crops[0])
+                chunk.extend([pad_img] * pad_size)
+
+            # Stack: (N, 3, 256, 128)
+            batch_input = np.concatenate(chunk, axis=0)
+
+            t0 = time.time()
+            try:
+                batch_output = reid_sess.run(None, {reid_input_name: batch_input})[0]
+                t1 = time.time()
+                print(f"     [Time] Batch ReID Inference: {(t1 - t0) * 1000:.2f} ms")
+
+                # Remove padding
+                valid_count = min(fixed_batch_size, len(preprocessed_crops) - i)
+                reid_outputs.extend(list(batch_output[:valid_count]))
+
+            except Exception as e:
+                print(f"[WARN] Batch inference failed: {e}. Falling back to serial.")
+                can_batch = False
+                reid_outputs = [] # Clear partial results
+                break
+
+    if not reid_outputs: # Serial execution (either can_batch=False or failed)
+        for idx, inp in enumerate(preprocessed_crops):
+            t0 = time.time()
+            out = reid_sess.run(None, {reid_input_name: inp})[0]
+            t1 = time.time()
+            # Only print time for first few to avoid spam
+            if idx < 3:
+                print(f"     [Time] ReID Inference ({idx}): {(t1 - t0) * 1000:.2f} ms")
+            reid_outputs.append(out)
+
+    # 3. Process Results
+    for idx, (i, cls_id, score, x0, y0, x1, y1) in enumerate(valid_boxes):
+        reid_output = reid_outputs[idx]
 
         # Store for analysis
         embeddings.append(reid_output.flatten())

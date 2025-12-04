@@ -132,13 +132,21 @@ def make_image_inputs(model_info: Dict[str, Any], input_shape: Tuple[int, ...], 
         prep = preprocess_image(img_path, target_size=target_hw, keep_ratio=False)
         # Map by input names declared in the model
         feeds = {}
+        batch_size = input_shape[0] if len(input_shape) == 4 else 1
+
         for inp in model_info["inputs"]:
             name = inp["name"]
             if name == 'image' and 'image' in prep:
-                feeds[name] = prep['image'][None, :]
+                img_data = prep['image'][None, :]
+                if batch_size > 1:
+                    img_data = np.repeat(img_data, batch_size, axis=0)
+                feeds[name] = img_data
             elif name == 'x' and 'image' in prep:
                 # Handle ReID model input 'x'
-                feeds[name] = prep['image'][None, :]
+                img_data = prep['image'][None, :]
+                if batch_size > 1:
+                    img_data = np.repeat(img_data, batch_size, axis=0)
+                feeds[name] = img_data
             elif name in ('im_shape', 'scale_factor') and name in prep:
                 feeds[name] = prep[name][None, :]
         # Ensure all inputs are covered without synthetic fallbacks

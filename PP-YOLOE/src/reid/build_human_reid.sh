@@ -50,7 +50,7 @@ if [ -f "${SURGERY_SCRIPT}" ]; then
     echo "🔧 Running ANE graph surgery..."
     python3 "${SURGERY_SCRIPT}" \
         --model "${ONNX_FILE}" \
-        --input-shape "1,3,256,128" \
+        --input-shape "4,3,256,128" \
         --img "${DEMO_IMG}" \
         --outdir "${OUT_DIR}/surgery" \
         --output-model "${OUT_DIR}/surgery/${MODEL_NAME}_ane.onnx" \
