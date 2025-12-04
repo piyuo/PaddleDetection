@@ -1220,6 +1220,77 @@ def remove_noop_slice(model_path: str, out_path: str) -> str:
     return out_path
 
 
+def remove_unused_initializers(model_path: str, out_path: str) -> str:
+    """Drop initializers not consumed by any node or graph IO."""
+    m = onnx.load(model_path)
+    g = m.graph
+
+    used = set()
+    for node in g.node:
+        for inp in node.input:
+            if inp:
+                used.add(inp)
+    for vi in list(g.input) + list(g.output):
+        if vi.name:
+            used.add(vi.name)
+
+    kept = []
+    removed = 0
+    for init in g.initializer:
+        if init.name in used:
+            kept.append(init)
+        else:
+            removed += 1
+
+    if removed == 0:
+        onnx.save(m, out_path)
+        return out_path
+
+    del g.initializer[:]
+    g.initializer.extend(kept)
+    onnx.save(m, out_path)
+    print(f"Removed unused initializers: {removed} tensor(s)")
+    return out_path
+
+
+def remove_unused_constants(model_path: str, out_path: str) -> str:
+    """Remove Constant nodes whose outputs are unused."""
+    m = onnx.load(model_path)
+    g = m.graph
+
+    consumers = set()
+    for node in g.node:
+        for inp in node.input:
+            if inp:
+                consumers.add(inp)
+    graph_outputs = {out.name for out in g.output}
+
+    kept: List[onnx.NodeProto] = []
+    removed = 0
+    for node in g.node:
+        if node.op_type == "Constant" and node.output:
+            unused = True
+            for out_name in node.output:
+                if not out_name:
+                    continue
+                if out_name in consumers or out_name in graph_outputs:
+                    unused = False
+                    break
+            if unused:
+                removed += 1
+                continue
+        kept.append(node)
+
+    if removed == 0:
+        onnx.save(m, out_path)
+        return out_path
+
+    del g.node[:]
+    g.node.extend(kept)
+    onnx.save(m, out_path)
+    print(f"Removed unused Constant nodes: {removed}")
+    return out_path
+
 
 def remove_identity_nodes(model_path: str, out_path: str) -> str:
     """Remove Identity nodes whose outputs are not graph outputs."""
@@ -1335,6 +1406,8 @@ def main():
     parser.add_argument("--remove-noop-slice", action="store_true", help="Remove Slice ops that are effectively identity")
     parser.add_argument("--fold-conv-bn", action="store_true", help="Fold BatchNorm parameters into preceding Conv nodes")
     parser.add_argument("--remove-identity", action="store_true", help="Remove redundant Identity nodes")
+    parser.add_argument("--remove-unused-inits", action="store_true", help="Drop orphan initializers left after rewrites")
+    parser.add_argument("--remove-unused-const", action="store_true", help="Drop Constant nodes with no consumers")
     parser.add_argument("--output-model", type=str, help="Path to copy final optimized model to")
 
     args = parser.parse_args()
@@ -1451,6 +1524,16 @@ def main():
         print("[stage] Removing Identity nodes…")
         modID = os.path.join(args.outdir, os.path.basename(args.model).replace('.onnx', '_no_identity.onnx'))
         work_path = remove_identity_nodes(work_path, modID)
+
+    if args.remove_unused_const:
+        print("[stage] Removing unused Constant nodes…")
+        modUC = os.path.join(args.outdir, os.path.basename(args.model).replace('.onnx', '_no_const.onnx'))
+        work_path = remove_unused_constants(work_path, modUC)
+
+    if args.remove_unused_inits:
+        print("[stage] Dropping unused initializers…")
+        modUI = os.path.join(args.outdir, os.path.basename(args.model).replace('.onnx', '_clean_inits.onnx'))
+        work_path = remove_unused_initializers(work_path, modUI)
 
     if args.rewrite_reduce_to_globalpool:
         print("[stage] Rewriting Reduce -> GlobalPool…")

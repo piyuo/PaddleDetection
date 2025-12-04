@@ -65,7 +65,9 @@ if [ -f "${SURGERY_SCRIPT}" ]; then
         --rewrite-pow \
         --rewrite-hardsigmoid \
         --remove-noop-slice \
+        --remove-unused-const \
         --remove-identity \
+        --remove-unused-inits \
         --fp16 \
         --split-concat 0
 
