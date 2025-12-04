@@ -80,24 +80,6 @@ rm -f "${ONNX_FILE}"
 cp -f "${OUT_DIR}/surgery/${MODEL_NAME}_ane.onnx" "${ONNX_FILE}"
 echo "${OUT_DIR}/surgery/${MODEL_NAME}_ane.onnx" "->" "${ONNX_FILE}"
 
-# ONNX Weight Compression
-echo "╔════════════════════════════════════════════════════════════╗"
-echo "║   ONNX Weight Compression (FP32 -> FP16 Storage)          ║"
-echo "╚════════════════════════════════════════════════════════════╝"
-
-PREP_MODEL="${OUT_DIR}/${MODEL_NAME}_prep.onnx"
-COMPRESSED_MODEL="${OUT_DIR}/${MODEL_NAME}_quant.onnx"
-
-echo "🔧 Preprocessing model (Constant -> Initializer)..."
-python3 "${SCRIPT_DIR}/preprocess_for_quant.py" "${ONNX_FILE}" "${PREP_MODEL}"
-
-echo "🔧 Compressing weights..."
-python3 "${SCRIPT_DIR}/compress_weights.py" "${PREP_MODEL}" "${COMPRESSED_MODEL}"
-
-rm "${PREP_MODEL}"
-mv "${COMPRESSED_MODEL}" "${ONNX_FILE}"
-echo "✅ Compressed model saved to ${ONNX_FILE}"
-
 # convert to ncnn
 
 echo "╔════════════════════════════════════════════════════════════╗"
