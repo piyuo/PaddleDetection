@@ -1,0 +1,165 @@
+# PP-YOLOE/src/reid/build_human_reid.sh
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
+DEFAULT_OPSET=16
+DEFAULT_OUT_DIR="${REPO_ROOT}/PP-YOLOE/build/models"
+OPSET=${DEFAULT_OPSET}
+OUT_DIR="${DEFAULT_OUT_DIR}"
+MODEL_NAME="human_reid"
+ONNX_FILE="${OUT_DIR}/${MODEL_NAME}.onnx"
+TEMP_DIR="PP-YOLOE/build/models/pnnx/"
+OUTPUT_MODEL_NAME="human_ncnn"
+
+
+# Activate the Python virtual environment
+echo "🔧 Activating Python environment..."
+source PP-YOLOE/build/venv/bin/activate
+
+if ! command -v paddle2onnx >/dev/null 2>&1; then
+	echo "paddle2onnx not found; installing to user site-packages ..."
+	set -x
+	"${PY}" -m pip install --user -q paddle2onnx
+	set +x
+fi
+
+set -x
+paddle2onnx \
+	--model_dir "${REPO_ROOT}/PP-YOLOE/build/weights/human_reid" \
+	--model_filename model.pdmodel \
+	--params_filename model.pdiparams \
+	--opset_version "${OPSET}" \
+    --enable_auto_update_opset False \
+    --optimize_tool None \
+    --enable_onnx_checker True\
+	--save_file "${ONNX_FILE}"
+set +x
+
+# ANE Optimization
+echo "╔════════════════════════════════════════════════════════════╗"
+echo "║   ANE Graph Surgery for CoreML Optimization               ║"
+echo "╚════════════════════════════════════════════════════════════╝"
+
+SURGERY_SCRIPT="${SCRIPT_DIR}/ane_graph_surgery_reid.py"
+DEMO_IMG="${REPO_ROOT}/PP-YOLOE/build/dataset/demo/demo.jpg"
+
+if [ -f "${SURGERY_SCRIPT}" ]; then
+    echo "🔧 Running ANE graph surgery..."
+    python3 "${SURGERY_SCRIPT}" \
+        --model "${ONNX_FILE}" \
+        --input-shape "1,3,256,128" \
+        --img "${DEMO_IMG}" \
+        --outdir "${OUT_DIR}/surgery" \
+        --output-model "${OUT_DIR}/surgery/${MODEL_NAME}_ane.onnx" \
+        --ort-profile-dir "${OUT_DIR}/profile_reid" \
+        --fix-input-shapes \
+        --rewrite-reduce-to-globalpool \
+        --rewrite-slice-range-to-gather \
+        --rewrite-slice-to-gather \
+        --fold-static-shapes \
+        --fold-conv-bn \
+        --rewrite-div \
+        --rewrite-pow \
+        --rewrite-hardsigmoid \
+        --remove-noop-slice \
+        --remove-unused-const \
+        --remove-identity \
+        --remove-unused-inits \
+        --fp16 \
+        --split-concat 0
+
+    echo "✅ ANE optimized model saved to ${OUT_DIR}/surgery/${MODEL_NAME}_ane.onnx"
+else
+    echo "⚠️  Surgery script not found at ${SURGERY_SCRIPT}"
+fi
+
+rm -f "${ONNX_FILE}"
+cp -f "${OUT_DIR}/surgery/${MODEL_NAME}_ane.onnx" "${ONNX_FILE}"
+echo "${OUT_DIR}/surgery/${MODEL_NAME}_ane.onnx" "->" "${ONNX_FILE}"
+
+# ONNX Weight Compression
+echo "╔════════════════════════════════════════════════════════════╗"
+echo "║   ONNX Weight Compression (FP32 -> FP16 Storage)          ║"
+echo "╚════════════════════════════════════════════════════════════╝"
+
+PREP_MODEL="${OUT_DIR}/${MODEL_NAME}_prep.onnx"
+COMPRESSED_MODEL="${OUT_DIR}/${MODEL_NAME}_quant.onnx"
+
+echo "🔧 Preprocessing model (Constant -> Initializer)..."
+python3 "${SCRIPT_DIR}/preprocess_for_quant.py" "${ONNX_FILE}" "${PREP_MODEL}"
+
+echo "🔧 Compressing weights..."
+python3 "${SCRIPT_DIR}/compress_weights.py" "${PREP_MODEL}" "${COMPRESSED_MODEL}"
+
+rm "${PREP_MODEL}"
+mv "${COMPRESSED_MODEL}" "${ONNX_FILE}"
+echo "✅ Compressed model saved to ${ONNX_FILE}"
+
+# convert to ncnn
+
+echo "╔════════════════════════════════════════════════════════════╗"
+echo "║   NCNN Model Build for Mobile Deployment                  ║"
+echo "╚════════════════════════════════════════════════════════════╝"
+echo ""
+
+# Check if pnnx is available
+if ! command -v pnnx &> /dev/null; then
+    echo "❌ pnnx command not found!"
+    echo "   Please install pnnx or add it to PATH"
+    exit 1
+fi
+
+if [ ! -f "PP-YOLOE/build/ncnnoptimize" ]; then
+    echo "⚠️  Custom ncnnoptimize not found at PP-YOLOE/build/ncnnoptimize"
+    echo "   Please install ncnnoptimize or add it to PATH"
+    echo ""
+fi
+
+# Convert with maximum optimization for mobile
+echo ""
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "Step 2: PNNX Conversion to NCNN (Optimized for Mobile)"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo ""
+echo "🔧 Running PNNX conversion with optlevel=3 (max optimization)..."
+
+mkdir -p "$TEMP_DIR"
+cp "$ONNX_FILE" "$TEMP_DIR"
+
+
+# Model has 2 inputs: scale_factor [1,2] and image [1,3,640,640]
+pnnx "${TEMP_DIR}${MODEL_NAME}.onnx"  \
+    fp16=1 \
+    optlevel=3 \
+    device=gpu
+
+echo ""
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "Step 3: NCNN Optimize (Preserving Feature Maps)"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo ""
+
+ncnnoptimize \
+    "PP-YOLOE/build/models/pnnx/human_reid.ncnn.param" \
+    "PP-YOLOE/build/models/pnnx/human_reid.ncnn.bin" \
+    "PP-YOLOE/build/models/human_reid.param" \
+    "PP-YOLOE/build/models/human_reid.bin" \
+    1
+
+echo ""
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "Step 4: Verify Model Outputs"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo ""
+
+
+cp -f "${ONNX_FILE}" "../flutter-vision/assets/models/${MODEL_NAME}.onnx"
+cp -f "PP-YOLOE/build/models/human_reid.param" "../flutter-vision/assets/models/human_reid.param"
+cp -f "PP-YOLOE/build/models/human_reid.bin" "../flutter-vision/assets/models/human_reid.bin"
+
+
+# and the inference model is in PP-YOLOE/inference_model/ppyoloe_crn_s_36e_pphuman/
+echo "Final model is in ../flutter-vision/assets/models/${MODEL_NAME}.onnx, This is reid model for embedding extraction."
