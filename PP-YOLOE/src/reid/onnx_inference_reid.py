@@ -18,10 +18,8 @@ import numpy as np
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from onnx_inference_ane_model import run_ane_inference
-from onnx_inference_original_model import run_original_inference
 from onnx_inference_utils import (
     default_paths,
-    detect_model_type,
     get_hardcoded_preprocess,
     preprocess_image,
     get_coreml_version_info,
@@ -147,14 +145,8 @@ def main():
     inputs_map = preprocess_image(args.img, target_size=(640, 640), keep_ratio=False)
     feed = build_feed_dict(det_sess, inputs_map)
 
-    # Detect model type and run inference
-    out_names = [o.name for o in det_sess.get_outputs()]
-    model_type = detect_model_type(out_names)
-
-    if model_type == "original":
-        boxes_valid, _ = run_original_inference(det_sess, feed, draw_threshold, warmup_runs=1)
-    else:
-        boxes_valid, _ = run_ane_inference(det_sess, feed, args.img, draw_threshold, warmup_runs=1)
+    # Run inference
+    boxes_valid, _ = run_ane_inference(det_sess, feed, args.img, draw_threshold, warmup_runs=1)
 
     print(f"  -> Found {len(boxes_valid)} valid detections.")
 
