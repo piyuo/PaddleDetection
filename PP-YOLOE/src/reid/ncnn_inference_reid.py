@@ -149,7 +149,7 @@ def run_reid_ncnn(net, img_crop: np.ndarray, target_size: Tuple[int, int] = (256
     if ret != 0:
         raise RuntimeError("NCNN ReID inference failed")
 
-    output = np.array(out_mat)
+    output = out_mat.numpy()
     return output
 
 def main():
@@ -211,6 +211,14 @@ def main():
     print("\n[3/4] Loading ReID Model (NCNN) and Extracting Features...")
     reid_net = get_ncnn_net(args.reid_param, args.reid_bin, args.threads)
 
+    # Warmup ReID
+    print("[INFO] Warming up ReID model...")
+    dummy_input = np.zeros((256, 128, 3), dtype=np.uint8)
+    try:
+        run_reid_ncnn(reid_net, dummy_input)
+    except Exception as e:
+        print(f"[WARN] Warmup failed: {e}")
+
     os.makedirs(args.out, exist_ok=True)
     vis_img = orig_img.copy()
 
@@ -219,11 +227,14 @@ def main():
 
     embeddings = []
     valid_ids = []
+    crops = []
+    valid_boxes = []
 
     # Scale factors for mapping boxes back to original image
     scale_x = orig_w / float(DET_SIZE[0])
     scale_y = orig_h / float(DET_SIZE[1])
 
+    # 1. Collect crops
     for i, box in enumerate(boxes_valid):
         cls_id, score, x0, y0, x1, y1 = box
 
@@ -243,12 +254,40 @@ def main():
             continue
 
         crop = orig_img[y0:y1, x0:x1]
+        crops.append(crop)
+        valid_boxes.append((i, cls_id, score, x0, y0, x1, y1))
 
-        # NCNN Inference
+    if not crops:
+        print("No valid crops found.")
+        return
+
+    # 2. Run Inference (Serial for NCNN)
+    # NCNN Python API typically handles single-image inference best.
+    # Batching is often done by running multiple extractors or serially.
+    print(f"[INFO] Running NCNN Inference for {len(crops)} objects...")
+
+    reid_outputs = []
+    total_time = 0
+    for idx, crop in enumerate(crops):
         t0 = time.time()
         reid_output = run_reid_ncnn(reid_net, crop)
         t1 = time.time()
-        print(f"     [Time] ReID Inference (NCNN): {(t1 - t0) * 1000:.2f} ms")
+        dt = t1 - t0
+        total_time += dt
+
+        # Only print time for first few to avoid spam
+        if idx < 3:
+            print(f"     [Time] ReID Inference (Object {idx+1}/{len(crops)}): {dt * 1000:.2f} ms")
+        elif idx == 3:
+            print(f"     ... (hiding individual logs for remaining {len(crops)-3} objects) ...")
+        reid_outputs.append(reid_output)
+
+    avg_time = (total_time / len(crops)) * 1000
+    print(f"     [Summary] Processed {len(crops)} objects. Avg Latency: {avg_time:.2f} ms/object")
+
+    # 3. Process Results
+    for idx, (i, cls_id, score, x0, y0, x1, y1) in enumerate(valid_boxes):
+        reid_output = reid_outputs[idx]
 
         embeddings.append(reid_output.flatten())
         valid_ids.append(i)
